@@ -4,7 +4,8 @@ use anyhow::Context;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Response},
+    http::{Request, Response, StatusCode},
+    response::IntoResponse,
     routing::{any, get, put},
     Router,
 };
@@ -56,6 +57,10 @@ async fn proxy_fallback(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    if request.uri().path().starts_with("/api/") {
+        return Ok((StatusCode::NOT_FOUND, "API endpoint not found").into_response());
+    }
+
     let config = state.config.read().await.clone();
     let matcher = Matcher::new(config.rules.clone());
     let balancer = Balancer::new(config.upstreams.clone());
