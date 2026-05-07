@@ -9,4 +9,7 @@ export const createRule = (rule: unknown) => api.post('/rules', rule);
 export const updateRule = (id: string, rule: unknown) => api.put(`/rules/${id}`, rule);
 export const deleteRule = (id: string) => api.delete(`/rules/${id}`);
 export const getUpstreams = () => api.get('/upstreams');
+export const createUpstream = (upstream: unknown) => api.post('/upstreams', upstream);
+export const updateUpstream = (id: string, upstream: unknown) => api.put(`/upstreams/${id}`, upstream);
+export const deleteUpstream = (id: string) => api.delete(`/upstreams/${id}`);
 export const getMetrics = () => axios.get('/metrics');
