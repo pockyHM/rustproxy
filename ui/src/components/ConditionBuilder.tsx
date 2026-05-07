@@ -1,8 +1,8 @@
-export type ConditionType = 'Header' | 'Cookie' | 'Jwt';
-export type ConditionOperator = 'Exact' | 'Regex' | 'Exists' | 'Contains';
+export type ConditionType = 'header' | 'cookie' | 'jwt';
+export type ConditionOperator = 'exact' | 'regex' | 'exists' | 'contains';
 
 export type RuleCondition = {
-  condition_type: ConditionType;
+  type: ConditionType;
   key?: string;
   claim_path?: string;
   operator: ConditionOperator;
@@ -14,39 +14,39 @@ type ConditionBuilderProps = {
   onChange: (conditions: RuleCondition[]) => void;
 };
 
-const conditionTypes: ConditionType[] = ['Header', 'Cookie', 'Jwt'];
-const operators: ConditionOperator[] = ['Exact', 'Regex', 'Exists', 'Contains'];
+const conditionTypes: ConditionType[] = ['header', 'cookie', 'jwt'];
+const operators: ConditionOperator[] = ['exact', 'regex', 'exists', 'contains'];
 
 const labels: Record<ConditionType | ConditionOperator, string> = {
-  Header: 'Header',
-  Cookie: 'Cookie',
-  Jwt: 'JWT',
-  Exact: 'exact',
-  Regex: 'regex',
-  Exists: 'exists',
-  Contains: 'contains',
+  header: 'Header',
+  cookie: 'Cookie',
+  jwt: 'JWT',
+  exact: 'exact',
+  regex: 'regex',
+  exists: 'exists',
+  contains: 'contains',
 };
 
 const createCondition = (): RuleCondition => ({
-  condition_type: 'Header',
+  type: 'header',
   key: '',
-  operator: 'Exact',
+  operator: 'exact',
   value: '',
 });
 
 function normalizeCondition(condition: RuleCondition): RuleCondition {
   const next: RuleCondition = {
-    condition_type: condition.condition_type,
+    type: condition.type,
     operator: condition.operator,
   };
 
-  if (condition.condition_type === 'Jwt') {
+  if (condition.type === 'jwt') {
     next.claim_path = condition.claim_path ?? '';
   } else {
     next.key = condition.key ?? '';
   }
 
-  if (condition.operator !== 'Exists') {
+  if (condition.operator !== 'exists') {
     next.value = condition.value ?? '';
   }
 
@@ -83,8 +83,8 @@ function ConditionBuilder({ conditions, onChange }: ConditionBuilderProps) {
       <div style={{ display: 'grid', gap: '1rem' }}>
         {conditions.map((condition, index) => {
           const normalizedCondition = normalizeCondition(condition);
-          const isJwt = normalizedCondition.condition_type === 'Jwt';
-          const isExists = normalizedCondition.operator === 'Exists';
+          const isJwt = normalizedCondition.type === 'jwt';
+          const isExists = normalizedCondition.operator === 'exists';
 
           return (
             <div
@@ -101,12 +101,12 @@ function ConditionBuilder({ conditions, onChange }: ConditionBuilderProps) {
                 <label style={{ display: 'grid', gap: '0.25rem' }}>
                   Type
                   <select
-                    value={normalizedCondition.condition_type}
+                    value={normalizedCondition.type}
                     onChange={(event) =>
                       updateCondition(index, {
-                        condition_type: event.target.value as ConditionType,
-                        key: event.target.value === 'Jwt' ? undefined : normalizedCondition.key,
-                        claim_path: event.target.value === 'Jwt' ? normalizedCondition.claim_path : undefined,
+                        type: event.target.value as ConditionType,
+                        key: event.target.value === 'jwt' ? undefined : normalizedCondition.key,
+                        claim_path: event.target.value === 'jwt' ? normalizedCondition.claim_path : undefined,
                       })
                     }
                   >
@@ -135,7 +135,7 @@ function ConditionBuilder({ conditions, onChange }: ConditionBuilderProps) {
                       type="text"
                       value={normalizedCondition.key ?? ''}
                       onChange={(event) => updateCondition(index, { key: event.target.value })}
-                      placeholder={normalizedCondition.condition_type === 'Header' ? 'Host' : 'session'}
+                      placeholder={normalizedCondition.type === 'header' ? 'Host' : 'session'}
                     />
                   </label>
                 )}

@@ -1,1 +1,6 @@
-# rustproxy configuration
+version: "1.0"
+listen: "127.0.0.1:3000"
+rules: []
+upstreams: {}
+fallback:
+  url: "http://127.0.0.1:8080"

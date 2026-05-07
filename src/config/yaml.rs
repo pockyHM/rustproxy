@@ -52,9 +52,9 @@ rules:
     name: "Test Rule"
     priority: 10
     conditions:
-      - Header
+      - type: header
         key: "Host"
-        operator: Exact
+        operator: exact
         value: "example.com"
     upstream: "backend-1"
     weight: 100
@@ -107,18 +107,18 @@ rules:
     name: "Header Rule"
     priority: 10
     conditions:
-      - Header
+      - type: header
         key: "X-Api-Key"
-        operator: Exists
+        operator: exists
     upstream: "api-backend"
     weight: 80
   - id: "rule-2"
     name: "JWT Rule"
     priority: 5
     conditions:
-      - Jwt
+      - type: jwt
         claim_path: "roles"
-        operator: Contains
+        operator: contains
         value: "admin"
     upstream: "admin-backend"
     weight: 100

@@ -26,9 +26,9 @@ const unwrapApiData = <T,>(payload: T | ApiResponse<T>): T => {
 };
 
 const formatCondition = (condition: RuleCondition): string => {
-  const target = condition.condition_type === 'Jwt' ? condition.claim_path : condition.key;
-  const value = condition.operator === 'Exists' ? '' : ` ${condition.value ?? ''}`;
-  return `${condition.condition_type} ${target ?? ''} ${condition.operator}${value}`.trim();
+  const target = condition.type === 'jwt' ? condition.claim_path : condition.key;
+  const value = condition.operator === 'exists' ? '' : ` ${condition.value ?? ''}`;
+  return `${condition.type} ${target ?? ''} ${condition.operator}${value}`.trim();
 };
 
 function RuleList() {

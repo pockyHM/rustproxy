@@ -15,7 +15,7 @@ mod tests {
     fn test_condition_type_serde() {
         let header = ConditionType::Header;
         let json = serde_json::to_string(&header).unwrap();
-        assert_eq!(json, "\"Header\"");
+        assert_eq!(json, "\"header\"");
         let parsed: ConditionType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ConditionType::Header);
     }
@@ -32,13 +32,13 @@ mod tests {
     fn test_operator_serde() {
         let exact = Operator::Exact;
         let json = serde_json::to_string(&exact).unwrap();
-        assert_eq!(json, "\"Exact\"");
+        assert_eq!(json, "\"exact\"");
         let parsed: Operator = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, Operator::Exact);
 
         let regex = Operator::Regex;
         let json = serde_json::to_string(&regex).unwrap();
-        assert_eq!(json, "\"Regex\"");
+        assert_eq!(json, "\"regex\"");
         let parsed: Operator = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, Operator::Regex);
     }
@@ -53,6 +53,8 @@ mod tests {
             value: Some("application/json".to_string()),
         };
         let json = serde_json::to_string(&condition).unwrap();
+        assert!(json.contains("\"type\":\"header\""));
+        assert!(json.contains("\"operator\":\"exact\""));
         let parsed: Condition = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.condition_type, ConditionType::Header);
         assert_eq!(parsed.key, Some("Content-Type".to_string()));
@@ -186,6 +188,7 @@ mod tests {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConditionType {
     Header,
     Cookie,
@@ -193,6 +196,7 @@ pub enum ConditionType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Operator {
     Exact,
     Regex,
@@ -202,7 +206,7 @@ pub enum Operator {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Condition {
-    #[serde(flatten)]
+    #[serde(rename = "type")]
     pub condition_type: ConditionType,
     pub key: Option<String>,
     pub claim_path: Option<String>,

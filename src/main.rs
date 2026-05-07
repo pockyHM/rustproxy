@@ -15,6 +15,6 @@ async fn main() -> Result<()> {
     let config = AppConfig::load(&config_path)?;
 
     tracing::info!(%config_path, "Starting rustproxy server");
-    server::run(config).await
+    server::run(config, config_path).await
 }
 

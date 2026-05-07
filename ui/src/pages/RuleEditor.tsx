@@ -53,17 +53,17 @@ const createEmptyForm = (): RuleFormState => ({
 const sanitizeConditions = (conditions: RuleCondition[]): RuleCondition[] =>
   conditions.map((condition) => {
     const next: RuleCondition = {
-      condition_type: condition.condition_type,
+      type: condition.type,
       operator: condition.operator,
     };
 
-    if (condition.condition_type === 'Jwt') {
+    if (condition.type === 'jwt') {
       next.claim_path = condition.claim_path ?? '';
     } else {
       next.key = condition.key ?? '';
     }
 
-    if (condition.operator !== 'Exists') {
+    if (condition.operator !== 'exists') {
       next.value = condition.value ?? '';
     }
 
