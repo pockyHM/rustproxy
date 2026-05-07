@@ -7,10 +7,10 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 pub fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
-        .init();
+        .try_init();
 }
 
 pub fn next_request_id() -> String {

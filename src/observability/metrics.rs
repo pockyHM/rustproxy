@@ -70,6 +70,14 @@ mod tests {
     #[test]
     fn gathers_registered_metric_names() {
         let metrics = ProxyMetrics::new().unwrap();
+
+        metrics
+            .requests_total
+            .with_label_values(&["test-rule", "test-upstream", "200"]);
+        metrics
+            .request_duration
+            .with_label_values(&["test-rule", "test-upstream"]);
+
         let output = metrics.gather().unwrap();
 
         assert!(output.contains("proxy_requests_total"));
