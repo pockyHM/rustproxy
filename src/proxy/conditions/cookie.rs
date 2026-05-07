@@ -36,11 +36,9 @@ pub fn match_cookie(
 
     match operator {
         Operator::Exists => cookies.iter().any(|(k, _)| k == key),
-        Operator::Exact => {
-            cookies
-                .iter()
-                .any(|(k, v)| k == key && v == value.unwrap_or(""))
-        }
+        Operator::Exact => cookies
+            .iter()
+            .any(|(k, v)| k == key && v == value.unwrap_or("")),
         Operator::Regex => {
             if let Some(pattern) = value {
                 if let Ok(re) = Regex::new(pattern) {
@@ -82,50 +80,90 @@ mod tests {
     #[test]
     fn test_cookie_exact_match() {
         let cookie = "session=abc123";
-        assert!(match_cookie(cookie, "session", &Operator::Exact, Some("abc123")));
+        assert!(match_cookie(
+            cookie,
+            "session",
+            &Operator::Exact,
+            Some("abc123")
+        ));
     }
 
     #[test]
     fn test_cookie_exact_no_match() {
         let cookie = "session=abc123";
-        assert!(!match_cookie(cookie, "session", &Operator::Exact, Some("def456")));
+        assert!(!match_cookie(
+            cookie,
+            "session",
+            &Operator::Exact,
+            Some("def456")
+        ));
     }
 
     #[test]
     fn test_cookie_exact_missing_cookie() {
         let cookie = "session=abc123";
-        assert!(!match_cookie(cookie, "theme", &Operator::Exact, Some("dark")));
+        assert!(!match_cookie(
+            cookie,
+            "theme",
+            &Operator::Exact,
+            Some("dark")
+        ));
     }
 
     #[test]
     fn test_cookie_regex_match() {
         let cookie = "session=abc123";
-        assert!(match_cookie(cookie, "session", &Operator::Regex, Some(r"abc\d+")));
+        assert!(match_cookie(
+            cookie,
+            "session",
+            &Operator::Regex,
+            Some(r"abc\d+")
+        ));
     }
 
     #[test]
     fn test_cookie_regex_no_match() {
         let cookie = "session=abc123";
-        assert!(!match_cookie(cookie, "session", &Operator::Regex, Some(r"def\d+")));
+        assert!(!match_cookie(
+            cookie,
+            "session",
+            &Operator::Regex,
+            Some(r"def\d+")
+        ));
     }
 
     #[test]
     fn test_cookie_regex_invalid_pattern() {
         let cookie = "session=abc123";
         // Invalid regex should not panic, just return false
-        assert!(!match_cookie(cookie, "session", &Operator::Regex, Some(r"[invalid")));
+        assert!(!match_cookie(
+            cookie,
+            "session",
+            &Operator::Regex,
+            Some(r"[invalid")
+        ));
     }
 
     #[test]
     fn test_cookie_contains_match() {
         let cookie = "session=abc123xyz";
-        assert!(match_cookie(cookie, "session", &Operator::Contains, Some("123")));
+        assert!(match_cookie(
+            cookie,
+            "session",
+            &Operator::Contains,
+            Some("123")
+        ));
     }
 
     #[test]
     fn test_cookie_contains_no_match() {
         let cookie = "session=abc123xyz";
-        assert!(!match_cookie(cookie, "session", &Operator::Contains, Some("456")));
+        assert!(!match_cookie(
+            cookie,
+            "session",
+            &Operator::Contains,
+            Some("456")
+        ));
     }
 
     #[test]

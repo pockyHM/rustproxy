@@ -163,8 +163,14 @@ mod tests {
         let token = create_test_jwt(claims);
         let payload = decode_jwt_payload(&token).unwrap();
 
-        assert_eq!(navigate_path(&payload, "sub").unwrap(), &serde_json::json!("user123"));
-        assert_eq!(navigate_path(&payload, "role").unwrap(), &serde_json::json!("admin"));
+        assert_eq!(
+            navigate_path(&payload, "sub").unwrap(),
+            &serde_json::json!("user123")
+        );
+        assert_eq!(
+            navigate_path(&payload, "role").unwrap(),
+            &serde_json::json!("admin")
+        );
     }
 
     #[test]
@@ -193,8 +199,14 @@ mod tests {
         let token = create_test_jwt(claims);
         let payload = decode_jwt_payload(&token).unwrap();
 
-        assert_eq!(navigate_path(&payload, "roles.0").unwrap(), &serde_json::json!("admin"));
-        assert_eq!(navigate_path(&payload, "roles.1").unwrap(), &serde_json::json!("user"));
+        assert_eq!(
+            navigate_path(&payload, "roles.0").unwrap(),
+            &serde_json::json!("admin")
+        );
+        assert_eq!(
+            navigate_path(&payload, "roles.1").unwrap(),
+            &serde_json::json!("user")
+        );
     }
 
     #[test]
@@ -256,8 +268,18 @@ mod tests {
             "email": "user@example.com"
         });
         let token = create_test_jwt(claims);
-        assert!(match_jwt(&token, "email", &Operator::Regex, Some(r".*@example\.com")));
-        assert!(!match_jwt(&token, "email", &Operator::Regex, Some(r".*@other\.com")));
+        assert!(match_jwt(
+            &token,
+            "email",
+            &Operator::Regex,
+            Some(r".*@example\.com")
+        ));
+        assert!(!match_jwt(
+            &token,
+            "email",
+            &Operator::Regex,
+            Some(r".*@other\.com")
+        ));
     }
 
     #[test]
@@ -266,7 +288,12 @@ mod tests {
             "email": "user@example.com"
         });
         let token = create_test_jwt(claims);
-        assert!(!match_jwt(&token, "email", &Operator::Regex, Some(r"[invalid")));
+        assert!(!match_jwt(
+            &token,
+            "email",
+            &Operator::Regex,
+            Some(r"[invalid")
+        ));
     }
 
     #[test]
@@ -275,8 +302,18 @@ mod tests {
             "email": "user@example.com"
         });
         let token = create_test_jwt(claims);
-        assert!(match_jwt(&token, "email", &Operator::Contains, Some("@example")));
-        assert!(!match_jwt(&token, "email", &Operator::Contains, Some("@other")));
+        assert!(match_jwt(
+            &token,
+            "email",
+            &Operator::Contains,
+            Some("@example")
+        ));
+        assert!(!match_jwt(
+            &token,
+            "email",
+            &Operator::Contains,
+            Some("@other")
+        ));
     }
 
     #[test]
@@ -287,8 +324,18 @@ mod tests {
             }
         });
         let token = create_test_jwt(claims);
-        assert!(match_jwt(&token, "user.name", &Operator::Contains, Some("John")));
-        assert!(!match_jwt(&token, "user.name", &Operator::Contains, Some("Jane")));
+        assert!(match_jwt(
+            &token,
+            "user.name",
+            &Operator::Contains,
+            Some("John")
+        ));
+        assert!(!match_jwt(
+            &token,
+            "user.name",
+            &Operator::Contains,
+            Some("Jane")
+        ));
     }
 
     #[test]
@@ -302,8 +349,23 @@ mod tests {
             }
         });
         let token = create_test_jwt(claims);
-        assert!(match_jwt(&token, "user.metadata.tenant_id", &Operator::Exact, Some("tenant-abc")));
-        assert!(match_jwt(&token, "user.metadata.tenant_id", &Operator::Regex, Some(r"tenant-.*")));
-        assert!(match_jwt(&token, "user.metadata.tenant_id", &Operator::Contains, Some("abc")));
+        assert!(match_jwt(
+            &token,
+            "user.metadata.tenant_id",
+            &Operator::Exact,
+            Some("tenant-abc")
+        ));
+        assert!(match_jwt(
+            &token,
+            "user.metadata.tenant_id",
+            &Operator::Regex,
+            Some(r"tenant-.*")
+        ));
+        assert!(match_jwt(
+            &token,
+            "user.metadata.tenant_id",
+            &Operator::Contains,
+            Some("abc")
+        ));
     }
 }

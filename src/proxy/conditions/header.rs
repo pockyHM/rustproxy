@@ -66,13 +66,23 @@ mod tests {
     #[test]
     fn test_header_exists_true() {
         let headers = create_header_map(&[("Content-Type", "application/json")]);
-        assert!(match_header(&headers, "Content-Type", &Operator::Exists, None));
+        assert!(match_header(
+            &headers,
+            "Content-Type",
+            &Operator::Exists,
+            None
+        ));
     }
 
     #[test]
     fn test_header_exists_false() {
         let headers = create_header_map(&[("Content-Type", "application/json")]);
-        assert!(!match_header(&headers, "X-Custom-Header", &Operator::Exists, None));
+        assert!(!match_header(
+            &headers,
+            "X-Custom-Header",
+            &Operator::Exists,
+            None
+        ));
     }
 
     #[test]
@@ -171,6 +181,11 @@ mod tests {
         headers.append("Set-Cookie", "cookie2=value2".parse().unwrap());
 
         // Should find at least one matching header for Exists
-        assert!(match_header(&headers, "Set-Cookie", &Operator::Exists, None));
+        assert!(match_header(
+            &headers,
+            "Set-Cookie",
+            &Operator::Exists,
+            None
+        ));
     }
 }
