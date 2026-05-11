@@ -58,7 +58,10 @@ mod tests {
     fn create_header_map(headers: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (key, value) in headers {
-            map.insert((*key).parse().unwrap(), HeaderValue::from_static(value));
+            map.insert(
+                (*key).parse::<http::HeaderName>().unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
         }
         map
     }

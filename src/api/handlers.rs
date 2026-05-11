@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -19,15 +19,15 @@ pub struct ApiResponse<T>
 where
     T: Serialize,
 {
-    success: bool,
-    data: T,
+    pub success: bool,
+    pub data: T,
 }
 
 impl<T> ApiResponse<T>
 where
     T: Serialize,
 {
-    fn success(data: T) -> Self {
+    pub fn success(data: T) -> Self {
         Self {
             success: true,
             data,
@@ -42,22 +42,111 @@ struct ApiError {
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (status, Json(ApiError {
-        success: false,
-        error: message.into(),
-    }))
+    (
+        status,
+        Json(ApiError {
+            success: false,
+            error: message.into(),
+        }),
+    )
         .into_response()
 }
 
-async fn persist_config(state: &AppState, config: &AppConfig) -> Result<(), String> {
-    let yaml = serde_yaml::to_string(config)
-        .map_err(|error| format!("failed to serialize config: {error}"))?;
-    tokio::fs::write(state.config_path.as_str(), yaml)
-        .await
-        .map_err(|error| format!("failed to write config: {error}"))?;
-    state.metrics.config_reloads.inc();
-    Ok(())
+// ── Auth ──
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
 }
+
+#[derive(Serialize)]
+pub struct LoginData {
+    token: String,
+}
+
+#[derive(Serialize)]
+pub struct SetupStatus {
+    pub users_exist: bool,
+}
+
+pub async fn setup_status(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<SetupStatus>> {
+    let users = state.db.list_users().unwrap_or_default();
+    Json(ApiResponse::success(SetupStatus {
+        users_exist: !users.is_empty(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct SetupRequest {
+    pub username: String,
+    pub password: String,
+}
+
+pub async fn setup(
+    State(state): State<AppState>,
+    Json(body): Json<SetupRequest>,
+) -> Result<Json<ApiResponse<Value>>, Response> {
+    let users = state
+        .db
+        .list_users()
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !users.is_empty() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "admin user already exists",
+        ));
+    }
+
+    if body.username.trim().is_empty() || body.password.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "username and password are required",
+        ));
+    }
+
+    let hash = crate::auth::hash_password(&body.password)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state
+        .db
+        .create_user(&body.username, &hash)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ApiResponse::success(json!({ "username": body.username }))))
+}
+
+pub async fn login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginRequest>,
+) -> Result<Json<ApiResponse<LoginData>>, Response> {
+    let hash = state
+        .db
+        .get_user_password_hash(&body.username)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let hash = match hash {
+        Some(h) => h,
+        None => return Err(error_response(StatusCode::UNAUTHORIZED, "invalid credentials")),
+    };
+
+    let valid = crate::auth::verify_password(&body.password, &hash)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !valid {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "invalid credentials"));
+    }
+
+    let token = crate::auth::jwt::create_token(&body.username, &state.jwt_secret)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ApiResponse::success(LoginData { token })))
+}
+
+// ── Config ──
 
 pub async fn get_config(State(state): State<AppState>) -> Json<ApiResponse<AppConfig>> {
     let config = state.config.read().await.clone();
@@ -68,15 +157,21 @@ pub async fn put_config(
     State(state): State<AppState>,
     Json(new_config): Json<AppConfig>,
 ) -> Result<Json<ApiResponse<AppConfig>>, Response> {
-    persist_config(&state, &new_config)
-        .await
-        .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    state
+        .db
+        .save_full_config(&new_config)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut config = state.config.write().await;
-    *config = new_config.clone();
+    {
+        let mut config = state.config.write().await;
+        *config = new_config.clone();
+    }
 
+    state.metrics.config_reloads.inc();
     Ok(Json(ApiResponse::success(new_config)))
 }
+
+// ── Rules ──
 
 pub async fn list_rules(State(state): State<AppState>) -> Json<ApiResponse<Vec<Rule>>> {
     let rules = state.config.read().await.rules.clone();
@@ -87,23 +182,24 @@ pub async fn create_rule(
     State(state): State<AppState>,
     Json(rule): Json<Rule>,
 ) -> Result<(StatusCode, Json<ApiResponse<Rule>>), Response> {
-    let updated_config = {
-        let mut config = state.config.write().await;
+    {
+        let config = state.config.read().await;
         if config.rules.iter().any(|existing| existing.id == rule.id) {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 format!("rule '{}' already exists", rule.id),
             ));
         }
+    }
 
-        config.rules.push(rule.clone());
-        config.clone()
-    };
+    state
+        .db
+        .create_rule(&rule)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if let Err(error) = persist_config(&state, &updated_config).await {
+    {
         let mut config = state.config.write().await;
-        config.rules.retain(|existing| existing.id != rule.id);
-        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
+        config.rules.push(rule.clone());
     }
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(rule))))
@@ -116,7 +212,12 @@ pub async fn update_rule(
 ) -> Result<Json<ApiResponse<Rule>>, Response> {
     rule.id = id.clone();
 
-    let updated_config = {
+    state
+        .db
+        .update_rule(&rule)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    {
         let mut config = state.config.write().await;
         let Some(existing_rule) = config.rules.iter_mut().find(|existing| existing.id == id) else {
             return Err(error_response(
@@ -124,13 +225,7 @@ pub async fn update_rule(
                 format!("rule '{id}' not found"),
             ));
         };
-
         *existing_rule = rule.clone();
-        config.clone()
-    };
-
-    if let Err(error) = persist_config(&state, &updated_config).await {
-        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     Ok(Json(ApiResponse::success(rule)))
@@ -140,27 +235,27 @@ pub async fn delete_rule(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Value>>, Response> {
-    let updated_config = {
+    let deleted = state
+        .db
+        .delete_rule(&id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !deleted {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("rule '{id}' not found"),
+        ));
+    }
+
+    {
         let mut config = state.config.write().await;
-        let original_len = config.rules.len();
         config.rules.retain(|rule| rule.id != id);
-
-        if config.rules.len() == original_len {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("rule '{id}' not found"),
-            ));
-        }
-
-        config.clone()
-    };
-
-    if let Err(error) = persist_config(&state, &updated_config).await {
-        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     Ok(Json(ApiResponse::success(json!({ "id": id }))))
 }
+
+// ── Upstreams ──
 
 pub async fn list_upstreams(State(state): State<AppState>) -> Json<ApiResponse<Vec<Upstream>>> {
     let upstreams = state
@@ -178,25 +273,26 @@ pub async fn create_upstream(
     State(state): State<AppState>,
     Json(upstream): Json<Upstream>,
 ) -> Result<(StatusCode, Json<ApiResponse<Upstream>>), Response> {
-    let updated_config = {
-        let mut config = state.config.write().await;
+    {
+        let config = state.config.read().await;
         if config.upstreams.contains_key(&upstream.name) {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 format!("upstream '{}' already exists", upstream.name),
             ));
         }
+    }
 
+    state
+        .db
+        .create_upstream(&upstream)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    {
+        let mut config = state.config.write().await;
         config
             .upstreams
             .insert(upstream.name.clone(), upstream.clone());
-        config.clone()
-    };
-
-    if let Err(error) = persist_config(&state, &updated_config).await {
-        let mut config = state.config.write().await;
-        config.upstreams.remove(&upstream.name);
-        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(upstream))))
@@ -209,7 +305,12 @@ pub async fn update_upstream(
 ) -> Result<Json<ApiResponse<Upstream>>, Response> {
     upstream.name = id.clone();
 
-    let updated_config = {
+    state
+        .db
+        .update_upstream(&upstream)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    {
         let mut config = state.config.write().await;
         if !config.upstreams.contains_key(&id) {
             return Err(error_response(
@@ -217,13 +318,7 @@ pub async fn update_upstream(
                 format!("upstream '{id}' not found"),
             ));
         }
-
         config.upstreams.insert(id.clone(), upstream.clone());
-        config.clone()
-    };
-
-    if let Err(error) = persist_config(&state, &updated_config).await {
-        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
     }
 
     Ok(Json(ApiResponse::success(upstream)))
@@ -233,24 +328,27 @@ pub async fn delete_upstream(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Value>>, Response> {
-    let updated_config = {
+    let deleted = state
+        .db
+        .delete_upstream(&id)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !deleted {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("upstream '{id}' not found"),
+        ));
+    }
+
+    {
         let mut config = state.config.write().await;
-        if config.upstreams.remove(&id).is_none() {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("upstream '{id}' not found"),
-            ));
-        }
-
-        config.clone()
-    };
-
-    if let Err(error) = persist_config(&state, &updated_config).await {
-        return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error));
+        config.upstreams.remove(&id);
     }
 
     Ok(Json(ApiResponse::success(json!({ "id": id }))))
 }
+
+// ── Health & Metrics ──
 
 pub async fn health() -> Json<ApiResponse<Value>> {
     Json(ApiResponse::success(json!({ "status": "ok" })))
@@ -258,9 +356,10 @@ pub async fn health() -> Json<ApiResponse<Value>> {
 
 pub async fn metrics(State(state): State<AppState>) -> Response {
     match state.metrics.gather() {
-        Ok(metrics) => ([
-            (header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
-        ], metrics)
+        Ok(metrics_text) => (
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            metrics_text,
+        )
             .into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

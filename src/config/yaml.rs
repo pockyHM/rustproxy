@@ -1,4 +1,4 @@
-use rustproxy::models::{Rule, Target, Upstream};
+use crate::models::{Rule, Upstream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

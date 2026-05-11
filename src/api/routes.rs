@@ -5,8 +5,9 @@ use axum::{
     body::Body,
     extract::State,
     http::{Request, Response, StatusCode},
+    middleware,
     response::IntoResponse,
-    routing::{any, get, put},
+    routing::{any, get, post, put},
     Router,
 };
 use tokio::net::TcpListener;
@@ -15,7 +16,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::{
+    auth::middleware::{self as auth_mw},
     config::yaml::AppConfig,
+    db::Database,
     observability::metrics::ProxyMetrics,
     proxy::{balancer::Balancer, handle_proxy, matcher::Matcher},
 };
@@ -25,12 +28,20 @@ use super::handlers;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
-    pub config_path: Arc<String>,
+    pub db: Arc<Database>,
+    pub jwt_secret: Arc<String>,
     pub metrics: Arc<ProxyMetrics>,
 }
 
 pub fn routes(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
+        .route("/api/auth/login", put(handlers::login))
+        .route("/api/auth/setup-status", get(handlers::setup_status))
+        .route("/api/auth/setup", post(handlers::setup))
+        .route("/api/health", get(handlers::health))
+        .route("/metrics", get(handlers::metrics));
+
+    let protected = Router::new()
         .route("/api/config", get(handlers::get_config).put(handlers::put_config))
         .route("/api/rules", get(handlers::list_rules).post(handlers::create_rule))
         .route(
@@ -45,8 +56,18 @@ pub fn routes(state: AppState) -> Router {
             "/api/upstreams/{id}",
             put(handlers::update_upstream).delete(handlers::delete_upstream),
         )
-        .route("/api/health", get(handlers::health))
-        .route("/metrics", get(handlers::metrics))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_mw::require_auth,
+        ));
+
+    Router::new()
+        .merge(public)
+        .merge(protected)
+        .nest(
+            "/admin",
+            Router::new().fallback(any(super::ui::serve_admin_ui)),
+        )
         .fallback(any(proxy_fallback))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -74,13 +95,20 @@ async fn proxy_fallback(
     .await
 }
 
-pub async fn run(config: AppConfig, config_path: String) -> anyhow::Result<()> {
+pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
     let listen = config.listen.clone();
+    let jwt_secret = db.ensure_jwt_secret()?;
+
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
-        config_path: Arc::new(config_path),
+        db: Arc::new(db),
+        jwt_secret: Arc::new(jwt_secret),
         metrics: Arc::new(ProxyMetrics::new().context("failed to initialize metrics")?),
     };
+
+    // Background task to reload config from DB every 5 seconds
+    spawn_config_reloader(state.clone());
+
     let app = routes(state);
     let listener = TcpListener::bind(&listen)
         .await
@@ -92,4 +120,22 @@ pub async fn run(config: AppConfig, config_path: String) -> anyhow::Result<()> {
         .context("REST API server failed")?;
 
     Ok(())
+}
+
+fn spawn_config_reloader(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            match state.db.load_config() {
+                Ok(new_config) => {
+                    let mut config = state.config.write().await;
+                    *config = new_config;
+                }
+                Err(e) => {
+                    tracing::warn!("failed to reload config from DB: {e}");
+                }
+            }
+        }
+    });
 }

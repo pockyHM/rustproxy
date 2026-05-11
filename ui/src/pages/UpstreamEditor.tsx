@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { createUpstream, getUpstreams, updateUpstream } from '../api/client';
+import { useI18n } from '../i18n';
 
 type Target = {
   url: string;
@@ -32,9 +33,10 @@ const unwrapApiData = <T,>(payload: T | ApiResponse<T>): T => {
   if (payload && typeof payload === 'object' && 'data' in payload) {
     return (payload as ApiResponse<T>).data;
   }
-
   return payload as T;
 };
+
+const WEIGHT_COLORS = ['var(--color-link)', 'var(--color-success)', 'var(--color-warning)', 'var(--color-gray-400)'];
 
 const createEmptyForm = (): UpstreamFormState => ({
   name: '',
@@ -44,9 +46,12 @@ const createEmptyForm = (): UpstreamFormState => ({
 function UpstreamEditor() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { t } = useI18n();
   const isNewUpstream = id === undefined || id === 'new';
   const [form, setForm] = useState<UpstreamFormState>(createEmptyForm);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  const errorId = 'upstream-save-error';
 
   const upstreamsQuery = useQuery({
     queryKey: ['upstreams'],
@@ -58,10 +63,7 @@ function UpstreamEditor() {
   });
 
   const existingUpstream = useMemo(() => {
-    if (isNewUpstream || !upstreamsQuery.data) {
-      return undefined;
-    }
-
+    if (isNewUpstream || !upstreamsQuery.data) return undefined;
     return upstreamsQuery.data.find((upstream) => upstream.name === id);
   }, [id, isNewUpstream, upstreamsQuery.data]);
 
@@ -126,100 +128,175 @@ function UpstreamEditor() {
       } else {
         await updateUpstream(upstreamName, upstream);
       }
-
       navigate('/upstreams');
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : 'Unable to save upstream.');
+      setSaveError(error instanceof Error ? error.message : t.common.saveFail);
     }
   };
 
   if (!isNewUpstream && upstreamsQuery.isLoading) {
     return (
-      <section>
-        <h2>Edit Upstream</h2>
-        <p>Loading upstream...</p>
-      </section>
+      <div className="page">
+        <div className="page-header">
+          <div>
+            <h1 className="page-header__title">{t.upstreamEditor.editTitle}</h1>
+          </div>
+        </div>
+        <div className="loading-state">{t.common.loading}</div>
+      </div>
     );
   }
 
   if (!isNewUpstream && upstreamsQuery.data && !existingUpstream) {
     return (
-      <section>
-        <h2>Edit Upstream</h2>
-        <p>Upstream not found.</p>
-        <p>
-          Return to the <Link to="/upstreams">upstream list</Link>.
-        </p>
-      </section>
+      <div className="page">
+        <div className="page-header">
+          <div>
+            <h1 className="page-header__title">{t.upstreamEditor.editTitle}</h1>
+          </div>
+        </div>
+        <div className="empty-state">
+          {t.upstreamEditor.notFound}{' '}
+          <Link to="/upstreams">
+            {t.common.returnToList.replace('{page}', t.upstreamEditor.upstreamList)}
+          </Link>
+        </div>
+      </div>
     );
   }
 
+  const totalWeight = form.targets.reduce((sum, t) => sum + Number(t.weight || 0), 0);
+
   return (
-    <section>
-      <h2>{isNewUpstream ? 'Create Upstream' : `Edit Upstream: ${id}`}</h2>
-      <p>{isNewUpstream ? 'Define a new backend upstream pool.' : 'Update backend targets and weights.'}</p>
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-header__title">
+            {isNewUpstream ? t.upstreamEditor.createTitle : t.upstreamEditor.editTitle}
+          </h1>
+          <p className="page-header__desc">
+            {isNewUpstream ? t.upstreamEditor.createDesc : t.upstreamEditor.editDesc}
+          </p>
+        </div>
+      </div>
 
-      {upstreamsQuery.isError && <p>Unable to load upstream data.</p>}
-      {saveError && <p>{saveError}</p>}
+      {upstreamsQuery.isError && <div className="message message--error">{t.upstreamEditor.loadFail}</div>}
+      {saveError && (
+        <p id={errorId} className="message message--error" role="alert" aria-live="assertive">
+          {saveError}
+        </p>
+      )}
 
-      <form onSubmit={handleSubmit} style={{ display: 'grid', gap: '1rem', maxWidth: '48rem' }}>
-        <label style={{ display: 'grid', gap: '0.25rem' }}>
-          Upstream Name
-          <input type="text" value={form.name} onChange={(event) => updateName(event.target.value)} required disabled={!isNewUpstream} />
-        </label>
+      <form onSubmit={handleSubmit}>
+        <div className="form-section" style={{ marginBottom: 'var(--space-5)' }}>
+          <h2 className="form-section__title">{t.upstreamEditor.general}</h2>
+          <div className="form-group">
+            <label className="field-label" htmlFor="upstream-name">{t.upstreamEditor.upstreamName}</label>
+            <input
+              id="upstream-name"
+              type="text"
+              value={form.name}
+              onChange={(event) => updateName(event.target.value)}
+              className="field-input"
+              required
+              disabled={!isNewUpstream}
+              style={{ maxWidth: '24rem' }}
+            />
+            <p className="field-hint">{t.upstreamEditor.upstreamNameHint}</p>
+          </div>
+        </div>
 
-        <fieldset style={{ display: 'grid', gap: '1rem' }}>
-          <legend>Targets</legend>
-          {form.targets.map((target, index) => (
-            <div
-              key={index}
-              style={{
-                border: '1px solid #ddd',
-                borderRadius: '0.5rem',
-                display: 'grid',
-                gap: '0.75rem',
-                padding: '1rem',
-              }}
-            >
-              <label style={{ display: 'grid', gap: '0.25rem' }}>
-                URL
-                <input
-                  type="url"
-                  value={target.url}
-                  onChange={(event) => updateTarget(index, 'url', event.target.value)}
-                  placeholder="http://localhost:8080"
-                  required
-                />
-              </label>
-
-              <label style={{ display: 'grid', gap: '0.25rem' }}>
-                Weight
-                <input
-                  type="number"
-                  min="0"
-                  value={target.weight}
-                  onChange={(event) => updateTarget(index, 'weight', event.target.value)}
-                  required
-                />
-              </label>
-
-              <button type="button" onClick={() => removeTarget(index)} disabled={form.targets.length === 1}>
-                Remove target
-              </button>
-            </div>
-          ))}
-
-          <button type="button" onClick={addTarget}>
-            Add target
+        <div className="form-section" style={{ marginBottom: 'var(--space-5)' }}>
+          <h2 className="form-section__title">{t.upstreamEditor.targets}</h2>
+          <div style={{ display: 'grid', gap: 'var(--space-3)' }}>
+            {form.targets.map((target, index) => (
+              <div key={index} className="condition-card" role="group" aria-label={`Target ${index + 1}`}>
+                <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                  <div className="form-group" style={{ flex: '2 1 16rem', marginBottom: 0 }}>
+                    <label className="field-label" htmlFor={`target-url-${index}`}>{t.upstreamEditor.url}</label>
+                    <input
+                      id={`target-url-${index}`}
+                      type="url"
+                      value={target.url}
+                      onChange={(event) => updateTarget(index, 'url', event.target.value)}
+                      className="field-input"
+                      placeholder={t.upstreamEditor.urlPlaceholder}
+                      required
+                    />
+                    <p className="field-hint">{t.upstreamEditor.urlHint}</p>
+                  </div>
+                  <div className="form-group" style={{ flex: '1 1 8rem', marginBottom: 0 }}>
+                    <label className="field-label" htmlFor={`target-weight-${index}`}>{t.upstreamEditor.weight}</label>
+                    <input
+                      id={`target-weight-${index}`}
+                      type="number"
+                      min="0"
+                      value={target.weight}
+                      onChange={(event) => updateTarget(index, 'weight', event.target.value)}
+                      className="field-input"
+                      required
+                    />
+                    <p className="field-hint">{t.upstreamEditor.weightHint}</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-danger btn-sm"
+                    onClick={() => removeTarget(index)}
+                    disabled={form.targets.length === 1}
+                    aria-label={`Remove target ${index + 1}`}
+                  >
+                    {t.common.remove}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <button type="button" className="btn-secondary btn-sm" onClick={addTarget} style={{ marginTop: 'var(--space-4)' }}>
+            {t.upstreamEditor.addTarget}
           </button>
-        </fieldset>
+        </div>
 
-        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-          <button type="submit">Save upstream</button>
-          <Link to="/upstreams">Cancel</Link>
+        {/* Weight distribution preview */}
+        {form.targets.length > 1 && totalWeight > 0 && (
+          <div className="preview-panel" style={{ marginBottom: 'var(--space-5)' }}>
+            <h3 className="preview-panel__title">{t.upstreamEditor.weightPreview}</h3>
+            <div className="weight-bar" style={{ marginBottom: 'var(--space-3)' }}>
+              {form.targets.map((target, index) => (
+                <div
+                  key={index}
+                  className="weight-bar__segment"
+                  style={{
+                    width: `${(Number(target.weight || 0) / totalWeight) * 100}%`,
+                    background: WEIGHT_COLORS[index % WEIGHT_COLORS.length],
+                  }}
+                />
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap' }}>
+              {form.targets.map((target, index) => (
+                <span key={index} style={{ fontSize: 'var(--text-xs)', color: 'var(--color-gray-500)' }}>
+                  <span style={{
+                    display: 'inline-block',
+                    width: 8,
+                    height: 8,
+                    borderRadius: '50%',
+                    background: WEIGHT_COLORS[index % WEIGHT_COLORS.length],
+                    marginRight: 'var(--space-1)',
+                    verticalAlign: 'middle',
+                  }} />
+                  {target.url || `Target ${index + 1}`}: {totalWeight > 0 ? Math.round((Number(target.weight || 0) / totalWeight) * 100) : 0}%
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="form-actions">
+          <button type="submit" className="btn-primary">{t.upstreamEditor.saveUpstream}</button>
+          <Link to="/upstreams" className="btn-ghost">{t.common.cancel}</Link>
         </div>
       </form>
-    </section>
+    </div>
   );
 }
 

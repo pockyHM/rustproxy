@@ -1,13 +1,6 @@
-export type ConditionType = 'header' | 'cookie' | 'jwt';
-export type ConditionOperator = 'exact' | 'regex' | 'exists' | 'contains';
-
-export type RuleCondition = {
-  type: ConditionType;
-  key?: string;
-  claim_path?: string;
-  operator: ConditionOperator;
-  value?: string;
-};
+import { useCallback, memo } from 'react';
+import { useI18n } from '../i18n';
+import type { ConditionType, ConditionOperator, RuleCondition } from '../types/conditions';
 
 type ConditionBuilderProps = {
   conditions: RuleCondition[];
@@ -16,16 +9,6 @@ type ConditionBuilderProps = {
 
 const conditionTypes: ConditionType[] = ['header', 'cookie', 'jwt'];
 const operators: ConditionOperator[] = ['exact', 'regex', 'exists', 'contains'];
-
-const labels: Record<ConditionType | ConditionOperator, string> = {
-  header: 'Header',
-  cookie: 'Cookie',
-  jwt: 'JWT',
-  exact: 'exact',
-  regex: 'regex',
-  exists: 'exists',
-  contains: 'contains',
-};
 
 const createCondition = (): RuleCondition => ({
   type: 'header',
@@ -53,133 +36,177 @@ function normalizeCondition(condition: RuleCondition): RuleCondition {
   return next;
 }
 
-function ConditionBuilder({ conditions, onChange }: ConditionBuilderProps) {
-  const updateCondition = (index: number, updates: Partial<RuleCondition>) => {
-    const nextConditions = conditions.map((condition, currentIndex) => {
-      if (currentIndex !== index) {
-        return condition;
-      }
+type ConditionCardProps = {
+  condition: RuleCondition;
+  index: number;
+  onUpdate: (index: number, updates: Partial<RuleCondition>) => void;
+  onRemove: (index: number) => void;
+};
 
-      return normalizeCondition({ ...condition, ...updates });
-    });
+const ConditionCard = memo(function ConditionCard({
+  condition,
+  index,
+  onUpdate,
+  onRemove,
+}: ConditionCardProps) {
+  const { t } = useI18n();
+  const normalizedCondition = normalizeCondition(condition);
+  const isJwt = normalizedCondition.type === 'jwt';
+  const isExists = normalizedCondition.operator === 'exists';
 
-    onChange(nextConditions);
-  };
-
-  const addCondition = () => {
-    onChange([...conditions, createCondition()]);
-  };
-
-  const removeCondition = (index: number) => {
-    onChange(conditions.filter((_, currentIndex) => currentIndex !== index));
-  };
+  const hintKey = isJwt ? 'jwtHint' : normalizedCondition.type === 'cookie' ? 'cookieHint' : 'headerHint';
 
   return (
-    <fieldset style={{ border: '1px solid #ddd', borderRadius: '0.5rem', padding: '1rem' }}>
-      <legend>Conditions</legend>
+    <div className="condition-card" role="group" aria-label={`Condition ${index + 1}`}>
+      <p className="field-hint" style={{ margin: 0 }}>
+        {t.conditions[hintKey]}
+      </p>
+      <div className="field-row">
+        <div className="form-group" style={{ flex: '1 1 8rem' }}>
+          <label className="field-label" htmlFor={`condition-type-${index}`}>{t.conditions.type}</label>
+          <select
+            id={`condition-type-${index}`}
+            value={normalizedCondition.type}
+            onChange={(event) =>
+              onUpdate(index, {
+                type: event.target.value as ConditionType,
+                key: event.target.value === 'jwt' ? undefined : normalizedCondition.key,
+                claim_path: event.target.value === 'jwt' ? normalizedCondition.claim_path : undefined,
+              })
+            }
+            className="field-select"
+          >
+            {conditionTypes.map((ct) => (
+              <option key={ct} value={ct}>
+                {ct.toUpperCase()}
+              </option>
+            ))}
+          </select>
+        </div>
 
-      {conditions.length === 0 && <p>No conditions configured. Add one to define when this rule matches.</p>}
+        {isJwt ? (
+          <div className="form-group" style={{ flex: '1 1 10rem' }}>
+            <label className="field-label" htmlFor={`condition-claim-${index}`}>{t.conditions.claimPath}</label>
+            <input
+              id={`condition-claim-${index}`}
+              type="text"
+              value={normalizedCondition.claim_path ?? ''}
+              onChange={(event) => onUpdate(index, { claim_path: event.target.value })}
+              className="field-input"
+              placeholder="roles.0"
+            />
+            <p className="field-hint">{t.conditions.claimPathHint}</p>
+          </div>
+        ) : (
+          <div className="form-group" style={{ flex: '1 1 10rem' }}>
+            <label className="field-label" htmlFor={`condition-key-${index}`}>{t.conditions.key}</label>
+            <input
+              id={`condition-key-${index}`}
+              type="text"
+              value={normalizedCondition.key ?? ''}
+              onChange={(event) => onUpdate(index, { key: event.target.value })}
+              className="field-input"
+              placeholder={normalizedCondition.type === 'header' ? 'Host' : 'session'}
+            />
+            <p className="field-hint">
+              {normalizedCondition.type === 'header' ? t.conditions.keyHintHeader : t.conditions.keyHintCookie}
+            </p>
+          </div>
+        )}
 
-      <div style={{ display: 'grid', gap: '1rem' }}>
-        {conditions.map((condition, index) => {
-          const normalizedCondition = normalizeCondition(condition);
-          const isJwt = normalizedCondition.type === 'jwt';
-          const isExists = normalizedCondition.operator === 'exists';
+        <div className="form-group" style={{ flex: '1 1 8rem' }}>
+          <label className="field-label" htmlFor={`condition-op-${index}`}>{t.conditions.operator}</label>
+          <select
+            id={`condition-op-${index}`}
+            value={normalizedCondition.operator}
+            onChange={(event) => onUpdate(index, { operator: event.target.value as ConditionOperator })}
+            className="field-select"
+          >
+            {operators.map((operator) => (
+              <option key={operator} value={operator}>
+                {operator}
+              </option>
+            ))}
+          </select>
+        </div>
 
-          return (
-            <div
-              key={index}
-              style={{
-                border: '1px solid #eee',
-                borderRadius: '0.5rem',
-                display: 'grid',
-                gap: '0.75rem',
-                padding: '1rem',
-              }}
-            >
-              <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
-                <label style={{ display: 'grid', gap: '0.25rem' }}>
-                  Type
-                  <select
-                    value={normalizedCondition.type}
-                    onChange={(event) =>
-                      updateCondition(index, {
-                        type: event.target.value as ConditionType,
-                        key: event.target.value === 'jwt' ? undefined : normalizedCondition.key,
-                        claim_path: event.target.value === 'jwt' ? normalizedCondition.claim_path : undefined,
-                      })
-                    }
-                  >
-                    {conditionTypes.map((conditionType) => (
-                      <option key={conditionType} value={conditionType}>
-                        {labels[conditionType]}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                {isJwt ? (
-                  <label style={{ display: 'grid', gap: '0.25rem' }}>
-                    Claim path
-                    <input
-                      type="text"
-                      value={normalizedCondition.claim_path ?? ''}
-                      onChange={(event) => updateCondition(index, { claim_path: event.target.value })}
-                      placeholder="roles.0"
-                    />
-                  </label>
-                ) : (
-                  <label style={{ display: 'grid', gap: '0.25rem' }}>
-                    Key
-                    <input
-                      type="text"
-                      value={normalizedCondition.key ?? ''}
-                      onChange={(event) => updateCondition(index, { key: event.target.value })}
-                      placeholder={normalizedCondition.type === 'header' ? 'Host' : 'session'}
-                    />
-                  </label>
-                )}
-
-                <label style={{ display: 'grid', gap: '0.25rem' }}>
-                  Operator
-                  <select
-                    value={normalizedCondition.operator}
-                    onChange={(event) => updateCondition(index, { operator: event.target.value as ConditionOperator })}
-                  >
-                    {operators.map((operator) => (
-                      <option key={operator} value={operator}>
-                        {labels[operator]}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                {!isExists && (
-                  <label style={{ display: 'grid', gap: '0.25rem' }}>
-                    Value
-                    <input
-                      type="text"
-                      value={normalizedCondition.value ?? ''}
-                      onChange={(event) => updateCondition(index, { value: event.target.value })}
-                    />
-                  </label>
-                )}
-              </div>
-
-              <div>
-                <button type="button" onClick={() => removeCondition(index)}>
-                  Remove condition
-                </button>
-              </div>
-            </div>
-          );
-        })}
+        {!isExists && (
+          <div className="form-group" style={{ flex: '1 1 10rem' }}>
+            <label className="field-label" htmlFor={`condition-value-${index}`}>{t.conditions.value}</label>
+            <input
+              id={`condition-value-${index}`}
+              type="text"
+              value={normalizedCondition.value ?? ''}
+              onChange={(event) => onUpdate(index, { value: event.target.value })}
+              className="field-input"
+            />
+          </div>
+        )}
       </div>
 
-      <button type="button" onClick={addCondition} style={{ marginTop: '1rem' }}>
-        Add condition
+      <button
+        type="button"
+        className="btn-danger btn-sm"
+        onClick={() => onRemove(index)}
+        aria-label={`${t.conditions.remove} ${index + 1}`}
+      >
+        {t.conditions.remove}
       </button>
-    </fieldset>
+    </div>
+  );
+});
+
+function ConditionBuilder({ conditions, onChange }: ConditionBuilderProps) {
+  const { t } = useI18n();
+
+  const updateCondition = useCallback(
+    (index: number, updates: Partial<RuleCondition>) => {
+      const nextConditions = conditions.map((condition, currentIndex) => {
+        if (currentIndex !== index) return condition;
+        return normalizeCondition({ ...condition, ...updates });
+      });
+      onChange(nextConditions);
+    },
+    [conditions, onChange],
+  );
+
+  const addCondition = useCallback(() => {
+    onChange([...conditions, createCondition()]);
+  }, [conditions, onChange]);
+
+  const removeCondition = useCallback(
+    (index: number) => {
+      onChange(conditions.filter((_, currentIndex) => currentIndex !== index));
+    },
+    [conditions, onChange],
+  );
+
+  return (
+    <div className="form-section">
+      <h2 className="form-section__title">{t.conditions.title}</h2>
+
+      {conditions.length === 0 && (
+        <p style={{ color: 'var(--color-gray-400)', fontSize: 'var(--text-sm)', margin: 0 }}>
+          {t.conditions.empty}
+        </p>
+      )}
+
+      <div style={{ display: 'grid', gap: 'var(--space-3)' }}>
+        {conditions.map((condition, index) => (
+          <ConditionCard
+            key={index}
+            condition={condition}
+            index={index}
+            onUpdate={updateCondition}
+            onRemove={removeCondition}
+          />
+        ))}
+      </div>
+
+      <button type="button" className="btn-secondary btn-sm" onClick={addCondition} style={{ marginTop: 'var(--space-4)' }}>
+        {t.conditions.addCondition}
+      </button>
+    </div>
   );
 }
 

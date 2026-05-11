@@ -204,7 +204,7 @@ pub enum Operator {
     Contains,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Condition {
     #[serde(rename = "type")]
     pub condition_type: ConditionType,
@@ -214,7 +214,7 @@ pub struct Condition {
     pub value: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rule {
     pub id: String,
     pub name: String,

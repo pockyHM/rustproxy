@@ -2,8 +2,9 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { createRule, getRules, getUpstreams, updateRule } from '../api/client';
+import { useI18n } from '../i18n';
 import ConditionBuilder from '../components/ConditionBuilder';
-import type { RuleCondition } from '../components/ConditionBuilder';
+import type { RuleCondition } from '../types/conditions';
 
 type Rule = {
   id: string;
@@ -37,7 +38,6 @@ const unwrapApiData = <T,>(payload: T | ApiResponse<T>): T => {
   if (payload && typeof payload === 'object' && 'data' in payload) {
     return (payload as ApiResponse<T>).data;
   }
-
   return payload as T;
 };
 
@@ -56,26 +56,26 @@ const sanitizeConditions = (conditions: RuleCondition[]): RuleCondition[] =>
       type: condition.type,
       operator: condition.operator,
     };
-
     if (condition.type === 'jwt') {
       next.claim_path = condition.claim_path ?? '';
     } else {
       next.key = condition.key ?? '';
     }
-
     if (condition.operator !== 'exists') {
       next.value = condition.value ?? '';
     }
-
     return next;
   });
 
 function RuleEditor() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { t } = useI18n();
   const isNewRule = id === undefined || id === 'new';
   const [form, setForm] = useState<RuleFormState>(createEmptyForm);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  const errorId = 'rule-save-error';
 
   const rulesQuery = useQuery({
     queryKey: ['rules'],
@@ -95,10 +95,7 @@ function RuleEditor() {
   });
 
   const existingRule = useMemo(() => {
-    if (isNewRule || !rulesQuery.data) {
-      return undefined;
-    }
-
+    if (isNewRule || !rulesQuery.data) return undefined;
     return rulesQuery.data.find((rule) => rule.id === id);
   }, [id, isNewRule, rulesQuery.data]);
 
@@ -144,99 +141,190 @@ function RuleEditor() {
       } else {
         await updateRule(rule.id, rule);
       }
-
       navigate('/rules');
     } catch (error) {
-      setSaveError(error instanceof Error ? error.message : 'Unable to save rule.');
+      setSaveError(error instanceof Error ? error.message : t.common.saveFail);
     }
   };
 
   if (!isNewRule && rulesQuery.isLoading) {
     return (
-      <section>
-        <h2>Edit Rule</h2>
-        <p>Loading rule...</p>
-      </section>
+      <div className="page">
+        <div className="page-header">
+          <div>
+            <h1 className="page-header__title">{t.ruleEditor.editTitle}</h1>
+          </div>
+        </div>
+        <div className="loading-state">{t.common.loading}</div>
+      </div>
     );
   }
 
   if (!isNewRule && rulesQuery.data && !existingRule) {
     return (
-      <section>
-        <h2>Edit Rule</h2>
-        <p>Rule not found.</p>
-        <p>
-          Return to the <Link to="/rules">rule list</Link>.
-        </p>
-      </section>
+      <div className="page">
+        <div className="page-header">
+          <div>
+            <h1 className="page-header__title">{t.ruleEditor.editTitle}</h1>
+          </div>
+        </div>
+        <div className="empty-state">
+          {t.ruleEditor.notFound}{' '}
+          <Link to="/rules">
+            {t.common.returnToList.replace('{page}', t.ruleEditor.ruleList)}
+          </Link>
+        </div>
+      </div>
     );
   }
 
+  const hasConditions = form.conditions.length > 0;
+
   return (
-    <section>
-      <h2>{isNewRule ? 'Create Rule' : `Edit Rule: ${id}`}</h2>
-      <p>{isNewRule ? 'Define a new routing rule.' : 'Update routing rule conditions and upstream targets.'}</p>
+    <div className="page">
+      <div className="page-header">
+        <div>
+          <h1 className="page-header__title">
+            {isNewRule ? t.ruleEditor.createTitle : t.ruleEditor.editTitle}
+          </h1>
+          <p className="page-header__desc">
+            {isNewRule ? t.ruleEditor.createDesc : t.ruleEditor.editDesc}
+          </p>
+        </div>
+      </div>
 
-      {rulesQuery.isError && <p>Unable to load rule data.</p>}
-      {upstreamsQuery.isError && <p>Unable to load upstream options.</p>}
-      {saveError && <p>{saveError}</p>}
+      {rulesQuery.isError && <div className="message message--error">{t.ruleEditor.loadFail}</div>}
+      {upstreamsQuery.isError && <div className="message message--error">{t.ruleEditor.upstreamLoadFail}</div>}
+      {saveError && (
+        <p id={errorId} className="message message--error" role="alert" aria-live="assertive">
+          {saveError}
+        </p>
+      )}
 
-      <form onSubmit={handleSubmit} style={{ display: 'grid', gap: '1rem', maxWidth: '48rem' }}>
-        {isNewRule && (
-          <label style={{ display: 'grid', gap: '0.25rem' }}>
-            Rule ID
-            <input type="text" value={form.id} onChange={(event) => updateField('id', event.target.value)} required />
-          </label>
-        )}
+      <form onSubmit={handleSubmit} aria-describedby={saveError ? errorId : undefined}>
+        <div className="form-section" style={{ marginBottom: 'var(--space-5)' }}>
+          <h2 className="form-section__title">{t.ruleEditor.general}</h2>
 
-        <label style={{ display: 'grid', gap: '0.25rem' }}>
-          Name
-          <input type="text" value={form.name} onChange={(event) => updateField('name', event.target.value)} required />
-        </label>
+          {isNewRule && (
+            <div className="form-group">
+              <label className="field-label" htmlFor="rule-id">{t.ruleEditor.ruleId}</label>
+              <input
+                id="rule-id"
+                type="text"
+                value={form.id}
+                onChange={(event) => updateField('id', event.target.value)}
+                className="field-input"
+                required
+                style={{ maxWidth: '24rem' }}
+              />
+              <p className="field-hint">{t.ruleEditor.ruleIdHint}</p>
+            </div>
+          )}
 
-        <label style={{ display: 'grid', gap: '0.25rem' }}>
-          Priority
-          <input
-            type="number"
-            value={form.priority}
-            onChange={(event) => updateField('priority', event.target.value)}
-            required
-          />
-        </label>
+          <div className="form-group">
+            <label className="field-label" htmlFor="rule-name">{t.ruleEditor.name}</label>
+            <input
+              id="rule-name"
+              type="text"
+              value={form.name}
+              onChange={(event) => updateField('name', event.target.value)}
+              className="field-input"
+              required
+              style={{ maxWidth: '32rem' }}
+            />
+            <p className="field-hint">{t.ruleEditor.nameHint}</p>
+          </div>
 
-        <ConditionBuilder conditions={form.conditions} onChange={(conditions) => updateField('conditions', conditions)} />
+          <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap' }}>
+            <div className="form-group" style={{ flex: '1 1 10rem', maxWidth: '14rem' }}>
+              <label className="field-label" htmlFor="rule-priority">{t.ruleEditor.priority}</label>
+              <input
+                id="rule-priority"
+                type="number"
+                value={form.priority}
+                onChange={(event) => updateField('priority', event.target.value)}
+                className="field-input"
+                required
+              />
+              <p className="field-hint">{t.ruleEditor.priorityHint}</p>
+            </div>
+            <div className="form-group" style={{ flex: '1 1 10rem', maxWidth: '14rem' }}>
+              <label className="field-label" htmlFor="rule-weight">{t.ruleEditor.weight}</label>
+              <input
+                id="rule-weight"
+                type="number"
+                min="0"
+                value={form.weight}
+                onChange={(event) => updateField('weight', event.target.value)}
+                className="field-input"
+                required
+              />
+              <p className="field-hint">{t.ruleEditor.weightHint}</p>
+            </div>
+          </div>
+        </div>
 
-        <label style={{ display: 'grid', gap: '0.25rem' }}>
-          Upstream
-          <select value={form.upstream} onChange={(event) => updateField('upstream', event.target.value)} required>
-            <option value="" disabled>
-              Select upstream
-            </option>
-            {upstreamsQuery.data?.map((upstream) => (
-              <option key={upstream.name} value={upstream.name}>
-                {upstream.name}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div style={{ marginBottom: 'var(--space-5)' }}>
+          <ConditionBuilder conditions={form.conditions} onChange={(conditions) => updateField('conditions', conditions)} />
+        </div>
 
-        <label style={{ display: 'grid', gap: '0.25rem' }}>
-          Weight
-          <input
-            type="number"
-            min="0"
-            value={form.weight}
-            onChange={(event) => updateField('weight', event.target.value)}
-            required
-          />
-        </label>
+        <div className="form-section" style={{ marginBottom: 'var(--space-5)' }}>
+          <h2 className="form-section__title">{t.ruleEditor.upstreamSection}</h2>
+          <div className="form-group">
+            <label className="field-label" htmlFor="rule-upstream">{t.ruleEditor.targetUpstream}</label>
+            <select
+              id="rule-upstream"
+              value={form.upstream}
+              onChange={(event) => updateField('upstream', event.target.value)}
+              className="field-select"
+              required
+              style={{ maxWidth: '24rem' }}
+            >
+              <option value="" disabled>{t.ruleEditor.selectUpstream}</option>
+              {upstreamsQuery.data?.map((upstream) => (
+                <option key={upstream.name} value={upstream.name}>{upstream.name}</option>
+              ))}
+            </select>
+          </div>
+        </div>
 
-        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-          <button type="submit">Save rule</button>
-          <Link to="/rules">Cancel</Link>
+        {/* Preview */}
+        <div className="preview-panel" style={{ marginBottom: 'var(--space-5)' }}>
+          <h3 className="preview-panel__title">{t.ruleEditor.preview}</h3>
+          <p className="preview-panel__text">
+            {hasConditions
+              ? <>
+                  {t.ruleEditor.previewMatches}{' '}
+                  {form.conditions.map((c, i) => (
+                    <span key={i}>
+                      <strong>{c.type === 'jwt' ? c.claim_path : c.key}</strong> {c.operator}
+                      {c.operator !== 'exists' && c.value ? ` "${c.value}"` : ''}
+                      {i < form.conditions.length - 1 && ` ${t.ruleEditor.previewAnd} `}
+                    </span>
+                  ))}
+                  {' '}{t.ruleEditor.previewRoutes}{' '}
+                  <strong>{form.upstream || '?'}</strong>{' '}
+                  {t.ruleEditor.previewWithWeight.replace('{weight}', form.weight)}
+                </>
+              : <>
+                  {t.ruleEditor.previewAlways}{' '}
+                  <strong>{form.upstream || '?'}</strong>{' '}
+                  {t.ruleEditor.previewWithWeight.replace('{weight}', form.weight)}
+                </>
+            }
+            <br />
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-gray-400)' }}>
+              {t.ruleEditor.previewPriority.replace('{priority}', form.priority)}
+            </span>
+          </p>
+        </div>
+
+        <div className="form-actions">
+          <button type="submit" className="btn-primary">{t.ruleEditor.saveRule}</button>
+          <Link to="/rules" className="btn-ghost">{t.common.cancel}</Link>
         </div>
       </form>
-    </section>
+    </div>
   );
 }
 

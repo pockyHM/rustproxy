@@ -1,10 +1,7 @@
-use jsonwebtoken::decode;
 use regex::Regex;
 use serde_json::Value;
 
 use crate::models::rule::Operator;
-
-use std::collections::HashMap;
 
 /// Decode a JWT token and extract the payload (without signature verification).
 fn decode_jwt_payload(token: &str) -> Option<Value> {
@@ -28,7 +25,7 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 /// Navigate a JSON value through a dot-separated path (e.g., "user.metadata.tenant_id").
-fn navigate_path(value: &Value, path: &str) -> Option<&Value> {
+fn navigate_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current: &Value = value;
 
@@ -116,6 +113,7 @@ pub fn match_jwt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // Helper to create a test JWT (header.payload.signature with base64url encoding)
     fn create_test_jwt(claims: Value) -> String {
