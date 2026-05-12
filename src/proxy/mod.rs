@@ -77,6 +77,19 @@ pub async fn handle_proxy(
         Ok(uri) => uri,
         Err(_) => return Ok(bad_gateway()),
     };
+
+    // Set the Host header to match the target
+    if let Some(host) = target_uri.host() {
+        let host_value = if let Some(port) = target_uri.port_u16() {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        if let Ok(value) = http::HeaderValue::from_str(&host_value) {
+            request.headers_mut().insert("host", value);
+        }
+    }
+
     *request.uri_mut() = target_uri;
 
     let is_https = request
@@ -91,7 +104,10 @@ pub async fn handle_proxy(
     };
 
     match response {
-        Ok(resp) => Ok(resp.map(Body::new)),
+        Ok(resp) => {
+            tracing::debug!(status = %resp.status(), "proxy response received");
+            Ok(resp.map(Body::new))
+        }
         Err(e) => {
             tracing::warn!(%e, "proxy request failed");
             Ok(bad_gateway())
@@ -108,7 +124,7 @@ fn send_http(request: Request<Body>) -> hyper_util::client::legacy::ResponseFutu
 fn send_https(request: Request<Body>, skip_ssl: bool) -> hyper_util::client::legacy::ResponseFuture {
     let client: Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>;
 
-    let config = if skip_ssl {
+    let tls_config = if skip_ssl {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
@@ -123,7 +139,7 @@ fn send_https(request: Request<Body>, skip_ssl: bool) -> hyper_util::client::leg
             .with_no_client_auth()
     };
     let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(config)
+        .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
         .enable_http2()
