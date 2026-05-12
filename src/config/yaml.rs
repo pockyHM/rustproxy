@@ -11,6 +11,8 @@ pub struct Fallback {
 pub struct AppConfig {
     pub version: String,
     pub listen: String,
+    #[serde(default)]
+    pub skip_ssl: bool,
     pub rules: Vec<Rule>,
     pub upstreams: HashMap<String, Upstream>,
     pub fallback: Fallback,

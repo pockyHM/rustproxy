@@ -220,6 +220,9 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     let version = get_setting(conn, "version").unwrap_or(None).unwrap_or_default();
     let listen = get_setting(conn, "listen").unwrap_or(None).unwrap_or_else(|| "127.0.0.1:3000".to_string());
     let fallback_url = get_setting(conn, "fallback_url").unwrap_or(None).unwrap_or_default();
+    let skip_ssl = get_setting(conn, "skip_ssl").unwrap_or(None)
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     let rules = load_rules(conn)?;
     let upstreams = load_upstreams(conn)?;
@@ -232,6 +235,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     Ok(AppConfig {
         version,
         listen,
+        skip_ssl,
         rules,
         upstreams: upstream_map,
         fallback: Fallback { url: fallback_url },
@@ -352,6 +356,7 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
     set_setting_tx(tx, "version", &config.version)?;
     set_setting_tx(tx, "listen", &config.listen)?;
     set_setting_tx(tx, "fallback_url", &config.fallback.url)?;
+    set_setting_tx(tx, "skip_ssl", if config.skip_ssl { "true" } else { "false" })?;
 
     // Upstreams
     for upstream in config.upstreams.values() {
@@ -560,6 +565,7 @@ mod tests {
                 m
             },
             fallback: Fallback { url: "http://fallback".to_string() },
+            skip_ssl: false,
         }
     }
 
