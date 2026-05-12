@@ -7,6 +7,7 @@ import Login from './pages/Login';
 import Setup from './pages/Setup';
 import ConfigEditor from './pages/ConfigEditor';
 import Dashboard from './pages/Dashboard';
+import Settings from './pages/Settings';
 import RuleEditor from './pages/RuleEditor';
 import RuleList from './pages/RuleList';
 import UpstreamEditor from './pages/UpstreamEditor';
@@ -15,7 +16,7 @@ import { getSetupStatus } from './api/client';
 
 type NavItem = {
   to: string;
-  labelKey: 'dashboard' | 'rules' | 'upstreams' | 'config';
+  labelKey: 'dashboard' | 'rules' | 'upstreams' | 'settings' | 'config';
   end?: boolean;
 };
 
@@ -23,6 +24,7 @@ const navItems: NavItem[] = [
   { to: '/', labelKey: 'dashboard', end: true },
   { to: '/rules', labelKey: 'rules' },
   { to: '/upstreams', labelKey: 'upstreams' },
+  { to: '/settings', labelKey: 'settings' },
   { to: '/config', labelKey: 'config' },
 ];
 
@@ -150,6 +152,14 @@ function AppRoutes() {
             element={
               <ProtectedRoute>
                 <UpstreamEditor />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/settings"
+            element={
+              <ProtectedRoute>
+                <Settings />
               </ProtectedRoute>
             }
           />
