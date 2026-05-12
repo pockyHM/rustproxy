@@ -7,10 +7,9 @@ use std::{convert::Infallible, sync::Arc};
 
 use axum::body::Body;
 use http::{Request, Response, StatusCode, Uri};
-use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
-};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use rustls_native_certs::load_native_certs;
 
 use crate::{config::yaml::AppConfig, proxy::balancer::Balancer, proxy::matcher::Matcher};
 
@@ -32,12 +31,50 @@ pub async fn handle_proxy(
     };
     *request.uri_mut() = target_uri;
 
-    let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
+    let is_https = request
+        .uri()
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
 
-    match client.request(request).await {
-        Ok(response) => Ok(response.map(Body::new)),
-        Err(_) => Ok(bad_gateway()),
+    let response = if is_https {
+        send_https(request).await
+    } else {
+        send_http(request).await
+    };
+
+    match response {
+        Ok(resp) => Ok(resp.map(Body::new)),
+        Err(e) => {
+            tracing::warn!(%e, "proxy request failed");
+            Ok(bad_gateway())
+        }
     }
+}
+
+fn send_http(request: Request<Body>) -> hyper_util::client::legacy::ResponseFuture {
+    let client: Client<hyper_util::client::legacy::connect::HttpConnector, Body> =
+        Client::builder(TokioExecutor::new()).build_http();
+    client.request(request)
+}
+
+fn send_https(request: Request<Body>) -> hyper_util::client::legacy::ResponseFuture {
+    let client: Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>;
+
+    let mut root_certs = rustls::RootCertStore::empty();
+    for cert in load_native_certs().expect("failed to load native certs") {
+        root_certs.add(cert).ok();
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_certs)
+        .with_no_client_auth();
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    client = Client::builder(TokioExecutor::new()).build(https);
+    client.request(request)
 }
 
 fn request_for_matching(request: &Request<Body>) -> Request<()> {

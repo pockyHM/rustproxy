@@ -7,7 +7,10 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 hyper = "1"
-hyper-util = { version = "0.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full", "tokio"] }
+hyper-rustls = { version = "0.27", features = ["http2"] }
+rustls = "0.23"
+rustls-native-certs = "0.7"
 http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
