@@ -1,10 +1,11 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { getConfig, getMetrics } from '../api/client';
+import { getConfig, getMetrics, updateConfig } from '../api/client';
 import { useI18n } from '../i18n';
 
 type ProxyConfig = {
   listen?: string;
+  skip_ssl?: boolean;
   rules?: unknown[] | Record<string, unknown>;
   upstreams?: unknown[] | Record<string, unknown>;
 };
@@ -38,14 +39,24 @@ const formatMetricPreview = (metrics: unknown): string[] => {
 
 function Dashboard() {
   const { t } = useI18n();
+  const queryClient = useQueryClient();
 
   const configQuery = useQuery({
     queryKey: ['config'],
     queryFn: async () => {
       const response = await getConfig();
-      return response.data as ProxyConfig;
+      const data = response.data?.data ?? response.data;
+      return data as ProxyConfig;
     },
   });
+
+  const toggleSkipSsl = async () => {
+    const data = configQuery.data;
+    if (!data) return;
+    const updated = { ...data, skip_ssl: !data.skip_ssl };
+    await updateConfig(updated);
+    queryClient.setQueryData(['config'], updated);
+  };
 
   const metricsQuery = useQuery({
     queryKey: ['metrics'],
@@ -128,6 +139,17 @@ function Dashboard() {
             )}
             <div>{ruleCount} {t.dashboard.rulesCount}, {totalConditions} {t.dashboard.conditions}</div>
             <div>{upstreamCount} {t.dashboard.upstreamsCount}, {totalTargets} {t.dashboard.targets}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginTop: 'var(--space-2)' }}>
+              <button
+                type="button"
+                className={`btn-sm ${config?.skip_ssl ? 'btn-danger' : 'btn-secondary'}`}
+                onClick={toggleSkipSsl}
+                style={{ fontSize: 'var(--text-xs)' }}
+              >
+                {config?.skip_ssl ? t.dashboard.sslSkipOn : t.dashboard.sslSkipOff}
+              </button>
+              <span style={{ fontSize: 'var(--text-xs)' }}>{t.dashboard.sslSkipHint}</span>
+            </div>
           </div>
         </div>
       </div>

@@ -59,6 +59,9 @@ const zh: Translations = {
     upstreamsCount: '个上游',
     conditions: '个条件',
     targets: '个目标',
+    sslSkipOn: 'SSL 校验：已跳过',
+    sslSkipOff: 'SSL 校验：已开启',
+    sslSkipHint: '切换是否跳过上游 TLS 证书校验。',
   },
   rules: {
     title: '规则',

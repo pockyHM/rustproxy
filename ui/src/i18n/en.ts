@@ -57,6 +57,9 @@ const en = {
     upstreamsCount: 'Upstreams configured',
     conditions: 'Conditions',
     targets: 'Targets',
+    sslSkipOn: 'SSL Verify: OFF',
+    sslSkipOff: 'SSL Verify: ON',
+    sslSkipHint: 'Toggle to skip upstream TLS certificate verification.',
   },
   rules: {
     title: 'Rules',
