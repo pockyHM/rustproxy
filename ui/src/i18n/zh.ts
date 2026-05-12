@@ -62,6 +62,8 @@ const zh: Translations = {
     sslSkipOn: 'SSL 校验：已跳过',
     sslSkipOff: 'SSL 校验：已开启',
     sslSkipHint: '切换是否跳过上游 TLS 证书校验。',
+    connectTimeout: '连接超时',
+    requestTimeout: '请求超时',
   },
   rules: {
     title: '规则',

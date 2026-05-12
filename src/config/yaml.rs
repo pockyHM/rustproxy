@@ -13,9 +13,21 @@ pub struct AppConfig {
     pub listen: String,
     #[serde(default)]
     pub skip_ssl: bool,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u64,
     pub rules: Vec<Rule>,
     pub upstreams: HashMap<String, Upstream>,
     pub fallback: Fallback,
+}
+
+fn default_connect_timeout() -> u64 {
+    10
+}
+
+fn default_request_timeout() -> u64 {
+    60
 }
 
 impl AppConfig {

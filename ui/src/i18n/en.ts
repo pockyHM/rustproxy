@@ -60,6 +60,8 @@ const en = {
     sslSkipOn: 'SSL Verify: OFF',
     sslSkipOff: 'SSL Verify: ON',
     sslSkipHint: 'Toggle to skip upstream TLS certificate verification.',
+    connectTimeout: 'Connect timeout',
+    requestTimeout: 'Request timeout',
   },
   rules: {
     title: 'Rules',

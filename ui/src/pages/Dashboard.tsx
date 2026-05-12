@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { getConfig, getMetrics, updateConfig } from '../api/client';
@@ -6,6 +7,8 @@ import { useI18n } from '../i18n';
 type ProxyConfig = {
   listen?: string;
   skip_ssl?: boolean;
+  connect_timeout?: number;
+  request_timeout?: number;
   rules?: unknown[] | Record<string, unknown>;
   upstreams?: unknown[] | Record<string, unknown>;
 };
@@ -37,6 +40,33 @@ const formatMetricPreview = (metrics: unknown): string[] => {
   return JSON.stringify(metrics, null, 2).split('\n').slice(0, 10);
 };
 
+function TimeoutInput({ label, value, onChange }: {
+  label: string;
+  value: number;
+  onChange: (value: string) => void;
+}) {
+  const [text, setText] = useState(String(value));
+  const [focused, setFocused] = useState(false);
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+      <span style={{ fontSize: 'var(--text-xs)', minWidth: '5.5rem' }}>{label}</span>
+      <input
+        type="number"
+        min="0"
+        value={focused ? text : value}
+        onChange={(e) => setText(e.target.value)}
+        onFocus={() => { setFocused(true); setText(String(value)); }}
+        onBlur={() => { setFocused(false); onChange(text); }}
+        onKeyDown={(e) => { if (e.key === 'Enter') { e.currentTarget.blur(); } }}
+        className="field-input"
+        style={{ width: '4.5rem', padding: '2px var(--space-2)', fontSize: 'var(--text-xs)', textAlign: 'right' }}
+      />
+      <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-gray-400)' }}>s</span>
+    </div>
+  );
+}
+
 function Dashboard() {
   const { t } = useI18n();
   const queryClient = useQueryClient();
@@ -54,6 +84,16 @@ function Dashboard() {
     const data = configQuery.data;
     if (!data) return;
     const updated = { ...data, skip_ssl: !data.skip_ssl };
+    await updateConfig(updated);
+    queryClient.setQueryData(['config'], updated);
+  };
+
+  const updateTimeout = async (field: 'connect_timeout' | 'request_timeout', value: string) => {
+    const data = configQuery.data;
+    if (!data) return;
+    const num = value === '' ? 0 : parseInt(value, 10);
+    if (isNaN(num) || num < 0) return;
+    const updated = { ...data, [field]: num };
     await updateConfig(updated);
     queryClient.setQueryData(['config'], updated);
   };
@@ -139,16 +179,27 @@ function Dashboard() {
             )}
             <div>{ruleCount} {t.dashboard.rulesCount}, {totalConditions} {t.dashboard.conditions}</div>
             <div>{upstreamCount} {t.dashboard.upstreamsCount}, {totalTargets} {t.dashboard.targets}</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginTop: 'var(--space-2)' }}>
-              <button
-                type="button"
-                className={`btn-sm ${config?.skip_ssl ? 'btn-danger' : 'btn-secondary'}`}
-                onClick={toggleSkipSsl}
-                style={{ fontSize: 'var(--text-xs)' }}
-              >
-                {config?.skip_ssl ? t.dashboard.sslSkipOn : t.dashboard.sslSkipOff}
-              </button>
-              <span style={{ fontSize: 'var(--text-xs)' }}>{t.dashboard.sslSkipHint}</span>
+            <div style={{ marginTop: 'var(--space-3)', display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                <button
+                  type="button"
+                  className={`btn-sm ${config?.skip_ssl ? 'btn-danger' : 'btn-secondary'}`}
+                  onClick={toggleSkipSsl}
+                  style={{ fontSize: 'var(--text-xs)' }}
+                >
+                  {config?.skip_ssl ? t.dashboard.sslSkipOn : t.dashboard.sslSkipOff}
+                </button>
+              </div>
+              <TimeoutInput
+                label={t.dashboard.connectTimeout}
+                value={config?.connect_timeout ?? 10}
+                onChange={(v) => updateTimeout('connect_timeout', v)}
+              />
+              <TimeoutInput
+                label={t.dashboard.requestTimeout}
+                value={config?.request_timeout ?? 60}
+                onChange={(v) => updateTimeout('request_timeout', v)}
+              />
             </div>
           </div>
         </div>

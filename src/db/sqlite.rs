@@ -223,6 +223,12 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     let skip_ssl = get_setting(conn, "skip_ssl").unwrap_or(None)
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    let connect_timeout = get_setting(conn, "connect_timeout").unwrap_or(None)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let request_timeout = get_setting(conn, "request_timeout").unwrap_or(None)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
 
     let rules = load_rules(conn)?;
     let upstreams = load_upstreams(conn)?;
@@ -236,6 +242,8 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         version,
         listen,
         skip_ssl,
+        connect_timeout,
+        request_timeout,
         rules,
         upstreams: upstream_map,
         fallback: Fallback { url: fallback_url },
@@ -357,6 +365,8 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
     set_setting_tx(tx, "listen", &config.listen)?;
     set_setting_tx(tx, "fallback_url", &config.fallback.url)?;
     set_setting_tx(tx, "skip_ssl", if config.skip_ssl { "true" } else { "false" })?;
+    set_setting_tx(tx, "connect_timeout", &config.connect_timeout.to_string())?;
+    set_setting_tx(tx, "request_timeout", &config.request_timeout.to_string())?;
 
     // Upstreams
     for upstream in config.upstreams.values() {
@@ -566,6 +576,8 @@ mod tests {
             },
             fallback: Fallback { url: "http://fallback".to_string() },
             skip_ssl: false,
+            connect_timeout: 10,
+            request_timeout: 60,
         }
     }
 

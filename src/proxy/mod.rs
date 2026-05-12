@@ -3,7 +3,7 @@ pub mod conditions;
 pub mod matcher;
 pub mod upstream;
 
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::body::Body;
 use http::{Request, Response, StatusCode, Uri};
@@ -97,33 +97,63 @@ pub async fn handle_proxy(
         .scheme_str()
         .is_some_and(|s| s.eq_ignore_ascii_case("https"));
 
-    let response = if is_https {
-        send_https(request, config.skip_ssl).await
+    let connect_timeout = if config.connect_timeout > 0 {
+        Some(Duration::from_secs(config.connect_timeout))
     } else {
-        send_http(request).await
+        None
     };
 
-    match response {
-        Ok(resp) => {
+    let request_timeout = if config.request_timeout > 0 {
+        Some(Duration::from_secs(config.request_timeout))
+    } else {
+        None
+    };
+
+    let send_future = if is_https {
+        send_https(request, config.skip_ssl, connect_timeout)
+    } else {
+        send_http(request, connect_timeout)
+    };
+
+    let result = match request_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, send_future).await,
+        None => Ok(send_future.await),
+    };
+
+    match result {
+        Ok(Ok(resp)) => {
             tracing::debug!(status = %resp.status(), "proxy response received");
             Ok(resp.map(Body::new))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(%e, "proxy request failed");
             Ok(bad_gateway())
+        }
+        Err(_) => {
+            tracing::warn!("proxy request timed out");
+            Ok(gateway_timeout())
         }
     }
 }
 
-fn send_http(request: Request<Body>) -> hyper_util::client::legacy::ResponseFuture {
+fn send_http(
+    request: Request<Body>,
+    connect_timeout: Option<Duration>,
+) -> hyper_util::client::legacy::ResponseFuture {
+    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    if let Some(timeout) = connect_timeout {
+        connector.set_connect_timeout(Some(timeout));
+    }
     let client: Client<hyper_util::client::legacy::connect::HttpConnector, Body> =
-        Client::builder(TokioExecutor::new()).build_http();
+        Client::builder(TokioExecutor::new()).build(connector);
     client.request(request)
 }
 
-fn send_https(request: Request<Body>, skip_ssl: bool) -> hyper_util::client::legacy::ResponseFuture {
-    let client: Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>;
-
+fn send_https(
+    request: Request<Body>,
+    skip_ssl: bool,
+    connect_timeout: Option<Duration>,
+) -> hyper_util::client::legacy::ResponseFuture {
     let tls_config = if skip_ssl {
         rustls::ClientConfig::builder()
             .dangerous()
@@ -138,13 +168,19 @@ fn send_https(request: Request<Body>, skip_ssl: bool) -> hyper_util::client::leg
             .with_root_certificates(root_certs)
             .with_no_client_auth()
     };
+
+    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    if let Some(timeout) = connect_timeout {
+        http_connector.set_connect_timeout(Some(timeout));
+    }
+
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .build();
-    client = Client::builder(TokioExecutor::new()).build(https);
+        .wrap_connector(http_connector);
+    let client = Client::builder(TokioExecutor::new()).build(https);
     client.request(request)
 }
 
@@ -171,6 +207,13 @@ fn bad_gateway() -> Response<Body> {
         .status(StatusCode::BAD_GATEWAY)
         .body(Body::from("Bad Gateway"))
         .expect("static bad gateway response is valid")
+}
+
+fn gateway_timeout() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .body(Body::from("Gateway Timeout"))
+        .expect("static gateway timeout response is valid")
 }
 
 #[cfg(test)]
