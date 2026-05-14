@@ -1,0 +1,8 @@
+version: "1.0"
+listen: "127.0.0.1:3000"
+proxy_listen: "0.0.0.0:9003"
+skip_ssl: true
+rules: []
+upstreams: {}
+fallback:
+  url: "http://127.0.0.1:8001"

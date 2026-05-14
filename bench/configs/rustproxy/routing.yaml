@@ -1,0 +1,120 @@
+version: "1.0"
+listen: "127.0.0.1:3000"
+proxy_listen: "0.0.0.0:9003"
+skip_ssl: true
+rules:
+  - id: "r1"
+    name: "Host api"
+    priority: 100
+    conditions:
+      - type: host
+        operator: exact
+        value: "api.example.com"
+    upstream: "b8001"
+    weight: 100
+  - id: "r2"
+    name: "Host web"
+    priority: 100
+    conditions:
+      - type: host
+        operator: exact
+        value: "web.example.com"
+    upstream: "b8002"
+    weight: 100
+  - id: "r3"
+    name: "Path /v1/"
+    priority: 90
+    conditions:
+      - type: path
+        operator: prefix
+        value: "/v1/"
+    upstream: "b8003"
+    weight: 100
+  - id: "r4"
+    name: "Path /v2/"
+    priority: 90
+    conditions:
+      - type: path
+        operator: prefix
+        value: "/v2/"
+    upstream: "b8004"
+    weight: 100
+  - id: "r5"
+    name: "Header X-Api-Key exists"
+    priority: 80
+    conditions:
+      - type: header
+        key: "X-Api-Key"
+        operator: exists
+    upstream: "b8001"
+    weight: 100
+  - id: "r6"
+    name: "Header X-Version=2"
+    priority: 80
+    conditions:
+      - type: header
+        key: "X-Version"
+        operator: exact
+        value: "2"
+    upstream: "b8002"
+    weight: 100
+  - id: "r7"
+    name: "Cookie session exists"
+    priority: 70
+    conditions:
+      - type: cookie
+        key: "session"
+        operator: exists
+    upstream: "b8003"
+    weight: 100
+  - id: "r8"
+    name: "Cookie env=prod"
+    priority: 70
+    conditions:
+      - type: cookie
+        key: "env"
+        operator: exact
+        value: "prod"
+    upstream: "b8004"
+    weight: 100
+  - id: "r9"
+    name: "Host CDN regex"
+    priority: 60
+    conditions:
+      - type: host
+        operator: regex
+        value: ".*\\.cdn\\.example\\.com"
+    upstream: "b8001"
+    weight: 100
+  - id: "r10"
+    name: "Path /health"
+    priority: 50
+    conditions:
+      - type: path
+        operator: prefix
+        value: "/health"
+    upstream: "b8002"
+    weight: 100
+upstreams:
+  b8001:
+    name: "b8001"
+    targets:
+      - url: "http://127.0.0.1:8001"
+        weight: 100
+  b8002:
+    name: "b8002"
+    targets:
+      - url: "http://127.0.0.1:8002"
+        weight: 100
+  b8003:
+    name: "b8003"
+    targets:
+      - url: "http://127.0.0.1:8003"
+        weight: 100
+  b8004:
+    name: "b8004"
+    targets:
+      - url: "http://127.0.0.1:8004"
+        weight: 100
+fallback:
+  url: "http://127.0.0.1:8001"

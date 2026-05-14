@@ -1,0 +1,25 @@
+version: "1.0"
+listen: "127.0.0.1:3000"
+proxy_listen: "0.0.0.0:9003"
+skip_ssl: true
+rules:
+  - id: "lb"
+    name: "Load balance"
+    priority: 1
+    conditions: []
+    upstream: "weighted"
+    weight: 100
+upstreams:
+  weighted:
+    name: "weighted"
+    targets:
+      - url: "http://127.0.0.1:8001"
+        weight: 4
+      - url: "http://127.0.0.1:8002"
+        weight: 3
+      - url: "http://127.0.0.1:8003"
+        weight: 2
+      - url: "http://127.0.0.1:8004"
+        weight: 1
+fallback:
+  url: "http://127.0.0.1:8001"
