@@ -56,7 +56,9 @@ fn embedded_asset_response(path: &str) -> Option<Response<Body>> {
 }
 
 fn asset_path_has_extension(path: &str) -> bool {
-    path.rsplit('/').next().is_some_and(|segment| segment.contains('.'))
+    path.rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.contains('.'))
 }
 
 #[cfg(test)]

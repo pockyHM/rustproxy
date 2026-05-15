@@ -3,17 +3,20 @@ use std::collections::HashMap;
 use http::Request;
 use rustproxy::{
     config::yaml::{AppConfig, Fallback},
-    models::{Condition, ConditionType, Operator, Rule, Target, Upstream},
+    models::{ConditionExpr, ConditionType, Operator, Rule, Target, Upstream},
     proxy::{balancer::Balancer, matcher::Matcher},
 };
 
 fn build_config() -> AppConfig {
     let canary_upstream = Upstream {
         name: "canary".to_string(),
+        skip_ssl: false,
+        websocket: false,
         targets: vec![Target {
             url: "http://canary.internal:8080".to_string(),
             weight: 100,
         }],
+        health_check: Default::default(),
     };
 
     let mut upstreams = HashMap::new();
@@ -22,24 +25,34 @@ fn build_config() -> AppConfig {
     AppConfig {
         version: "1.0".to_string(),
         listen: "127.0.0.1:0".to_string(),
+        proxy_listen: "0.0.0.0:80".to_string(),
         rules: vec![Rule {
             id: "canary-header".to_string(),
             name: "Route canary header".to_string(),
             priority: 100,
-            conditions: vec![Condition {
+            conditions: Some(ConditionExpr::Leaf {
                 condition_type: ConditionType::Header,
                 key: Some("x-route".to_string()),
                 claim_path: None,
                 operator: Operator::Exact,
                 value: Some("canary".to_string()),
-            }],
+            }),
             upstream: "canary".to_string(),
             weight: 100,
+            listen: None,
+            tls: None,
         }],
         upstreams,
         fallback: Fallback {
             url: "http://fallback.internal:8080".to_string(),
         },
+        connect_timeout: 10,
+        request_timeout: 60,
+        pool_max_idle_per_host: 32,
+        pool_idle_timeout: 90,
+        tcp_keepalive: 60,
+        certificates: Vec::new(),
+        tls_listeners: Vec::new(),
     }
 }
 
@@ -55,7 +68,7 @@ async fn test_header_routing() {
         .unwrap();
 
     let matched_rule = matcher
-        .match_request(&request)
+        .match_request(&request, None)
         .expect("header should match canary rule");
     let selected_target = balancer
         .select(&matched_rule.upstream)
@@ -74,10 +87,10 @@ async fn test_fallback_when_header_does_not_match() {
     let request = Request::builder().uri("/users").body(()).unwrap();
 
     let selected_target = matcher
-        .match_request(&request)
+        .match_request(&request, None)
         .and_then(|rule| balancer.select(&rule.upstream))
         .unwrap_or_else(|| config.fallback.url.clone());
 
-    assert!(matcher.match_request(&request).is_none());
+    assert!(matcher.match_request(&request, None).is_none());
     assert_eq!(selected_target, "http://fallback.internal:8080");
 }

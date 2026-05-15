@@ -1,8 +1,177 @@
 use anyhow::{Context, Result};
 use std::fs;
 
-use crate::config::yaml::AppConfig;
+use crate::cli::{RuleCommands, UpstreamCommands};
+use crate::config::yaml::{AppConfig, Fallback};
 use crate::db::{migration, Database};
+use crate::models::{ConditionExpr, ConditionType, Operator, Rule, Target, Upstream};
+
+const CONFIG_KEYS: &[&str] = &[
+    "version",
+    "listen",
+    "proxy_listen",
+    "fallback_url",
+    "connect_timeout",
+    "request_timeout",
+    "pool_max_idle_per_host",
+    "pool_idle_timeout",
+    "tcp_keepalive",
+];
+
+pub fn run_get(db_path: &str, key: Option<&str>) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let config = db.load_config()?;
+
+    match key {
+        Some(key) => {
+            println!("{}", get_config_value(&config, key)?);
+        }
+        None => {
+            for key in CONFIG_KEYS {
+                println!("{key}={}", get_config_value(&config, key)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn run_set(db_path: &str, key: &str, value: &str) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let mut config = db.load_config()?;
+    ensure_minimum_config(&mut config);
+    set_config_value(&mut config, key, value)?;
+    db.save_full_config(&config)?;
+    println!("{key}={}", get_config_value(&config, key)?);
+    Ok(())
+}
+
+pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let mut config = db.load_config()?;
+    ensure_minimum_config(&mut config);
+
+    match command {
+        UpstreamCommands::List => {
+            for upstream in config.upstreams.values() {
+                println!("{}:", upstream.name);
+                for target in &upstream.targets {
+                    println!("  {} weight={}", target.url, target.weight);
+                }
+            }
+            return Ok(());
+        }
+        UpstreamCommands::Add { name, url, weight } => {
+            validate_name("upstream", &name)?;
+            validate_upstream_url(&url)?;
+            if config.upstreams.contains_key(&name) {
+                anyhow::bail!("upstream '{name}' already exists");
+            }
+            config.upstreams.insert(
+                name.clone(),
+                Upstream {
+                    name: name.clone(),
+                    skip_ssl: false,
+                    websocket: false,
+                    targets: vec![Target { url, weight }],
+                    health_check: Default::default(),
+                },
+            );
+            db.save_full_config(&config)?;
+            println!("upstream {name} added");
+        }
+        UpstreamCommands::AddTarget { name, url, weight } => {
+            validate_upstream_url(&url)?;
+            let Some(upstream) = config.upstreams.get_mut(&name) else {
+                anyhow::bail!("upstream '{name}' not found");
+            };
+            upstream.targets.push(Target { url, weight });
+            db.save_full_config(&config)?;
+            println!("target added to upstream {name}");
+        }
+        UpstreamCommands::Delete { name } => {
+            if config.rules.iter().any(|rule| rule.upstream == name) {
+                anyhow::bail!("upstream '{name}' is still referenced by at least one rule");
+            }
+            if config.upstreams.remove(&name).is_none() {
+                anyhow::bail!("upstream '{name}' not found");
+            }
+            db.save_full_config(&config)?;
+            println!("upstream {name} deleted");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let mut config = db.load_config()?;
+    ensure_minimum_config(&mut config);
+
+    match command {
+        RuleCommands::List => {
+            for rule in &config.rules {
+                let listen = rule.listen.as_deref().unwrap_or("default");
+                println!(
+                    "{} priority={} upstream={} listen={} name={}",
+                    rule.id, rule.priority, rule.upstream, listen, rule.name
+                );
+            }
+            return Ok(());
+        }
+        RuleCommands::Add {
+            id,
+            name,
+            upstream,
+            priority,
+            weight,
+            listen,
+            condition_type,
+            operator,
+            value,
+            key,
+            claim_path,
+        } => {
+            validate_name("rule", &id)?;
+            if config.rules.iter().any(|rule| rule.id == id) {
+                anyhow::bail!("rule '{id}' already exists");
+            }
+            if !config.upstreams.contains_key(&upstream) {
+                anyhow::bail!("upstream '{upstream}' not found");
+            }
+            if let Some(listen) = listen.as_deref() {
+                validate_listen_addr(listen)?;
+            }
+
+            let conditions = build_condition(condition_type, operator, value, key, claim_path)?;
+            config.rules.push(Rule {
+                id: id.clone(),
+                name,
+                priority,
+                conditions,
+                upstream,
+                weight,
+                listen,
+                tls: None,
+            });
+            config.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+            db.save_full_config(&config)?;
+            println!("rule {id} added");
+        }
+        RuleCommands::Delete { id } => {
+            let before = config.rules.len();
+            config.rules.retain(|rule| rule.id != id);
+            if config.rules.len() == before {
+                anyhow::bail!("rule '{id}' not found");
+            }
+            db.save_full_config(&config)?;
+            println!("rule {id} deleted");
+        }
+    }
+
+    Ok(())
+}
 
 pub fn run_export(db_path: &str) -> Result<()> {
     let db = Database::open(db_path)?;
@@ -32,8 +201,7 @@ pub fn run_edit(db_path: &str) -> Result<()> {
     let yaml = migration::export_yaml(&db)?;
     let temp_dir = std::env::temp_dir();
     let temp_path = temp_dir.join("rustproxy-config-edit.yaml");
-    fs::write(&temp_path, &yaml)
-        .with_context(|| "failed to write temp config file")?;
+    fs::write(&temp_path, &yaml).with_context(|| "failed to write temp config file")?;
 
     let original_metadata = fs::metadata(&temp_path)?;
 
@@ -60,11 +228,241 @@ pub fn run_edit(db_path: &str) -> Result<()> {
 
     // Validate and reimport
     let content = fs::read_to_string(&temp_path)?;
-    let config: AppConfig = serde_yaml::from_str(&content)
-        .with_context(|| "YAML validation failed".to_string())?;
+    let config: AppConfig =
+        serde_yaml::from_str(&content).with_context(|| "YAML validation failed".to_string())?;
     migration::import_yaml(&db, &config)?;
     println!("Configuration updated.");
 
     let _ = fs::remove_file(&temp_path);
     Ok(())
+}
+
+fn ensure_minimum_config(config: &mut AppConfig) {
+    if config.version.is_empty() {
+        config.version = "1.0".to_string();
+    }
+    if config.listen.is_empty() {
+        config.listen = "127.0.0.1:3000".to_string();
+    }
+    if config.proxy_listen.is_empty() {
+        config.proxy_listen = "0.0.0.0:80".to_string();
+    }
+    if config.fallback.url.is_empty() {
+        config.fallback = Fallback {
+            url: "404".to_string(),
+        };
+    }
+}
+
+fn get_config_value(config: &AppConfig, key: &str) -> Result<String> {
+    match key {
+        "version" => Ok(config.version.clone()),
+        "listen" => Ok(config.listen.clone()),
+        "proxy_listen" => Ok(config.proxy_listen.clone()),
+        "fallback_url" => Ok(config.fallback.url.clone()),
+        "connect_timeout" => Ok(config.connect_timeout.to_string()),
+        "request_timeout" => Ok(config.request_timeout.to_string()),
+        "pool_max_idle_per_host" => Ok(config.pool_max_idle_per_host.to_string()),
+        "pool_idle_timeout" => Ok(config.pool_idle_timeout.to_string()),
+        "tcp_keepalive" => Ok(config.tcp_keepalive.to_string()),
+        _ => unknown_key(key),
+    }
+}
+
+fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> Result<()> {
+    match key {
+        "version" => config.version = value.to_string(),
+        "listen" => {
+            validate_listen_addr(value)?;
+            config.listen = value.to_string();
+        }
+        "proxy_listen" => {
+            validate_listen_addr(value)?;
+            config.proxy_listen = value.to_string();
+        }
+        "fallback_url" => {
+            validate_upstream_url(value)?;
+            config.fallback.url = value.to_string();
+        }
+        "connect_timeout" => config.connect_timeout = parse_u64(key, value)?,
+        "request_timeout" => config.request_timeout = parse_u64(key, value)?,
+        "pool_max_idle_per_host" => config.pool_max_idle_per_host = parse_usize(key, value)?,
+        "pool_idle_timeout" => config.pool_idle_timeout = parse_u64(key, value)?,
+        "tcp_keepalive" => config.tcp_keepalive = parse_u64(key, value)?,
+        _ => unknown_key(key)?,
+    }
+    Ok(())
+}
+
+fn parse_u64(key: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be a non-negative integer"))
+}
+
+fn parse_usize(key: &str, value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .with_context(|| format!("{key} must be a non-negative integer"))
+}
+
+fn validate_listen_addr(value: &str) -> Result<()> {
+    let Some((_, port)) = value.rsplit_once(':') else {
+        anyhow::bail!("listen address must include a port, for example 127.0.0.1:3000");
+    };
+    port.parse::<u16>()
+        .with_context(|| format!("invalid listen port in address: {value}"))?;
+    Ok(())
+}
+
+fn validate_upstream_url(value: &str) -> Result<()> {
+    if value == "404" {
+        return Ok(());
+    }
+    let uri = value
+        .parse::<http::Uri>()
+        .with_context(|| format!("invalid URL: {value}"))?;
+    match uri.scheme_str() {
+        Some("http") | Some("https") => Ok(()),
+        _ => anyhow::bail!("fallback_url must use http://, https://, or 404"),
+    }
+}
+
+fn validate_name(kind: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("{kind} name cannot be empty");
+    }
+    Ok(())
+}
+
+fn build_condition(
+    condition_type: Option<String>,
+    operator: Option<String>,
+    value: Option<String>,
+    key: Option<String>,
+    claim_path: Option<String>,
+) -> Result<Option<ConditionExpr>> {
+    let Some(condition_type) = condition_type else {
+        if operator.is_some() || value.is_some() || key.is_some() || claim_path.is_some() {
+            anyhow::bail!("--condition-type is required when condition options are provided");
+        }
+        return Ok(None);
+    };
+
+    let condition_type = parse_condition_type(&condition_type)?;
+    let operator = parse_operator(operator.as_deref().unwrap_or("exists"))?;
+
+    match condition_type {
+        ConditionType::Header | ConditionType::Cookie => {
+            if key.as_deref().unwrap_or("").is_empty() {
+                anyhow::bail!("--key is required for header and cookie conditions");
+            }
+        }
+        ConditionType::Jwt => {
+            if claim_path.as_deref().unwrap_or("").is_empty() {
+                anyhow::bail!("--claim-path is required for jwt conditions");
+            }
+        }
+        ConditionType::Host | ConditionType::Path => {}
+    }
+
+    if operator != Operator::Exists && value.is_none() {
+        anyhow::bail!("--value is required unless --operator exists is used");
+    }
+
+    Ok(Some(ConditionExpr::Leaf {
+        condition_type,
+        key,
+        claim_path,
+        operator,
+        value,
+    }))
+}
+
+fn parse_condition_type(value: &str) -> Result<ConditionType> {
+    match value.to_ascii_lowercase().as_str() {
+        "host" => Ok(ConditionType::Host),
+        "path" => Ok(ConditionType::Path),
+        "header" => Ok(ConditionType::Header),
+        "cookie" => Ok(ConditionType::Cookie),
+        "jwt" => Ok(ConditionType::Jwt),
+        _ => anyhow::bail!("condition type must be one of: host, path, header, cookie, jwt"),
+    }
+}
+
+fn parse_operator(value: &str) -> Result<Operator> {
+    match value.to_ascii_lowercase().as_str() {
+        "exact" => Ok(Operator::Exact),
+        "prefix" => Ok(Operator::Prefix),
+        "regex" => Ok(Operator::Regex),
+        "exists" => Ok(Operator::Exists),
+        "contains" => Ok(Operator::Contains),
+        _ => anyhow::bail!("operator must be one of: exact, prefix, regex, exists, contains"),
+    }
+}
+
+fn unknown_key<T>(key: &str) -> Result<T> {
+    anyhow::bail!(
+        "unknown config key '{key}'. Supported keys: {}",
+        CONFIG_KEYS.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn config() -> AppConfig {
+        AppConfig {
+            version: "1.0".to_string(),
+            listen: "127.0.0.1:3000".to_string(),
+            proxy_listen: "0.0.0.0:80".to_string(),
+            connect_timeout: 10,
+            request_timeout: 60,
+            pool_max_idle_per_host: 32,
+            pool_idle_timeout: 90,
+            tcp_keepalive: 60,
+            certificates: Vec::new(),
+            tls_listeners: Vec::new(),
+            rules: vec![],
+            upstreams: HashMap::new(),
+            fallback: Fallback {
+                url: "http://fallback.local".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn set_config_value_updates_supported_keys() {
+        let mut config = config();
+
+        set_config_value(&mut config, "listen", "127.0.0.1:4000").unwrap();
+        set_config_value(&mut config, "proxy_listen", "0.0.0.0:8080").unwrap();
+        set_config_value(&mut config, "fallback_url", "https://fallback.local").unwrap();
+        set_config_value(&mut config, "connect_timeout", "2").unwrap();
+        set_config_value(&mut config, "request_timeout", "30").unwrap();
+        set_config_value(&mut config, "pool_max_idle_per_host", "128").unwrap();
+        set_config_value(&mut config, "pool_idle_timeout", "45").unwrap();
+        set_config_value(&mut config, "tcp_keepalive", "20").unwrap();
+
+        assert_eq!(config.listen, "127.0.0.1:4000");
+        assert_eq!(config.proxy_listen, "0.0.0.0:8080");
+        assert_eq!(config.fallback.url, "https://fallback.local");
+        assert_eq!(config.connect_timeout, 2);
+        assert_eq!(config.request_timeout, 30);
+        assert_eq!(config.pool_max_idle_per_host, 128);
+        assert_eq!(config.pool_idle_timeout, 45);
+        assert_eq!(config.tcp_keepalive, 20);
+    }
+
+    #[test]
+    fn rejects_invalid_config_values() {
+        let mut config = config();
+
+        assert!(set_config_value(&mut config, "listen", "127.0.0.1").is_err());
+        assert!(set_config_value(&mut config, "fallback_url", "ftp://fallback.local").is_err());
+        assert!(set_config_value(&mut config, "connect_timeout", "-1").is_err());
+        assert!(set_config_value(&mut config, "missing", "value").is_err());
+    }
 }

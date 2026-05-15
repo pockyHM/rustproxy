@@ -1,11 +1,11 @@
 version: "1.0"
-listen: "127.0.0.1:3000"
-proxy_listen: "0.0.0.0:9003"
-skip_ssl: true
+listen: "127.0.0.1:39000"
+proxy_listen: "127.0.0.1:39003"
 rules:
   - id: "lb"
     name: "Load balance"
     priority: 1
+    listen: "0.0.0.0:9003"
     conditions: []
     upstream: "weighted"
     weight: 100

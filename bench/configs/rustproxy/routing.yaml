@@ -1,11 +1,11 @@
 version: "1.0"
-listen: "127.0.0.1:3000"
-proxy_listen: "0.0.0.0:9003"
-skip_ssl: true
+listen: "127.0.0.1:39000"
+proxy_listen: "127.0.0.1:39003"
 rules:
   - id: "r1"
     name: "Host api"
     priority: 100
+    listen: "0.0.0.0:9003"
     conditions:
       - type: host
         operator: exact
@@ -15,6 +15,7 @@ rules:
   - id: "r2"
     name: "Host web"
     priority: 100
+    listen: "0.0.0.0:9003"
     conditions:
       - type: host
         operator: exact
@@ -24,6 +25,7 @@ rules:
   - id: "r3"
     name: "Path /v1/"
     priority: 90
+    listen: "0.0.0.0:9003"
     conditions:
       - type: path
         operator: prefix
@@ -33,6 +35,7 @@ rules:
   - id: "r4"
     name: "Path /v2/"
     priority: 90
+    listen: "0.0.0.0:9003"
     conditions:
       - type: path
         operator: prefix
@@ -42,6 +45,7 @@ rules:
   - id: "r5"
     name: "Header X-Api-Key exists"
     priority: 80
+    listen: "0.0.0.0:9003"
     conditions:
       - type: header
         key: "X-Api-Key"
@@ -51,6 +55,7 @@ rules:
   - id: "r6"
     name: "Header X-Version=2"
     priority: 80
+    listen: "0.0.0.0:9003"
     conditions:
       - type: header
         key: "X-Version"
@@ -61,6 +66,7 @@ rules:
   - id: "r7"
     name: "Cookie session exists"
     priority: 70
+    listen: "0.0.0.0:9003"
     conditions:
       - type: cookie
         key: "session"
@@ -70,6 +76,7 @@ rules:
   - id: "r8"
     name: "Cookie env=prod"
     priority: 70
+    listen: "0.0.0.0:9003"
     conditions:
       - type: cookie
         key: "env"
@@ -80,6 +87,7 @@ rules:
   - id: "r9"
     name: "Host CDN regex"
     priority: 60
+    listen: "0.0.0.0:9003"
     conditions:
       - type: host
         operator: regex
@@ -89,6 +97,7 @@ rules:
   - id: "r10"
     name: "Path /health"
     priority: 50
+    listen: "0.0.0.0:9003"
     conditions:
       - type: path
         operator: prefix

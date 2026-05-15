@@ -1,6 +1,11 @@
 use prometheus::{
-    opts, Counter, CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, Registry, TextEncoder,
+    self,
+    core::{Collector, Desc},
+    opts, Counter, CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntGauge,
+    Opts, Registry, TextEncoder,
 };
+use std::sync::Mutex;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 pub struct ProxyMetrics {
     pub registry: Registry,
@@ -44,6 +49,8 @@ impl ProxyMetrics {
         ))?;
         registry.register(Box::new(config_reloads.clone()))?;
 
+        registry.register(Box::new(SelfProcessCollector::new()))?;
+
         Ok(Self {
             registry,
             requests_total,
@@ -60,6 +67,118 @@ impl ProxyMetrics {
         encoder.encode(&metric_families, &mut buffer)?;
 
         String::from_utf8(buffer).map_err(|error| prometheus::Error::Msg(error.to_string()))
+    }
+}
+
+/// Collects process-level metrics (CPU, memory, FDs) for the current process.
+/// Only queries the system when `/metrics` is scraped — zero overhead on the proxy hot path.
+struct SelfProcessCollector {
+    descs: Vec<Desc>,
+    system: Mutex<System>,
+    pid: Pid,
+    cpu_total_ms: IntCounter,
+    rss_bytes: IntGauge,
+    vms_bytes: IntGauge,
+    open_fds: IntGauge,
+    start_time: IntGauge,
+}
+
+impl SelfProcessCollector {
+    fn new() -> Self {
+        let pid = Pid::from(std::process::id() as usize);
+        let mut descs = Vec::new();
+
+        let cpu_total_ms = IntCounter::with_opts(Opts::new(
+            "process_cpu_seconds_total",
+            "Total user and system CPU time spent in seconds.",
+        ))
+        .unwrap();
+        descs.extend(cpu_total_ms.desc().into_iter().cloned());
+
+        let rss_bytes = IntGauge::with_opts(Opts::new(
+            "process_resident_memory_bytes",
+            "Resident memory size in bytes.",
+        ))
+        .unwrap();
+        descs.extend(rss_bytes.desc().into_iter().cloned());
+
+        let vms_bytes = IntGauge::with_opts(Opts::new(
+            "process_virtual_memory_bytes",
+            "Virtual memory size in bytes.",
+        ))
+        .unwrap();
+        descs.extend(vms_bytes.desc().into_iter().cloned());
+
+        let open_fds = IntGauge::with_opts(Opts::new(
+            "process_open_fds",
+            "Number of open file descriptors.",
+        ))
+        .unwrap();
+        descs.extend(open_fds.desc().into_iter().cloned());
+
+        let start_time = IntGauge::with_opts(Opts::new(
+            "process_start_time_seconds",
+            "Start time of the process since unix epoch in seconds.",
+        ))
+        .unwrap();
+        descs.extend(start_time.desc().into_iter().cloned());
+
+        Self {
+            descs,
+            system: Mutex::new(System::new()),
+            pid,
+            cpu_total_ms,
+            rss_bytes,
+            vms_bytes,
+            open_fds,
+            start_time,
+        }
+    }
+}
+
+impl Collector for SelfProcessCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.descs.iter().collect()
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let mut system = match self.system.lock() {
+            Ok(guard) => guard,
+            Err(_) => return vec![],
+        };
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+
+        let proc = match system.process(self.pid) {
+            Some(p) => p,
+            None => return vec![],
+        };
+
+        // CPU: accumulate milliseconds -> seconds (only increment delta)
+        let total_cpu_ms = proc.accumulated_cpu_time();
+        let past = self.cpu_total_ms.get();
+        let delta = total_cpu_ms.saturating_sub(past);
+        if delta > 0 {
+            self.cpu_total_ms.inc_by(delta);
+        }
+
+        self.rss_bytes.set(proc.memory() as i64);
+        self.vms_bytes.set(proc.virtual_memory() as i64);
+        if let Some(fds) = proc.open_files() {
+            self.open_fds.set(fds as i64);
+        }
+        self.start_time.set(proc.start_time() as i64);
+
+        let mut mfs = Vec::with_capacity(5);
+        mfs.extend(self.cpu_total_ms.collect());
+        mfs.extend(self.rss_bytes.collect());
+        mfs.extend(self.vms_bytes.collect());
+        mfs.extend(self.open_fds.collect());
+        mfs.extend(self.start_time.collect());
+        mfs
     }
 }
 
@@ -84,6 +203,8 @@ mod tests {
         assert!(output.contains("proxy_request_duration_seconds"));
         assert!(output.contains("proxy_active_connections"));
         assert!(output.contains("proxy_config_reloads_total"));
+        assert!(output.contains("process_cpu_seconds_total"));
+        assert!(output.contains("process_resident_memory_bytes"));
     }
 
     #[test]

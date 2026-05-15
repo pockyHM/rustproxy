@@ -18,6 +18,8 @@ mod tests {
     fn skips_zero_weight_targets() {
         let upstream = Upstream {
             name: "backend".to_string(),
+            skip_ssl: false,
+            websocket: false,
             targets: vec![
                 Target {
                     url: "http://a".to_string(),
@@ -28,6 +30,7 @@ mod tests {
                     weight: 0,
                 },
             ],
+            health_check: Default::default(),
         };
 
         let targets = selectable_targets(&upstream);

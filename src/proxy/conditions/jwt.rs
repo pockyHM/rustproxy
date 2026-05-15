@@ -107,6 +107,14 @@ pub fn match_jwt(
             }
             false
         }
+        Operator::Prefix => {
+            if let Some(claim) = navigate_path(&payload, claim_path) {
+                if let (Some(prefix), Some(actual)) = (value, value_to_string(claim)) {
+                    return actual.starts_with(prefix);
+                }
+            }
+            false
+        }
     }
 }
 

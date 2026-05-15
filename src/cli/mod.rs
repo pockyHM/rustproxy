@@ -10,7 +10,12 @@ use clap::{Parser, Subcommand};
 #[command(version)]
 pub struct Cli {
     /// Path to SQLite database file
-    #[arg(long, global = true, default_value = "rustproxy.db", env = "RUSTPROXY_DB")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "rustproxy.db",
+        env = "RUSTPROXY_DB"
+    )]
     pub db: String,
 
     #[command(subcommand)]
@@ -41,6 +46,33 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum ConfigCommands {
+    /// Print current configuration, or one top-level config value
+    Get {
+        /// Config key to print (version, listen, proxy_listen, fallback_url, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive)
+        key: Option<String>,
+    },
+
+    /// Set one top-level config value in the database
+    Set {
+        /// Config key to update
+        key: String,
+
+        /// New value for the config key
+        value: String,
+    },
+
+    /// Manage upstream pools
+    Upstream {
+        #[command(subcommand)]
+        command: UpstreamCommands,
+    },
+
+    /// Manage routing rules
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommands,
+    },
+
     /// Export database config to YAML on stdout
     Export,
 
@@ -56,6 +88,102 @@ pub enum ConfigCommands {
 
     /// Open config in $EDITOR for editing (exports to temp YAML, reimports on save)
     Edit,
+}
+
+#[derive(Subcommand)]
+pub enum UpstreamCommands {
+    /// List upstream pools
+    List,
+
+    /// Add an upstream pool with one target
+    Add {
+        /// Upstream name
+        name: String,
+
+        /// Target URL, for example http://127.0.0.1:8080
+        url: String,
+
+        /// Target weight
+        #[arg(long, default_value_t = 100)]
+        weight: u32,
+    },
+
+    /// Add a target to an existing upstream pool
+    AddTarget {
+        /// Upstream name
+        name: String,
+
+        /// Target URL, for example http://127.0.0.1:8080
+        url: String,
+
+        /// Target weight
+        #[arg(long, default_value_t = 100)]
+        weight: u32,
+    },
+
+    /// Delete an upstream pool
+    Delete {
+        /// Upstream name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RuleCommands {
+    /// List routing rules
+    List,
+
+    /// Add a routing rule. Omit condition options for an always-match rule.
+    Add {
+        /// Rule id
+        id: String,
+
+        /// Human-readable rule name
+        #[arg(long)]
+        name: String,
+
+        /// Upstream pool name
+        #[arg(long)]
+        upstream: String,
+
+        /// Rule priority. Higher priority matches first.
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+
+        /// Rule weight metadata
+        #[arg(long, default_value_t = 100)]
+        weight: u32,
+
+        /// Dedicated listen address for this rule, for example 0.0.0.0:9090
+        #[arg(long)]
+        listen: Option<String>,
+
+        /// Condition type: host, path, header, cookie, jwt
+        #[arg(long)]
+        condition_type: Option<String>,
+
+        /// Condition operator: exact, prefix, regex, exists, contains
+        #[arg(long)]
+        operator: Option<String>,
+
+        /// Condition value. Not required for exists.
+        #[arg(long)]
+        value: Option<String>,
+
+        /// Header or cookie name for header/cookie conditions
+        #[arg(long)]
+        key: Option<String>,
+
+        /// JWT claim path for jwt conditions, for example user.role
+        #[arg(long)]
+        claim_path: Option<String>,
+    },
+
+    /// Delete a routing rule
+    Delete {
+        /// Rule id
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]

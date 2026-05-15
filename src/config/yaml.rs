@@ -2,24 +2,58 @@ use crate::models::{Rule, Upstream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fallback {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Certificate {
+    pub name: String,
+    pub cert: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TlsListener {
+    #[serde(default = "default_tls_listener_enabled")]
+    pub enabled: bool,
+    pub listen: String,
+    pub certificate: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: String,
+    #[serde(default = "default_listen")]
     pub listen: String,
-    #[serde(default)]
-    pub skip_ssl: bool,
+    #[serde(default = "default_proxy_listen")]
+    pub proxy_listen: String,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
     #[serde(default = "default_request_timeout")]
     pub request_timeout: u64,
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub pool_max_idle_per_host: usize,
+    #[serde(default = "default_pool_idle_timeout")]
+    pub pool_idle_timeout: u64,
+    #[serde(default = "default_tcp_keepalive")]
+    pub tcp_keepalive: u64,
+    #[serde(default)]
+    pub certificates: Vec<Certificate>,
+    #[serde(default)]
+    pub tls_listeners: Vec<TlsListener>,
     pub rules: Vec<Rule>,
     pub upstreams: HashMap<String, Upstream>,
     pub fallback: Fallback,
+}
+
+fn default_listen() -> String {
+    "127.0.0.1:3000".to_string()
+}
+
+fn default_proxy_listen() -> String {
+    "0.0.0.0:80".to_string()
 }
 
 fn default_connect_timeout() -> u64 {
@@ -28,6 +62,22 @@ fn default_connect_timeout() -> u64 {
 
 fn default_request_timeout() -> u64 {
     60
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    32
+}
+
+fn default_pool_idle_timeout() -> u64 {
+    90
+}
+
+fn default_tcp_keepalive() -> u64 {
+    60
+}
+
+fn default_tls_listener_enabled() -> bool {
+    true
 }
 
 impl AppConfig {

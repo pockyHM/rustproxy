@@ -45,7 +45,9 @@ start_proxy() {
             ;;
         rustproxy)
             config="${SCRIPT_DIR}/configs/rustproxy/${scenario}.yaml"
-            "${PROJECT_ROOT}/target/release/rustproxy" serve --config "$config" &>/tmp/bench_rustproxy.log &
+            local db="/tmp/bench_rustproxy_${scenario}.db"
+            rm -f "$db" "$db-shm" "$db-wal"
+            "${PROJECT_ROOT}/target/release/rustproxy" --db "$db" serve "$config" &>/tmp/bench_rustproxy.log &
             echo $! > /tmp/bench_rustproxy.pid
             ;;
     esac

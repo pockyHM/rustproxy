@@ -47,6 +47,14 @@ pub fn match_header(
             }
             false
         }
+        Operator::Prefix => {
+            if let Some(header_value) = request_headers.get(key) {
+                if let (Some(prefix), Ok(actual)) = (value, header_value.to_str()) {
+                    return actual.starts_with(prefix);
+                }
+            }
+            false
+        }
     }
 }
 

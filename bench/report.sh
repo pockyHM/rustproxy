@@ -22,25 +22,25 @@ extract_metric() {
     fi
     case "$metric" in
         rps)
-            grep -oP 'Requests/sec:\s+\K[\d.]+' "$file" 2>/dev/null || echo "N/A"
+            awk '/Requests\/sec:/ { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
         avg)
-            grep -oP 'Latency\s+\K[\d.]+[a-z]+' "$file" 2>/dev/null | head -1 || echo "N/A"
+            awk '/^[[:space:]]*Latency[[:space:]]/ { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
         p50)
-            grep -oP '50\.000%\s+\K[\d.]+[a-z]+' "$file" 2>/dev/null || echo "N/A"
+            awk '$1 == "50.000%" { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
         p90)
-            grep -oP '90\.000%\s+\K[\d.]+[a-z]+' "$file" 2>/dev/null || echo "N/A"
+            awk '$1 == "90.000%" { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
         p99)
-            grep -oP '99\.000%\s+\K[\d.]+[a-z]+' "$file" 2>/dev/null || echo "N/A"
+            awk '$1 == "99.000%" { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
         p999)
-            grep -oP '99\.900%\s+\K[\d.]+[a-z]+' "$file" 2>/dev/null || echo "N/A"
+            awk '$1 == "99.900%" { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
         transfer)
-            grep -oP 'Transfer/sec:\s+\K[\d.]+[A-Z]+B' "$file" 2>/dev/null || echo "N/A"
+            awk '/Transfer\/sec:/ { print $2; found=1; exit } END { if (!found) print "N/A" }' "$file"
             ;;
     esac
 }

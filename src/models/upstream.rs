@@ -30,6 +30,8 @@ mod tests {
     fn test_upstream_serde() {
         let upstream = Upstream {
             name: "backend".to_string(),
+            skip_ssl: false,
+            websocket: false,
             targets: vec![
                 Target {
                     url: "http://localhost:8080".to_string(),
@@ -40,6 +42,7 @@ mod tests {
                     weight: 20,
                 },
             ],
+            health_check: Default::default(),
         };
         let json = serde_json::to_string(&upstream).unwrap();
         let parsed: Upstream = serde_json::from_str(&json).unwrap();
@@ -55,10 +58,13 @@ mod tests {
     fn test_upstream_single_target() {
         let upstream = Upstream {
             name: "single".to_string(),
+            skip_ssl: false,
+            websocket: false,
             targets: vec![Target {
                 url: "http://localhost:9090".to_string(),
                 weight: 100,
             }],
+            health_check: Default::default(),
         };
         assert_eq!(upstream.targets.len(), 1);
         assert_eq!(upstream.targets[0].url, "http://localhost:9090");
@@ -68,6 +74,8 @@ mod tests {
     fn test_upstream_clone() {
         let upstream = Upstream {
             name: "clone-test".to_string(),
+            skip_ssl: false,
+            websocket: false,
             targets: vec![
                 Target {
                     url: "http://localhost:8080".to_string(),
@@ -78,6 +86,7 @@ mod tests {
                     weight: 50,
                 },
             ],
+            health_check: Default::default(),
         };
         let cloned = upstream.clone();
         assert_eq!(upstream, cloned);
@@ -100,10 +109,48 @@ mod tests {
     fn test_upstream_debug() {
         let upstream = Upstream {
             name: "debug-upstream".to_string(),
+            skip_ssl: false,
+            websocket: false,
             targets: vec![],
+            health_check: Default::default(),
         };
         let debug_str = format!("{:?}", upstream);
         assert!(debug_str.contains("debug-upstream"));
+    }
+
+    #[test]
+    fn test_upstream_health_check_serde() {
+        let yaml = r#"
+name: backend
+targets:
+  - url: http://localhost:8080
+    weight: 100
+health_check:
+  enabled: true
+  mode: http
+  path: /ready
+  expected_status: 204
+"#;
+        let upstream: Upstream = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(upstream.health_check.enabled);
+        assert_eq!(upstream.health_check.mode, HealthCheckMode::Http);
+        assert_eq!(upstream.health_check.path, "/ready");
+        assert_eq!(upstream.health_check.expected_status, 204);
+    }
+
+    #[test]
+    fn test_upstream_health_check_defaults_to_disabled() {
+        let yaml = r#"
+name: backend
+targets:
+  - url: http://localhost:8080
+    weight: 100
+"#;
+        let upstream: Upstream = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(!upstream.health_check.enabled);
+        assert_eq!(upstream.health_check.mode, HealthCheckMode::Tcp);
     }
 }
 
@@ -114,7 +161,79 @@ pub struct Target {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthCheckMode {
+    Tcp,
+    Http,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthCheck {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_health_check_mode")]
+    pub mode: HealthCheckMode,
+    #[serde(default = "default_health_check_path")]
+    pub path: String,
+    #[serde(default = "default_expected_status")]
+    pub expected_status: u16,
+    #[serde(default = "default_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_threshold")]
+    pub unhealthy_threshold: u32,
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_health_check_mode(),
+            path: default_health_check_path(),
+            expected_status: default_expected_status(),
+            interval_seconds: default_interval_seconds(),
+            timeout_seconds: default_timeout_seconds(),
+            healthy_threshold: default_threshold(),
+            unhealthy_threshold: default_threshold(),
+        }
+    }
+}
+
+fn default_health_check_mode() -> HealthCheckMode {
+    HealthCheckMode::Tcp
+}
+
+fn default_health_check_path() -> String {
+    "/health".to_string()
+}
+
+fn default_expected_status() -> u16 {
+    200
+}
+
+fn default_interval_seconds() -> u64 {
+    10
+}
+
+fn default_timeout_seconds() -> u64 {
+    2
+}
+
+fn default_threshold() -> u32 {
+    2
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Upstream {
     pub name: String,
+    #[serde(default)]
+    pub skip_ssl: bool,
+    #[serde(default)]
+    pub websocket: bool,
     pub targets: Vec<Target>,
+    #[serde(default)]
+    pub health_check: HealthCheck,
 }

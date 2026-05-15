@@ -49,8 +49,7 @@ pub fn run_passwd(db_path: &str, username: &str) -> Result<()> {
 
 fn read_password(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
-    let password = rpassword::read_password()
-        .context("failed to read password from terminal")?;
+    let password = rpassword::read_password().context("failed to read password from terminal")?;
     if password.is_empty() {
         anyhow::bail!("password cannot be empty");
     }

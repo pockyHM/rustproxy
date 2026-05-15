@@ -99,64 +99,101 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Test Rule".to_string(),
             priority: 10,
-            conditions: vec![
-                Condition {
+            conditions: Some(ConditionExpr::And {
+                children: vec![ConditionExpr::Leaf {
                     condition_type: ConditionType::Header,
                     key: Some("Host".to_string()),
                     claim_path: None,
                     operator: Operator::Exact,
                     value: Some("example.com".to_string()),
-                },
-            ],
+                }],
+            }),
             upstream: "backend-1".to_string(),
             weight: 100,
+            listen: None,
+            tls: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let parsed: Rule = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "rule-1");
         assert_eq!(parsed.name, "Test Rule");
         assert_eq!(parsed.priority, 10);
-        assert_eq!(parsed.conditions.len(), 1);
+        assert!(parsed.conditions.is_some());
         assert_eq!(parsed.upstream, "backend-1");
         assert_eq!(parsed.weight, 100);
     }
 
     #[test]
-    fn test_rule_multiple_conditions() {
-        let rule = Rule {
-            id: "rule-2".to_string(),
-            name: "Multi Condition Rule".to_string(),
-            priority: 5,
-            conditions: vec![
-                Condition {
-                    condition_type: ConditionType::Header,
-                    key: Some("X-Api-Key".to_string()),
-                    claim_path: None,
-                    operator: Operator::Exists,
-                    value: None,
-                },
-                Condition {
-                    condition_type: ConditionType::Cookie,
-                    key: Some("session".to_string()),
-                    claim_path: None,
-                    operator: Operator::Regex,
-                    value: Some("^abc[0-9]+$".to_string()),
-                },
-                Condition {
-                    condition_type: ConditionType::Jwt,
-                    key: None,
-                    claim_path: Some("sub".to_string()),
-                    operator: Operator::Exact,
-                    value: Some("user123".to_string()),
-                },
+    fn test_rule_backward_compat_legacy_array() {
+        // Old format: flat array of conditions should deserialize into AND expression
+        let json = r#"{
+            "id": "rule-1",
+            "name": "Test",
+            "priority": 10,
+            "conditions": [
+                {"type": "header", "key": "Host", "operator": "exact", "value": "example.com"},
+                {"type": "cookie", "key": "session", "operator": "exists"}
             ],
-            upstream: "backend-2".to_string(),
-            weight: 50,
+            "upstream": "backend-1",
+            "weight": 100
+        }"#;
+        let parsed: Rule = serde_json::from_str(json).unwrap();
+        let expr = parsed.conditions.unwrap();
+        match expr {
+            ConditionExpr::And { children } => assert_eq!(children.len(), 2),
+            _ => panic!("expected AND from legacy array"),
+        }
+    }
+
+    #[test]
+    fn test_rule_backward_compat_empty_conditions() {
+        let json = r#"{
+            "id": "rule-1",
+            "name": "Test",
+            "priority": 10,
+            "conditions": [],
+            "upstream": "backend-1",
+            "weight": 100
+        }"#;
+        let parsed: Rule = serde_json::from_str(json).unwrap();
+        assert!(parsed.conditions.is_none());
+    }
+
+    #[test]
+    fn test_rule_or_expression() {
+        let rule = Rule {
+            id: "rule-1".to_string(),
+            name: "OR Rule".to_string(),
+            priority: 10,
+            conditions: Some(ConditionExpr::Or {
+                children: vec![
+                    ConditionExpr::Leaf {
+                        condition_type: ConditionType::Host,
+                        key: None,
+                        claim_path: None,
+                        operator: Operator::Exact,
+                        value: Some("a.com".to_string()),
+                    },
+                    ConditionExpr::Leaf {
+                        condition_type: ConditionType::Host,
+                        key: None,
+                        claim_path: None,
+                        operator: Operator::Exact,
+                        value: Some("b.com".to_string()),
+                    },
+                ],
+            }),
+            upstream: "backend-1".to_string(),
+            weight: 100,
+            listen: None,
+            tls: None,
         };
-        assert_eq!(rule.conditions.len(), 3);
-        assert_eq!(rule.conditions[0].condition_type, ConditionType::Header);
-        assert_eq!(rule.conditions[1].condition_type, ConditionType::Cookie);
-        assert_eq!(rule.conditions[2].condition_type, ConditionType::Jwt);
+        let json = serde_json::to_string(&rule).unwrap();
+        let parsed: Rule = serde_json::from_str(&json).unwrap();
+        match parsed.conditions.unwrap() {
+            ConditionExpr::Or { children } => assert_eq!(children.len(), 2),
+            _ => panic!("expected OR"),
+        }
     }
 
     #[test]
@@ -165,9 +202,11 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Test".to_string(),
             priority: 1,
-            conditions: vec![],
+            conditions: None,
             upstream: "up".to_string(),
             weight: 100,
+            listen: None,
+            tls: None,
         };
         let rule2 = rule1.clone();
         assert_eq!(rule1, rule2);
@@ -190,6 +229,8 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConditionType {
+    Host,
+    Path,
     Header,
     Cookie,
     Jwt,
@@ -199,6 +240,7 @@ pub enum ConditionType {
 #[serde(rename_all = "lowercase")]
 pub enum Operator {
     Exact,
+    Prefix,
     Regex,
     Exists,
     Contains,
@@ -214,12 +256,135 @@ pub struct Condition {
     pub value: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
     pub id: String,
     pub name: String,
     pub priority: i32,
-    pub conditions: Vec<Condition>,
+    pub conditions: Option<ConditionExpr>,
     pub upstream: String,
     pub weight: u32,
+    /// Dedicated listen address for this rule (e.g. "0.0.0.0:9090").
+    /// If set, the proxy binds a separate listener and routes all traffic
+    /// on that port through this rule's upstream. If None, uses the default port.
+    pub listen: Option<String>,
+    pub tls: Option<RuleTls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleTls {
+    #[serde(default)]
+    pub enabled: bool,
+    pub certificate: String,
+}
+
+/// Helper to deserialize conditions: accepts both old flat array and new expression tree.
+fn deserialize_conditions<'de, D>(deserializer: D) -> Result<Option<ConditionExpr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
+
+    // Try new expression format first
+    if let Ok(expr) = serde_json::from_value::<ConditionExpr>(value.clone()) {
+        return Ok(Some(expr));
+    }
+
+    // Try old flat array format -> wrap in AND
+    if let Ok(conditions) = serde_json::from_value::<Vec<Condition>>(value.clone()) {
+        if conditions.is_empty() {
+            return Ok(None);
+        }
+        let children: Vec<ConditionExpr> = conditions
+            .into_iter()
+            .map(|c| ConditionExpr::Leaf {
+                condition_type: c.condition_type,
+                key: c.key,
+                claim_path: c.claim_path,
+                operator: c.operator,
+                value: c.value,
+            })
+            .collect();
+        return Ok(Some(ConditionExpr::And { children }));
+    }
+
+    // Null or missing
+    Ok(None)
+}
+
+impl Serialize for Rule {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Rule", 8)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("priority", &self.priority)?;
+        state.serialize_field("conditions", &self.conditions)?;
+        state.serialize_field("upstream", &self.upstream)?;
+        state.serialize_field("weight", &self.weight)?;
+        state.serialize_field("listen", &self.listen)?;
+        state.serialize_field("tls", &self.tls)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Rule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RuleHelper {
+            #[serde(default)]
+            id: String,
+            name: String,
+            priority: i32,
+            #[serde(default, deserialize_with = "deserialize_conditions")]
+            conditions: Option<ConditionExpr>,
+            upstream: String,
+            weight: u32,
+            #[serde(default)]
+            listen: Option<String>,
+            #[serde(default)]
+            tls: Option<RuleTls>,
+        }
+        let helper = RuleHelper::deserialize(deserializer)?;
+        Ok(Rule {
+            id: helper.id,
+            name: helper.name,
+            priority: helper.priority,
+            conditions: helper.conditions,
+            upstream: helper.upstream,
+            weight: helper.weight,
+            listen: helper.listen,
+            tls: helper.tls,
+        })
+    }
+}
+
+/// Recursive boolean expression tree for rule conditions.
+///
+/// - `Leaf`: a single condition match
+/// - `And`: all children must match
+/// - `Or`: any child must match
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ConditionExpr {
+    #[serde(rename = "leaf")]
+    Leaf {
+        #[serde(rename = "conditionType")]
+        condition_type: ConditionType,
+        key: Option<String>,
+        #[serde(rename = "claimPath")]
+        claim_path: Option<String>,
+        operator: Operator,
+        value: Option<String>,
+    },
+    #[serde(rename = "and")]
+    And { children: Vec<ConditionExpr> },
+    #[serde(rename = "or")]
+    Or { children: Vec<ConditionExpr> },
 }

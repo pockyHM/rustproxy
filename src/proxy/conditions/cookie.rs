@@ -53,6 +53,14 @@ pub fn match_cookie(
             }
             false
         }
+        Operator::Prefix => {
+            if let Some(prefix) = value {
+                return cookies
+                    .iter()
+                    .any(|(k, v)| k == key && v.starts_with(prefix));
+            }
+            false
+        }
     }
 }
 
