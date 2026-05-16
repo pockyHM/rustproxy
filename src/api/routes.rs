@@ -8,7 +8,7 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use axum::{
     body::Body,
-    extract::{Extension, State},
+    extract::{ConnectInfo, Extension, State},
     http::{Request, Response, StatusCode},
     middleware,
     response::IntoResponse,
@@ -28,13 +28,13 @@ use crate::{
     auth::middleware::{self as auth_mw},
     config::yaml::AppConfig,
     db::Database,
-    observability::metrics::ProxyMetrics,
+    observability::{access_log::AccessLogger, metrics::ProxyMetrics},
     proxy::balancer::Balancer,
     proxy::health::{run_health_checks, ConfigSnapshot, HealthRegistry},
     proxy::matcher::Matcher,
     proxy::request_for_matching,
     proxy::ProxyClients,
-    proxy::{handle_proxy_with_target, ProxyMetricLabels},
+    proxy::{handle_proxy_with_target, ProxyAccessLogContext, ProxyMetricLabels},
 };
 
 use super::handlers;
@@ -47,6 +47,7 @@ struct ProxyRuntime {
     balancer: Arc<Balancer>,
     config: Arc<AppConfig>,
     clients: Arc<ProxyClients>,
+    access_logger: Option<Arc<AccessLogger>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +94,11 @@ impl AppState {
             || old.pool_max_idle_per_host != new.pool_max_idle_per_host
             || old.pool_idle_timeout != new.pool_idle_timeout
             || old.tcp_keepalive != new.tcp_keepalive;
+        let access_logger = if old.access_log != new.access_log {
+            AccessLogger::from_config(&new.access_log).map(Arc::new)
+        } else {
+            self.proxy_runtime.load().access_logger.clone()
+        };
 
         let clients = if clients_changed {
             Arc::new(ProxyClients::new(
@@ -130,6 +136,7 @@ impl AppState {
             )),
             config: Arc::new(new.clone()),
             clients,
+            access_logger,
         };
 
         self.health_config.update(&new.upstreams);
@@ -707,7 +714,8 @@ async fn serve_tls(
                     return;
                 }
             };
-            let service = hyper_util::service::TowerToHyperService::new(app);
+            let service =
+                hyper_util::service::TowerToHyperService::new(app.layer(Extension(remote_addr)));
             if let Err(error) =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                     .serve_connection_with_upgrades(
@@ -733,11 +741,14 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
     let protocol = spec.protocol;
     let join = match spec.protocol {
         ListenerProtocol::Http => tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
+            if let Err(error) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
             {
                 tracing::error!(addr = %listen, %error, "HTTP proxy listener failed");
             }
@@ -852,8 +863,14 @@ fn proxy_router(state: AppState, listen_addr: Option<String>) -> Router {
 async fn proxy_handler(
     State(state): State<AppState>,
     listen_addr: Option<Extension<String>>,
+    remote_addr: Option<Extension<std::net::SocketAddr>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     request: Request<Body>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    let source = remote_addr
+        .map(|Extension(addr)| addr.to_string())
+        .or_else(|| connect_info.map(|ConnectInfo(addr)| addr.to_string()))
+        .unwrap_or_else(|| "-".to_string());
     let listen_addr = listen_addr.map(|Extension(addr)| addr).or_else(|| {
         request
             .headers()
@@ -868,10 +885,11 @@ async fn proxy_handler(
             })
     });
 
-    let (config, clients, target_base, metric_labels) = {
+    let (config, clients, access_logger, target_base, metric_labels) = {
         let runtime = state.proxy_runtime.load();
         let config = runtime.config.clone();
         let clients = runtime.clients.clone();
+        let access_logger = runtime.access_logger.clone();
         let match_request = request_for_matching(&request);
 
         let selected = listen_addr.as_deref().and_then(|addr| {
@@ -890,7 +908,7 @@ async fn proxy_handler(
             Some((rule, upstream, target)) => (target, ProxyMetricLabels { rule, upstream }),
             None => (config.fallback.url.clone(), ProxyMetricLabels::fallback()),
         };
-        (config, clients, target_base, metric_labels)
+        (config, clients, access_logger, target_base, metric_labels)
     };
 
     handle_proxy_with_target(
@@ -899,6 +917,8 @@ async fn proxy_handler(
         clients,
         target_base,
         Some(state.metrics),
+        access_logger,
+        ProxyAccessLogContext { source },
         metric_labels,
     )
     .await
@@ -957,6 +977,7 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
                 None
             },
         )),
+        access_logger: AccessLogger::from_config(&config.access_log).map(Arc::new),
     }));
 
     let state = AppState {

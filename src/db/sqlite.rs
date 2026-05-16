@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::config::yaml::{AppConfig, Certificate, Fallback, TlsListener};
+use crate::config::yaml::{AccessLogConfig, AppConfig, Certificate, Fallback, TlsListener};
 use crate::models::{
     ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType, HostMatcher,
     LocationMatchType, LocationMatcher, MatchSet, Operator, Rule, RuleTls, Target, Upstream,
@@ -333,6 +333,10 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     let certificate_dir = get_setting(conn, "certificate_dir")
         .unwrap_or(None)
         .unwrap_or_else(|| "/etc/rustproxy/cert.d".to_string());
+    let access_log = get_setting(conn, "access_log")
+        .unwrap_or(None)
+        .and_then(|v| serde_json::from_str::<AccessLogConfig>(&v).ok())
+        .unwrap_or_default();
     let certificates = get_setting(conn, "certificates")
         .unwrap_or(None)
         .and_then(|v| serde_json::from_str::<Vec<Certificate>>(&v).ok())
@@ -364,6 +368,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         pool_idle_timeout,
         tcp_keepalive,
         certificate_dir,
+        access_log,
         certificates,
         tls_listeners,
         match_sets,
@@ -543,6 +548,11 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
     )?;
     set_setting_tx(tx, "tcp_keepalive", &config.tcp_keepalive.to_string())?;
     set_setting_tx(tx, "certificate_dir", &config.certificate_dir)?;
+    set_setting_tx(
+        tx,
+        "access_log",
+        &serde_json::to_string(&config.access_log)?,
+    )?;
     set_setting_tx(
         tx,
         "certificates",
@@ -1023,6 +1033,7 @@ mod tests {
             pool_idle_timeout: 90,
             tcp_keepalive: 60,
             certificate_dir: "/etc/rustproxy/cert.d".to_string(),
+            access_log: Default::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
         }

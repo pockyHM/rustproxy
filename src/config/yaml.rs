@@ -23,6 +23,26 @@ pub struct TlsListener {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccessLogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default = "default_access_log_buffer_size")]
+    pub buffer_size: Option<usize>,
+}
+
+impl Default for AccessLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            buffer_size: default_access_log_buffer_size(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: String,
     #[serde(default = "default_listen")]
@@ -42,6 +62,8 @@ pub struct AppConfig {
     #[serde(default = "default_certificate_dir")]
     pub certificate_dir: String,
     #[serde(default)]
+    pub access_log: AccessLogConfig,
+    #[serde(default)]
     pub certificates: Vec<Certificate>,
     #[serde(default)]
     pub tls_listeners: Vec<TlsListener>,
@@ -53,7 +75,7 @@ pub struct AppConfig {
 }
 
 fn default_listen() -> String {
-    "127.0.0.1:3000".to_string()
+    "0.0.0.0:3000".to_string()
 }
 
 fn default_proxy_listen() -> String {
@@ -86,6 +108,10 @@ fn default_certificate_dir() -> String {
 
 fn default_tls_listener_enabled() -> bool {
     true
+}
+
+fn default_access_log_buffer_size() -> Option<usize> {
+    Some(8192)
 }
 
 impl AppConfig {

@@ -56,6 +56,7 @@ fn build_config() -> AppConfig {
         pool_idle_timeout: 90,
         tcp_keepalive: 60,
         certificate_dir: "/etc/rustproxy/cert.d".to_string(),
+        access_log: Default::default(),
         certificates: Vec::new(),
         tls_listeners: Vec::new(),
         match_sets: Vec::new(),

@@ -1476,6 +1476,21 @@ textarea {
   accent-color: var(--primary);
 }
 
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-secondary);
+  font-size: 14px;
+  color: var(--foreground);
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
 .health-summary {
   display: flex;
   align-items: center;

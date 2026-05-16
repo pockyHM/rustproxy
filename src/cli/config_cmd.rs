@@ -19,6 +19,9 @@ const CONFIG_KEYS: &[&str] = &[
     "pool_max_idle_per_host",
     "pool_idle_timeout",
     "tcp_keepalive",
+    "access_log_enabled",
+    "access_log_path",
+    "access_log_buffer_size",
 ];
 
 pub fn run_get(db_path: &str, key: Option<&str>) -> Result<()> {
@@ -259,7 +262,7 @@ fn ensure_minimum_config(config: &mut AppConfig) {
         config.version = "1.0".to_string();
     }
     if config.listen.is_empty() {
-        config.listen = "127.0.0.1:3000".to_string();
+        config.listen = "0.0.0.0:3000".to_string();
     }
     if config.proxy_listen.is_empty() {
         config.proxy_listen = "0.0.0.0:80".to_string();
@@ -283,6 +286,9 @@ fn get_config_value(config: &AppConfig, key: &str) -> Result<String> {
         "pool_max_idle_per_host" => Ok(config.pool_max_idle_per_host.to_string()),
         "pool_idle_timeout" => Ok(config.pool_idle_timeout.to_string()),
         "tcp_keepalive" => Ok(config.tcp_keepalive.to_string()),
+        "access_log_enabled" => Ok(config.access_log.enabled.to_string()),
+        "access_log_path" => Ok(config.access_log.path.clone().unwrap_or_default()),
+        "access_log_buffer_size" => Ok(config.access_log.buffer_size.unwrap_or(8192).to_string()),
         _ => unknown_key(key),
     }
 }
@@ -307,9 +313,24 @@ fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> Result<()
         "pool_max_idle_per_host" => config.pool_max_idle_per_host = parse_usize(key, value)?,
         "pool_idle_timeout" => config.pool_idle_timeout = parse_u64(key, value)?,
         "tcp_keepalive" => config.tcp_keepalive = parse_u64(key, value)?,
+        "access_log_enabled" => config.access_log.enabled = parse_bool(key, value)?,
+        "access_log_path" => {
+            config.access_log.path = if value.trim().is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "access_log_buffer_size" => config.access_log.buffer_size = Some(parse_usize(key, value)?),
         _ => unknown_key(key)?,
     }
     Ok(())
+}
+
+fn parse_bool(key: &str, value: &str) -> Result<bool> {
+    value
+        .parse()
+        .with_context(|| format!("{key} must be true or false"))
 }
 
 fn parse_u64(key: &str, value: &str) -> Result<u64> {
@@ -485,6 +506,7 @@ mod tests {
             pool_idle_timeout: 90,
             tcp_keepalive: 60,
             certificate_dir: "/etc/rustproxy/cert.d".to_string(),
+            access_log: Default::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
             match_sets: Vec::new(),
@@ -508,6 +530,9 @@ mod tests {
         set_config_value(&mut config, "pool_max_idle_per_host", "128").unwrap();
         set_config_value(&mut config, "pool_idle_timeout", "45").unwrap();
         set_config_value(&mut config, "tcp_keepalive", "20").unwrap();
+        set_config_value(&mut config, "access_log_enabled", "true").unwrap();
+        set_config_value(&mut config, "access_log_path", "/tmp/rustproxy-access.log").unwrap();
+        set_config_value(&mut config, "access_log_buffer_size", "2048").unwrap();
 
         assert_eq!(config.listen, "127.0.0.1:4000");
         assert_eq!(config.proxy_listen, "0.0.0.0:8080");
@@ -517,6 +542,12 @@ mod tests {
         assert_eq!(config.pool_max_idle_per_host, 128);
         assert_eq!(config.pool_idle_timeout, 45);
         assert_eq!(config.tcp_keepalive, 20);
+        assert!(config.access_log.enabled);
+        assert_eq!(
+            config.access_log.path.as_deref(),
+            Some("/tmp/rustproxy-access.log")
+        );
+        assert_eq!(config.access_log.buffer_size, Some(2048));
     }
 
     #[test]

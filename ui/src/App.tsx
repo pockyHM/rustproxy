@@ -63,6 +63,7 @@ type AppConfig = {
   pool_idle_timeout?: number;
   tcp_keepalive?: number;
   certificate_dir?: string;
+  access_log?: { enabled?: boolean; path?: string | null; buffer_size?: number | null };
   certificates?: Certificate[];
   tls_listeners?: TlsListener[];
   match_sets?: MatchSet[];
@@ -148,6 +149,11 @@ const T: Record<string, [string, string]> = {
   'config.poolMaxIdle': ['Max idle per host', '每主机最大空闲连接'],
   'config.poolIdleTimeout': ['Pool idle timeout (s)', '连接池空闲超时 (秒)'],
   'config.tcpKeepalive': ['TCP keepalive (s)', 'TCP Keepalive (秒)'],
+  'config.accessLog': ['Access Log', '访问日志'],
+  'config.accessLogEnabled': ['Enable access log', '启用访问日志'],
+  'config.accessLogPath': ['Log file path', '日志文件路径'],
+  'config.accessLogPathHint': ['Leave empty to write to stdout', '留空则输出到标准输出'],
+  'config.accessLogBuffer': ['Async buffer size', '异步队列大小'],
   'action.reload': ['Reload config', '重新加载'],
   'action.newRule': ['New rule', '新建规则'],
   'action.newMatchSet': ['New match set', '新建匹配集'],
@@ -333,7 +339,7 @@ const ROUTE_FLOW_COLORS = ['#FF8400', '#000066', '#804200', '#004D1A'];
 
 const emptyConfig: AppConfig = {
   version: '1.0', listen: '127.0.0.1:3000', proxy_listen: '0.0.0.0:80',
-  certificate_dir: '/etc/rustproxy/cert.d', certificates: [], tls_listeners: [], match_sets: [],
+  certificate_dir: '/etc/rustproxy/cert.d', access_log: { enabled: false, path: null, buffer_size: 8192 }, certificates: [], tls_listeners: [], match_sets: [],
   rules: [], upstreams: {}, fallback: { url: '404' },
 };
 
@@ -1541,6 +1547,11 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
     setText(yaml.dump({ ...current, fallback: { ...(current.fallback ?? { url: '' }), url } }, { lineWidth: 110 }));
   }
 
+  function updateAccessLog(patch: NonNullable<AppConfig['access_log']>) {
+    const current = parsedConfig ?? config;
+    setText(yaml.dump({ ...current, access_log: { enabled: false, path: null, buffer_size: 8192, ...(current.access_log ?? {}), ...patch } }, { lineWidth: 110 }));
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 16 }}>
       <ViewHeader title={t('config.title')} subtitle={t('config.sub')} actions={
@@ -1570,9 +1581,20 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <Field label={t('config.poolIdleTimeout')}><input type="number" min="0" value={globalConfig.pool_idle_timeout ?? 90} onChange={(e) => updateGlobal({ pool_idle_timeout: Number(e.target.value) })} /></Field>
             <Field label={t('config.tcpKeepalive')}><input type="number" min="0" value={globalConfig.tcp_keepalive ?? 60} onChange={(e) => updateGlobal({ tcp_keepalive: Number(e.target.value) })} /></Field>
           </div>
+          <div className="card global-config-card">
+            <h3 className="card-title-sm">{t('config.accessLog')}</h3>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={Boolean(globalConfig.access_log?.enabled)} onChange={(e) => updateAccessLog({ enabled: e.target.checked })} />
+              <span>{t('config.accessLogEnabled')}</span>
+            </label>
+            <Field label={t('config.accessLogPath')}>
+              <input value={globalConfig.access_log?.path ?? ''} placeholder={t('config.accessLogPathHint')} onChange={(e) => updateAccessLog({ path: e.target.value.trim() ? e.target.value : null })} />
+            </Field>
+            <Field label={t('config.accessLogBuffer')}><input type="number" min="1" value={globalConfig.access_log?.buffer_size ?? 8192} onChange={(e) => updateAccessLog({ buffer_size: Number(e.target.value) })} /></Field>
+          </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.schema')}</h3>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />

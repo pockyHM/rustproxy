@@ -11,7 +11,13 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_native_certs::load_native_certs;
 
-use crate::{config::yaml::AppConfig, observability::metrics::ProxyMetrics};
+use crate::{
+    config::yaml::AppConfig,
+    observability::{
+        access_log::{AccessLogEntry, AccessLogger},
+        metrics::ProxyMetrics,
+    },
+};
 
 // ── TLS verification bypass ──
 
@@ -92,6 +98,11 @@ impl ProxyMetricLabels {
             upstream: "fallback".to_string(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyAccessLogContext {
+    pub source: String,
 }
 
 impl ProxyClients {
@@ -188,9 +199,19 @@ pub async fn handle_proxy_with_target(
     clients: Arc<ProxyClients>,
     target_base: String,
     metrics: Option<Arc<ProxyMetrics>>,
+    access_logger: Option<Arc<AccessLogger>>,
+    access_context: ProxyAccessLogContext,
     metric_labels: ProxyMetricLabels,
 ) -> Result<Response<Body>, Infallible> {
     let start = std::time::Instant::now();
+    let original_method = request.method().to_string();
+    let original_uri = request.uri().to_string();
+    let original_host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
     let _active_connection = metrics.as_ref().map(|metrics| {
         metrics.active_connections.inc();
         ActiveConnectionGuard {
@@ -206,11 +227,18 @@ pub async fn handle_proxy_with_target(
     );
 
     if is_builtin_not_found_target(&target_base) {
-        return Ok(record_proxy_metrics(
+        return Ok(record_proxy_outcome(
             not_found_page(),
             metrics.as_deref(),
+            access_logger.as_deref(),
+            &access_context,
             &metric_labels,
             start,
+            &original_method,
+            &original_host,
+            &original_uri,
+            &target_base,
+            None,
         ));
     }
 
@@ -218,11 +246,18 @@ pub async fn handle_proxy_with_target(
         Ok(uri) => uri,
         Err(e) => {
             tracing::error!(target_base = %target_base, error = %e, "failed to build target URI");
-            return Ok(record_proxy_metrics(
+            return Ok(record_proxy_outcome(
                 bad_gateway(),
                 metrics.as_deref(),
+                access_logger.as_deref(),
+                &access_context,
                 &metric_labels,
                 start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &target_base,
+                Some(format!("failed to build target URI: {e}")),
             ));
         }
     };
@@ -236,11 +271,18 @@ pub async fn handle_proxy_with_target(
     let is_websocket = is_websocket_upgrade(request.headers());
     if is_websocket && !upstream_websocket {
         tracing::warn!("websocket upgrade rejected because websocket support is disabled");
-        return Ok(record_proxy_metrics(
+        return Ok(record_proxy_outcome(
             websocket_disabled(),
             metrics.as_deref(),
+            access_logger.as_deref(),
+            &access_context,
             &metric_labels,
             start,
+            &original_method,
+            &original_host,
+            &original_uri,
+            &target_base,
+            Some("websocket support is disabled".to_string()),
         ));
     }
 
@@ -303,29 +345,50 @@ pub async fn handle_proxy_with_target(
                     });
                 }
             }
-            Ok(record_proxy_metrics(
+            Ok(record_proxy_outcome(
                 resp.map(Body::new),
                 metrics.as_deref(),
+                access_logger.as_deref(),
+                &access_context,
                 &metric_labels,
                 start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &target_base,
+                None,
             ))
         }
         Ok(Err(e)) => {
             tracing::warn!(target = %target_base, %is_https, %e, "proxy request failed");
-            Ok(record_proxy_metrics(
+            Ok(record_proxy_outcome(
                 bad_gateway(),
                 metrics.as_deref(),
+                access_logger.as_deref(),
+                &access_context,
                 &metric_labels,
                 start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &target_base,
+                Some(e.to_string()),
             ))
         }
         Err(_) => {
             tracing::warn!("proxy request timed out");
-            Ok(record_proxy_metrics(
+            Ok(record_proxy_outcome(
                 gateway_timeout(),
                 metrics.as_deref(),
+                access_logger.as_deref(),
+                &access_context,
                 &metric_labels,
                 start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &target_base,
+                Some("request timed out".to_string()),
             ))
         }
     }
@@ -341,6 +404,7 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+#[cfg(test)]
 fn record_proxy_metrics(
     response: Response<Body>,
     metrics: Option<&ProxyMetrics>,
@@ -361,6 +425,63 @@ fn record_proxy_metrics(
             .request_duration
             .with_label_values(&[labels.rule.as_str(), labels.upstream.as_str()])
             .observe(start.elapsed().as_secs_f64());
+    }
+
+    response
+}
+
+fn record_proxy_outcome(
+    response: Response<Body>,
+    metrics: Option<&ProxyMetrics>,
+    access_logger: Option<&AccessLogger>,
+    access_context: &ProxyAccessLogContext,
+    labels: &ProxyMetricLabels,
+    start: std::time::Instant,
+    method: &str,
+    host: &str,
+    uri: &str,
+    target: &str,
+    error: Option<String>,
+) -> Response<Body> {
+    let elapsed = start.elapsed();
+    if let Some(logger) = access_logger {
+        logger.record(AccessLogEntry {
+            source: access_context.source.clone(),
+            method: method.to_string(),
+            host: host.to_string(),
+            uri: uri.to_string(),
+            status: response.status().as_u16(),
+            duration_ms: elapsed.as_millis(),
+            rule: labels.rule.clone(),
+            upstream: labels.upstream.clone(),
+            target: target.to_string(),
+            error,
+        });
+    }
+
+    record_proxy_metrics_with_elapsed(response, metrics, labels, elapsed)
+}
+
+fn record_proxy_metrics_with_elapsed(
+    response: Response<Body>,
+    metrics: Option<&ProxyMetrics>,
+    labels: &ProxyMetricLabels,
+    elapsed: Duration,
+) -> Response<Body> {
+    if let Some(metrics) = metrics {
+        let status = response.status().as_u16().to_string();
+        metrics
+            .requests_total
+            .with_label_values(&[
+                labels.rule.as_str(),
+                labels.upstream.as_str(),
+                status.as_str(),
+            ])
+            .inc();
+        metrics
+            .request_duration
+            .with_label_values(&[labels.rule.as_str(), labels.upstream.as_str()])
+            .observe(elapsed.as_secs_f64());
     }
 
     response
