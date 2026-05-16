@@ -1,15 +1,22 @@
 use std::{cell::OnceCell, collections::HashMap};
 
 use http::{HeaderMap, Request};
+use jsonwebtoken::{decode, DecodingKey, Validation};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::models::rule::{ConditionExpr, ConditionType, Operator, Rule};
+use crate::models::rule::{ConditionExpr, ConditionType, MatchSet, Operator, Rule};
 
 pub struct Matcher {
     rules: Vec<CompiledRule>,
     default_rules: RuleBucket,
     listen_rules: HashMap<String, RuleBucket>,
+    jwt_validation: JwtValidation,
+}
+
+enum JwtValidation {
+    Unverified,
+    Verified { secret: String },
 }
 
 struct CompiledRule {
@@ -41,15 +48,57 @@ struct EvalContext<'a> {
 struct RuleBucket {
     general: Vec<usize>,
     host_exact: HashMap<String, Vec<usize>>,
+    fallback: Vec<usize>,
 }
 
 impl Matcher {
-    pub fn new(mut rules: Vec<Rule>) -> Self {
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    pub fn new(rules: Vec<Rule>) -> Self {
+        Self::new_with_jwt_validation(rules, Vec::new(), JwtValidation::Unverified)
+    }
+
+    pub fn new_verified(rules: Vec<Rule>, jwt_secret: String) -> Self {
+        Self::new_with_jwt_validation(
+            rules,
+            Vec::new(),
+            JwtValidation::Verified { secret: jwt_secret },
+        )
+    }
+
+    pub fn new_with_match_sets(rules: Vec<Rule>, match_sets: Vec<MatchSet>) -> Self {
+        Self::new_with_jwt_validation(rules, match_sets, JwtValidation::Unverified)
+    }
+
+    pub fn new_verified_with_match_sets(
+        rules: Vec<Rule>,
+        match_sets: Vec<MatchSet>,
+        jwt_secret: String,
+    ) -> Self {
+        Self::new_with_jwt_validation(
+            rules,
+            match_sets,
+            JwtValidation::Verified { secret: jwt_secret },
+        )
+    }
+
+    fn new_with_jwt_validation(
+        mut rules: Vec<Rule>,
+        match_sets: Vec<MatchSet>,
+        jwt_validation: JwtValidation,
+    ) -> Self {
+        let match_set_map: HashMap<String, ConditionExpr> = match_sets
+            .into_iter()
+            .filter_map(|set| set.conditions.map(|conditions| (set.name, conditions)))
+            .collect();
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         let rules: Vec<_> = rules
             .into_iter()
             .map(|rule| {
-                let conditions = rule.conditions.as_ref().map(CompiledExpr::from_expr);
+                let conditions = rule
+                    .match_set
+                    .as_ref()
+                    .and_then(|name| match_set_map.get(name))
+                    .or(rule.conditions.as_ref())
+                    .map(CompiledExpr::from_expr);
                 CompiledRule { rule, conditions }
             })
             .collect();
@@ -58,14 +107,15 @@ impl Matcher {
             rules,
             default_rules,
             listen_rules,
+            jwt_validation,
         }
     }
 
     /// Match a request against all rules, returning the first matching rule.
     ///
     /// If `listen_addr` is Some, only rules with that exact `listen` value
-    /// are considered. If None, only rules without a `listen` field are considered
-    /// (i.e. the default port).
+    /// are considered. Runtime proxy requests always pass a listener address;
+    /// None is retained for legacy unit tests and pre-normalized callers.
     pub fn match_request(&self, request: &Request<()>, listen_addr: Option<&str>) -> Option<&Rule> {
         let bucket = match listen_addr {
             Some(addr) => self.listen_rules.get(addr)?,
@@ -78,7 +128,7 @@ impl Matcher {
             .map(|host| host.to_ascii_lowercase());
 
         bucket
-            .first_matching(&self.rules, request, host.as_deref())
+            .first_matching(&self.rules, &self.jwt_validation, request, host.as_deref())
             .map(|compiled| &compiled.rule)
     }
 
@@ -91,14 +141,18 @@ impl Matcher {
                 Some(listen) => listen_rules.entry(listen.to_string()).or_default(),
                 None => &mut default_rules,
             };
-            bucket.insert(idx, compiled.exact_host());
+            bucket.insert(idx, compiled.rule.is_fallback, compiled.exact_host());
         }
 
         (default_rules, listen_rules)
     }
 
     /// Check if a single rule matches the request.
-    fn rule_matches(rule: &CompiledRule, request: &Request<()>) -> bool {
+    fn rule_matches(
+        rule: &CompiledRule,
+        jwt_validation: &JwtValidation,
+        request: &Request<()>,
+    ) -> bool {
         match &rule.conditions {
             None => true,
             Some(expr) => {
@@ -106,22 +160,34 @@ impl Matcher {
                     request,
                     jwt_payload: OnceCell::new(),
                 };
-                Self::eval_expr(expr, &ctx)
+                Self::eval_expr(expr, jwt_validation, &ctx)
             }
         }
     }
 
     /// Recursively evaluate a condition expression.
-    fn eval_expr(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> bool {
+    fn eval_expr(
+        expr: &CompiledExpr,
+        jwt_validation: &JwtValidation,
+        ctx: &EvalContext<'_>,
+    ) -> bool {
         match expr {
-            CompiledExpr::And { children } => children.iter().all(|c| Self::eval_expr(c, ctx)),
-            CompiledExpr::Or { children } => children.iter().any(|c| Self::eval_expr(c, ctx)),
-            CompiledExpr::Leaf(leaf) => Self::eval_leaf(leaf, ctx),
+            CompiledExpr::And { children } => children
+                .iter()
+                .all(|child| Self::eval_expr(child, jwt_validation, ctx)),
+            CompiledExpr::Or { children } => children
+                .iter()
+                .any(|child| Self::eval_expr(child, jwt_validation, ctx)),
+            CompiledExpr::Leaf(leaf) => Self::eval_leaf(leaf, jwt_validation, ctx),
         }
     }
 
     /// Evaluate a single leaf condition against the request.
-    fn eval_leaf(leaf: &CompiledLeaf, ctx: &EvalContext<'_>) -> bool {
+    fn eval_leaf(
+        leaf: &CompiledLeaf,
+        jwt_validation: &JwtValidation,
+        ctx: &EvalContext<'_>,
+    ) -> bool {
         let headers = ctx.request.headers();
 
         match leaf.condition_type {
@@ -165,8 +231,12 @@ impl Matcher {
                 match_cookie(cookie_header, key, leaf)
             }
             ConditionType::Jwt => {
-                let payload = ctx.jwt_payload.get_or_init(|| {
-                    Self::extract_jwt_token(ctx.request).and_then(decode_jwt_payload)
+                let payload = ctx.jwt_payload.get_or_init(|| match jwt_validation {
+                    JwtValidation::Unverified => {
+                        Self::extract_jwt_token(ctx.request).and_then(decode_jwt_payload)
+                    }
+                    JwtValidation::Verified { secret } => Self::extract_jwt_token(ctx.request)
+                        .and_then(|token| decode_verified_jwt_payload(token, secret)),
                 });
                 payload
                     .as_ref()
@@ -190,7 +260,11 @@ impl CompiledRule {
 }
 
 impl RuleBucket {
-    fn insert(&mut self, idx: usize, exact_host: Option<&str>) {
+    fn insert(&mut self, idx: usize, is_fallback: bool, exact_host: Option<&str>) {
+        if is_fallback {
+            self.fallback.push(idx);
+            return;
+        }
         match exact_host {
             Some(host) => self
                 .host_exact
@@ -204,6 +278,7 @@ impl RuleBucket {
     fn first_matching<'a>(
         &self,
         rules: &'a [CompiledRule],
+        jwt_validation: &JwtValidation,
         request: &Request<()>,
         host: Option<&str>,
     ) -> Option<&'a CompiledRule> {
@@ -233,14 +308,19 @@ impl RuleBucket {
                     host_idx += 1;
                     host_rule_idx
                 }
-                (None, None) => return None,
+                (None, None) => break,
             };
 
             let compiled = &rules[next_rule_idx];
-            if Matcher::rule_matches(compiled, request) {
+            if Matcher::rule_matches(compiled, jwt_validation, request) {
                 return Some(compiled);
             }
         }
+
+        self.fallback
+            .iter()
+            .filter_map(|idx| rules.get(*idx))
+            .find(|compiled| Matcher::rule_matches(compiled, jwt_validation, request))
     }
 }
 
@@ -431,6 +511,16 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
     serde_json::from_slice(&decoded).ok()
 }
 
+fn decode_verified_jwt_payload(token: &str, secret: &str) -> Option<Value> {
+    decode::<Value>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .ok()
+    .map(|data| data.claims)
+}
+
 fn match_jwt(payload: &Value, claim_path: &[String], leaf: &CompiledLeaf) -> bool {
     let Some(claim) = navigate_path(payload, claim_path) else {
         return false;
@@ -477,7 +567,7 @@ fn value_to_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::Matcher;
-    use crate::models::rule::{ConditionExpr, ConditionType, Operator, Rule};
+    use crate::models::rule::{ConditionExpr, ConditionType, MatchSet, Operator, Rule};
     use http::{HeaderMap, HeaderValue, Request};
 
     fn create_request_with_headers(headers: &[(&str, &str)]) -> Request<()> {
@@ -495,9 +585,11 @@ mod tests {
             id: "test-rule".to_string(),
             name: "Test Rule".to_string(),
             priority,
+            match_set: None,
             conditions,
             upstream: "backend-1".to_string(),
             weight: 100,
+            is_fallback: false,
             listen: None,
             tls: None,
         }
@@ -562,6 +654,22 @@ mod tests {
         let signature_b64 = "fake_signature".to_string();
 
         format!("{}.{}.{}", header_b64, payload_b64, signature_b64)
+    }
+
+    fn create_signed_test_jwt(secret: &str, mut claims: serde_json::Value) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        claims["iat"] = serde_json::json!(now);
+        claims["exp"] = serde_json::json!(now + 3600);
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -820,6 +928,32 @@ mod tests {
     }
 
     #[test]
+    fn test_verified_jwt_condition_rejects_unsigned_token() {
+        let secret = "runtime-secret";
+        let rule = create_rule(
+            10,
+            leaf(create_jwt_leaf("sub", Operator::Exact, Some("user123"))),
+        );
+        let matcher = Matcher::new_verified(vec![rule], secret.to_string());
+
+        let unsigned = create_test_jwt(serde_json::json!({ "sub": "user123" }));
+        let mut unsigned_request = create_request_with_headers(&[]);
+        unsigned_request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", unsigned)).unwrap(),
+        );
+        assert!(matcher.match_request(&unsigned_request, None).is_none());
+
+        let signed = create_signed_test_jwt(secret, serde_json::json!({ "sub": "user123" }));
+        let mut signed_request = create_request_with_headers(&[]);
+        signed_request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", signed)).unwrap(),
+        );
+        assert!(matcher.match_request(&signed_request, None).is_some());
+    }
+
+    #[test]
     fn test_jwt_extracted_from_authorization_header() {
         let claims = serde_json::json!({
             "sub": "user123"
@@ -862,6 +996,29 @@ mod tests {
         let matcher = Matcher::new(vec![rule]);
         let request = create_request_with_headers(&[("Host", "anything.com")]);
         assert!(matcher.match_request(&request, None).is_some());
+    }
+
+    #[test]
+    fn test_rule_can_reference_match_set() {
+        let mut rule = create_rule(10, None);
+        rule.match_set = Some("api-host".to_string());
+        let matcher = Matcher::new_with_match_sets(
+            vec![rule],
+            vec![MatchSet {
+                name: "api-host".to_string(),
+                conditions: leaf(create_header_leaf(
+                    "Host",
+                    Operator::Exact,
+                    Some("api.example.com"),
+                )),
+            }],
+        );
+
+        let matched = create_request_with_headers(&[("Host", "api.example.com")]);
+        let missed = create_request_with_headers(&[("Host", "web.example.com")]);
+
+        assert!(matcher.match_request(&matched, None).is_some());
+        assert!(matcher.match_request(&missed, None).is_none());
     }
 
     #[test]

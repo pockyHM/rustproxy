@@ -1,7 +1,6 @@
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
-    io::Cursor,
     sync::Arc,
 };
 
@@ -16,11 +15,11 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose, Engine as _};
+use rustls::pki_types::pem::PemObject;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::models::{ConditionExpr, ConditionType, Operator, Rule};
@@ -119,7 +118,11 @@ impl AppState {
         };
 
         let runtime = ProxyRuntime {
-            matcher: Arc::new(Matcher::new(new.rules.clone())),
+            matcher: Arc::new(Matcher::new_verified_with_match_sets(
+                new.rules.clone(),
+                new.match_sets.clone(),
+                self.jwt_secret.to_string(),
+            )),
             balancer: Arc::new(Balancer::new_with_health(
                 new.upstreams.clone(),
                 Some(self.health.clone()),
@@ -334,6 +337,7 @@ fn tls_acceptor(
 }
 
 pub(crate) fn validate_tls_config(config: &AppConfig) -> anyhow::Result<()> {
+    validate_match_sets(config)?;
     for rule in config.rules.iter().filter(|rule| rule_tls_enabled(rule)) {
         if rule.listen.as_deref().unwrap_or("").trim().is_empty() {
             anyhow::bail!("TLS rule '{}' must define a listen address", rule.id);
@@ -350,6 +354,34 @@ pub(crate) fn validate_tls_config(config: &AppConfig) -> anyhow::Result<()> {
     for listener in effective_tls_listeners(config) {
         tls_acceptor(config, &listener)
             .with_context(|| format!("invalid TLS listener {}", listener.listen))?;
+    }
+    Ok(())
+}
+
+fn validate_match_sets(config: &AppConfig) -> anyhow::Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for set in &config.match_sets {
+        let name = set.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("match set name is required");
+        }
+        if !names.insert(name.to_string()) {
+            anyhow::bail!("match set '{}' already exists", name);
+        }
+        if set.conditions.is_none() {
+            anyhow::bail!("match set '{}' must define conditions", name);
+        }
+    }
+    for rule in &config.rules {
+        if let Some(name) = rule
+            .match_set
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+        {
+            if !names.contains(name) {
+                anyhow::bail!("rule '{}' references missing match set '{}'", rule.id, name);
+            }
+        }
     }
     Ok(())
 }
@@ -437,7 +469,7 @@ fn proxy_listener_specs(config: &AppConfig) -> anyhow::Result<HashMap<String, Li
 
 fn tls_listener_signature(config: &AppConfig, listener: &EffectiveTlsListener) -> String {
     let mut sni: Vec<_> = listener.sni_certificates.iter().collect();
-    sni.sort_by(|(left, _), (right, _)| left.cmp(right));
+    sni.sort_by_key(|(host, _)| *host);
     let sni = sni
         .into_iter()
         .map(|(host, certificate)| {
@@ -552,8 +584,18 @@ fn parse_cert_chain(
     input: &str,
 ) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let trimmed = input.trim();
+    if looks_like_file_path(trimmed) {
+        let bytes = std::fs::read(trimmed)
+            .with_context(|| format!("failed to read certificate file {trimmed}"))?;
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if text.contains("-----BEGIN") {
+                return parse_cert_chain(text);
+            }
+        }
+        return Ok(vec![rustls::pki_types::CertificateDer::from(bytes)]);
+    }
     if trimmed.contains("-----BEGIN") {
-        let certs = rustls_pemfile::certs(&mut Cursor::new(trimmed.as_bytes()))
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(trimmed.as_bytes())
             .collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
             anyhow::bail!("no PEM certificate blocks found");
@@ -569,19 +611,31 @@ fn parse_cert_chain(
 
 fn parse_private_key(input: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
     let trimmed = input.trim();
-    if trimmed.contains("-----BEGIN") {
-        let mut reader = Cursor::new(trimmed.as_bytes());
-        if let Some(key) = rustls_pemfile::private_key(&mut reader)? {
-            return Ok(key);
+    if looks_like_file_path(trimmed) {
+        let bytes = std::fs::read(trimmed)
+            .with_context(|| format!("failed to read private key file {trimmed}"))?;
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if text.contains("-----BEGIN") {
+                return parse_private_key(text);
+            }
         }
-        anyhow::bail!("no PEM private key block found");
+        return rustls::pki_types::PrivateKeyDer::try_from(bytes)
+            .map_err(|_| anyhow::anyhow!("unsupported DER private key format"));
+    }
+    if trimmed.contains("-----BEGIN") {
+        return rustls::pki_types::PrivateKeyDer::from_pem_slice(trimmed.as_bytes())
+            .context("no supported PEM private key block found");
     }
 
     let der = general_purpose::STANDARD
         .decode(trimmed.as_bytes())
         .context("DER private key must be base64 encoded")?;
-    Ok(rustls::pki_types::PrivateKeyDer::try_from(der)
-        .map_err(|_| anyhow::anyhow!("unsupported DER private key format"))?)
+    rustls::pki_types::PrivateKeyDer::try_from(der)
+        .map_err(|_| anyhow::anyhow!("unsupported DER private key format"))
+}
+
+fn looks_like_file_path(input: &str) -> bool {
+    input.starts_with('/') || input.starts_with("./") || input.starts_with("../")
 }
 
 async fn serve_tls(
@@ -685,6 +739,15 @@ fn api_router(state: AppState) -> Router {
             "/api/config",
             get(handlers::get_config).put(handlers::put_config),
         )
+        .route("/api/certificates", post(handlers::upload_certificate))
+        .route(
+            "/api/match-sets",
+            get(handlers::list_match_sets).post(handlers::create_match_set),
+        )
+        .route(
+            "/api/match-sets/:name",
+            put(handlers::update_match_set).delete(handlers::delete_match_set),
+        )
         .route(
             "/api/rules",
             get(handlers::list_rules).post(handlers::create_rule),
@@ -716,17 +779,13 @@ fn api_router(state: AppState) -> Router {
         // API port returns 404 for unknown /api/ paths instead of proxying
         .fallback(api_not_found)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
-async fn api_not_found(request: Request<Body>) -> Result<Response<Body>, std::convert::Infallible> {
-    let status = if request.uri().path().starts_with("/api/") {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::NOT_FOUND
-    };
-    Ok(status.into_response())
+async fn api_not_found(
+    _request: Request<Body>,
+) -> Result<Response<Body>, std::convert::Infallible> {
+    Ok(StatusCode::NOT_FOUND.into_response())
 }
 
 /// Proxy-only router (no API routes).
@@ -768,8 +827,7 @@ async fn proxy_handler(
         let clients = runtime.clients.clone();
         let match_request = request_for_matching(&request);
 
-        // Try specific listen addr first, then default (None).
-        let selected = if let Some(ref addr) = listen_addr {
+        let selected = listen_addr.as_deref().and_then(|addr| {
             runtime
                 .matcher
                 .match_request(&match_request, Some(addr))
@@ -779,28 +837,7 @@ async fn proxy_handler(
                         .select(&rule.upstream)
                         .map(|target| (rule.id.clone(), rule.upstream.clone(), target))
                 })
-                .or_else(|| {
-                    runtime
-                        .matcher
-                        .match_request(&match_request, None)
-                        .and_then(|rule| {
-                            runtime
-                                .balancer
-                                .select(&rule.upstream)
-                                .map(|target| (rule.id.clone(), rule.upstream.clone(), target))
-                        })
-                })
-        } else {
-            runtime
-                .matcher
-                .match_request(&match_request, None)
-                .and_then(|rule| {
-                    runtime
-                        .balancer
-                        .select(&rule.upstream)
-                        .map(|target| (rule.id.clone(), rule.upstream.clone(), target))
-                })
-        };
+        });
 
         let (target_base, metric_labels) = match selected {
             Some((rule, upstream, target)) => (target, ProxyMetricLabels { rule, upstream }),
@@ -846,7 +883,11 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
     health_config.update(&config.upstreams);
 
     let proxy_runtime = Arc::new(RwLock::new(ProxyRuntime {
-        matcher: Arc::new(Matcher::new(config.rules.clone())),
+        matcher: Arc::new(Matcher::new_verified_with_match_sets(
+            config.rules.clone(),
+            config.match_sets.clone(),
+            jwt_secret.clone(),
+        )),
         balancer: Arc::new(Balancer::new_with_health(
             config.upstreams.clone(),
             Some(health.clone()),

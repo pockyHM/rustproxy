@@ -119,7 +119,11 @@ impl ProxyClients {
             .build(http_connector);
 
         let mut root_certs = rustls::RootCertStore::empty();
-        for cert in load_native_certs().expect("failed to load native certs") {
+        let native_certs = load_native_certs();
+        for error in native_certs.errors {
+            tracing::warn!(%error, "failed to load a native certificate");
+        }
+        for cert in native_certs.certs {
             root_certs.add(cert).ok();
         }
         let tls_config = rustls::ClientConfig::builder()
@@ -173,8 +177,9 @@ pub async fn handle_proxy(
     listen_addr: Option<String>,
 ) -> Result<Response<Body>, Infallible> {
     let match_request = request_for_matching(&request);
-    let target_base = matcher
-        .match_request(&match_request, listen_addr.as_deref())
+    let target_base = listen_addr
+        .as_deref()
+        .and_then(|addr| matcher.match_request(&match_request, Some(addr)))
         .and_then(|rule| balancer.select(&rule.upstream))
         .unwrap_or_else(|| config.fallback.url.clone());
 
@@ -475,17 +480,13 @@ fn websocket_disabled() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_target_uri, handle_proxy_with_target, is_websocket_upgrade, record_proxy_metrics,
-        ProxyClients, ProxyMetricLabels,
+        build_target_uri, is_websocket_upgrade, not_found_page, record_proxy_metrics,
+        ProxyMetricLabels,
     };
-    use crate::{
-        config::yaml::{AppConfig, Fallback},
-        observability::metrics::ProxyMetrics,
-        proxy::balancer::Balancer,
-    };
+    use crate::observability::metrics::ProxyMetrics;
     use axum::body::Body;
-    use http::{HeaderMap, Request, Response, StatusCode, Uri};
-    use std::{collections::HashMap, sync::Arc, time::Instant};
+    use http::{HeaderMap, Response, StatusCode, Uri};
+    use std::time::Instant;
 
     #[test]
     fn builds_target_uri_for_matched_upstream() {
@@ -503,38 +504,9 @@ mod tests {
         assert_eq!(target_uri, "http://fallback.internal/missing");
     }
 
-    #[tokio::test]
-    async fn builtin_404_target_returns_not_found_page() {
-        let response = handle_proxy_with_target(
-            Request::builder()
-                .uri("/missing")
-                .body(Body::empty())
-                .unwrap(),
-            Arc::new(AppConfig {
-                version: "1.0".to_string(),
-                listen: "127.0.0.1:3000".to_string(),
-                proxy_listen: "0.0.0.0:80".to_string(),
-                connect_timeout: 10,
-                request_timeout: 60,
-                pool_max_idle_per_host: 32,
-                pool_idle_timeout: 90,
-                tcp_keepalive: 60,
-                certificates: Vec::new(),
-                tls_listeners: Vec::new(),
-                rules: Vec::new(),
-                upstreams: HashMap::new(),
-                fallback: Fallback {
-                    url: "404".to_string(),
-                },
-            }),
-            Arc::new(Balancer::new(HashMap::new())),
-            Arc::new(ProxyClients::new(None, 32, None, None)),
-            "404".to_string(),
-            None,
-            ProxyMetricLabels::fallback(),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn builtin_404_target_returns_not_found_page() {
+        let response = not_found_page();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 

@@ -99,6 +99,7 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Test Rule".to_string(),
             priority: 10,
+            match_set: None,
             conditions: Some(ConditionExpr::And {
                 children: vec![ConditionExpr::Leaf {
                     condition_type: ConditionType::Header,
@@ -110,6 +111,7 @@ mod tests {
             }),
             upstream: "backend-1".to_string(),
             weight: 100,
+            is_fallback: false,
             listen: None,
             tls: None,
         };
@@ -165,6 +167,7 @@ mod tests {
             id: "rule-1".to_string(),
             name: "OR Rule".to_string(),
             priority: 10,
+            match_set: None,
             conditions: Some(ConditionExpr::Or {
                 children: vec![
                     ConditionExpr::Leaf {
@@ -185,6 +188,7 @@ mod tests {
             }),
             upstream: "backend-1".to_string(),
             weight: 100,
+            is_fallback: false,
             listen: None,
             tls: None,
         };
@@ -202,9 +206,11 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Test".to_string(),
             priority: 1,
+            match_set: None,
             conditions: None,
             upstream: "up".to_string(),
             weight: 100,
+            is_fallback: false,
             listen: None,
             tls: None,
         };
@@ -261,14 +267,23 @@ pub struct Rule {
     pub id: String,
     pub name: String,
     pub priority: i32,
+    pub match_set: Option<String>,
     pub conditions: Option<ConditionExpr>,
     pub upstream: String,
     pub weight: u32,
+    pub is_fallback: bool,
     /// Dedicated listen address for this rule (e.g. "0.0.0.0:9090").
     /// If set, the proxy binds a separate listener and routes all traffic
     /// on that port through this rule's upstream. If None, uses the default port.
     pub listen: Option<String>,
     pub tls: Option<RuleTls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchSet {
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_conditions")]
+    pub conditions: Option<ConditionExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -318,13 +333,15 @@ impl Serialize for Rule {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Rule", 8)?;
+        let mut state = serializer.serialize_struct("Rule", 10)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("priority", &self.priority)?;
+        state.serialize_field("match_set", &self.match_set)?;
         state.serialize_field("conditions", &self.conditions)?;
         state.serialize_field("upstream", &self.upstream)?;
         state.serialize_field("weight", &self.weight)?;
+        state.serialize_field("is_fallback", &self.is_fallback)?;
         state.serialize_field("listen", &self.listen)?;
         state.serialize_field("tls", &self.tls)?;
         state.end()
@@ -342,10 +359,14 @@ impl<'de> Deserialize<'de> for Rule {
             id: String,
             name: String,
             priority: i32,
+            #[serde(default)]
+            match_set: Option<String>,
             #[serde(default, deserialize_with = "deserialize_conditions")]
             conditions: Option<ConditionExpr>,
             upstream: String,
             weight: u32,
+            #[serde(default)]
+            is_fallback: bool,
             #[serde(default)]
             listen: Option<String>,
             #[serde(default)]
@@ -356,9 +377,11 @@ impl<'de> Deserialize<'de> for Rule {
             id: helper.id,
             name: helper.name,
             priority: helper.priority,
+            match_set: helper.match_set,
             conditions: helper.conditions,
             upstream: helper.upstream,
             weight: helper.weight,
+            is_fallback: helper.is_fallback,
             listen: helper.listen,
             tls: helper.tls,
         })

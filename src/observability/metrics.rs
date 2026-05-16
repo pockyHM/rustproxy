@@ -1,8 +1,8 @@
 use prometheus::{
     self,
     core::{Collector, Desc},
-    opts, Counter, CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, IntCounter, IntGauge,
-    Opts, Registry, TextEncoder,
+    opts, Counter, CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, IntGauge, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::Mutex;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -76,7 +76,7 @@ struct SelfProcessCollector {
     descs: Vec<Desc>,
     system: Mutex<System>,
     pid: Pid,
-    cpu_total_ms: IntCounter,
+    cpu_total_seconds: Counter,
     rss_bytes: IntGauge,
     vms_bytes: IntGauge,
     open_fds: IntGauge,
@@ -88,12 +88,12 @@ impl SelfProcessCollector {
         let pid = Pid::from(std::process::id() as usize);
         let mut descs = Vec::new();
 
-        let cpu_total_ms = IntCounter::with_opts(Opts::new(
+        let cpu_total_seconds = Counter::with_opts(Opts::new(
             "process_cpu_seconds_total",
             "Total user and system CPU time spent in seconds.",
         ))
         .unwrap();
-        descs.extend(cpu_total_ms.desc().into_iter().cloned());
+        descs.extend(cpu_total_seconds.desc().into_iter().cloned());
 
         let rss_bytes = IntGauge::with_opts(Opts::new(
             "process_resident_memory_bytes",
@@ -127,7 +127,7 @@ impl SelfProcessCollector {
             descs,
             system: Mutex::new(System::new()),
             pid,
-            cpu_total_ms,
+            cpu_total_seconds,
             rss_bytes,
             vms_bytes,
             open_fds,
@@ -157,12 +157,13 @@ impl Collector for SelfProcessCollector {
             None => return vec![],
         };
 
-        // CPU: accumulate milliseconds -> seconds (only increment delta)
+        // sysinfo reports accumulated CPU time in milliseconds. Prometheus expects seconds.
         let total_cpu_ms = proc.accumulated_cpu_time();
-        let past = self.cpu_total_ms.get();
-        let delta = total_cpu_ms.saturating_sub(past);
-        if delta > 0 {
-            self.cpu_total_ms.inc_by(delta);
+        let total_cpu_seconds = total_cpu_ms as f64 / 1000.0;
+        let past = self.cpu_total_seconds.get();
+        let delta = (total_cpu_seconds - past).max(0.0);
+        if delta > 0.0 {
+            self.cpu_total_seconds.inc_by(delta);
         }
 
         self.rss_bytes.set(proc.memory() as i64);
@@ -173,7 +174,7 @@ impl Collector for SelfProcessCollector {
         self.start_time.set(proc.start_time() as i64);
 
         let mut mfs = Vec::with_capacity(5);
-        mfs.extend(self.cpu_total_ms.collect());
+        mfs.extend(self.cpu_total_seconds.collect());
         mfs.extend(self.rss_bytes.collect());
         mfs.extend(self.vms_bytes.collect());
         mfs.extend(self.open_fds.collect());

@@ -164,6 +164,12 @@ impl ConfigSnapshot {
     }
 }
 
+impl Default for ConfigSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Clone for ConfigSnapshot {
     fn clone(&self) -> Self {
         Self {
@@ -245,7 +251,14 @@ async fn send_https_health_request(
             .with_no_client_auth()
     } else {
         let mut root_certs = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().ok()? {
+        let native_certs = rustls_native_certs::load_native_certs();
+        for error in native_certs.errors {
+            tracing::warn!(%error, "failed to load a native certificate for health check");
+        }
+        if native_certs.certs.is_empty() {
+            return None;
+        }
+        for cert in native_certs.certs {
             root_certs.add(cert).ok();
         }
         rustls::ClientConfig::builder()

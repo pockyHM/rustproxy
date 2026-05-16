@@ -149,13 +149,17 @@ pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
                 id: id.clone(),
                 name,
                 priority,
+                match_set: None,
                 conditions,
                 upstream,
                 weight,
+                is_fallback: false,
                 listen,
                 tls: None,
             });
-            config.rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+            config
+                .rules
+                .sort_by_key(|rule| std::cmp::Reverse(rule.priority));
             db.save_full_config(&config)?;
             println!("rule {id} added");
         }
@@ -189,6 +193,8 @@ pub fn run_import(db_path: &str, file_path: &str, replace: bool) -> Result<()> {
 
     let config = AppConfig::load(file_path)
         .with_context(|| format!("failed to load YAML from: {file_path}"))?;
+    let mut config = config;
+    config.normalize_rules();
     migration::import_yaml(&db, &config)?;
     println!("Configuration imported from {file_path}");
     Ok(())
@@ -252,6 +258,7 @@ fn ensure_minimum_config(config: &mut AppConfig) {
             url: "404".to_string(),
         };
     }
+    config.normalize_rules();
 }
 
 fn get_config_value(config: &AppConfig, key: &str) -> Result<String> {
@@ -423,8 +430,10 @@ mod tests {
             pool_max_idle_per_host: 32,
             pool_idle_timeout: 90,
             tcp_keepalive: 60,
+            certificate_dir: "/etc/rustproxy/cert.d".to_string(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
+            match_sets: Vec::new(),
             rules: vec![],
             upstreams: HashMap::new(),
             fallback: Fallback {

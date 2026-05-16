@@ -1,4 +1,4 @@
-use crate::models::{Rule, Upstream};
+use crate::models::{MatchSet, Rule, Upstream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -39,10 +39,14 @@ pub struct AppConfig {
     pub pool_idle_timeout: u64,
     #[serde(default = "default_tcp_keepalive")]
     pub tcp_keepalive: u64,
+    #[serde(default = "default_certificate_dir")]
+    pub certificate_dir: String,
     #[serde(default)]
     pub certificates: Vec<Certificate>,
     #[serde(default)]
     pub tls_listeners: Vec<TlsListener>,
+    #[serde(default)]
+    pub match_sets: Vec<MatchSet>,
     pub rules: Vec<Rule>,
     pub upstreams: HashMap<String, Upstream>,
     pub fallback: Fallback,
@@ -76,6 +80,10 @@ fn default_tcp_keepalive() -> u64 {
     60
 }
 
+fn default_certificate_dir() -> String {
+    "/etc/rustproxy/cert.d".to_string()
+}
+
 fn default_tls_listener_enabled() -> bool {
     true
 }
@@ -83,8 +91,32 @@ fn default_tls_listener_enabled() -> bool {
 impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: AppConfig = serde_yaml::from_str(&content)?;
+        let mut config: AppConfig = serde_yaml::from_str(&content)?;
+        config.normalize_rules();
         Ok(config)
+    }
+
+    pub fn normalize_rules(&mut self) {
+        if self.proxy_listen.trim().is_empty() {
+            self.proxy_listen = default_proxy_listen();
+        }
+        let default_listen = self.proxy_listen.clone();
+        for rule in &mut self.rules {
+            Self::normalize_rule_with_default(rule, &default_listen);
+        }
+    }
+
+    pub fn normalize_rule_with_default(rule: &mut Rule, default_listen: &str) {
+        if rule.listen.as_deref().unwrap_or_default().trim().is_empty() {
+            rule.listen = Some(default_listen.to_string());
+        }
+        if rule.is_fallback {
+            rule.priority = 0;
+            rule.conditions = None;
+            rule.match_set = None;
+            rule.weight = 100;
+            rule.tls = None;
+        }
     }
 
     pub fn reload(&mut self) -> anyhow::Result<()> {

@@ -70,9 +70,7 @@ fallback:
     #[test]
     fn test_watch_config_nonexistent_path() {
         let result = watch_config("/nonexistent/path/config.yaml", || {});
-        // Should return an error because the file doesn't exist
-        // Note: notify may still create a watcher, so we check if it works
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     fn create_temp_file(content: &str) -> NamedTempFile {

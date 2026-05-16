@@ -26,7 +26,7 @@ pub fn run_list(db_path: &str) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<5} {:<20} {}", "ID", "Username", "Created");
+    println!("{:<5} {:<20} Created", "ID", "Username");
     for (id, username, created) in &users {
         println!("{id:<5} {username:<20} {created}");
     }

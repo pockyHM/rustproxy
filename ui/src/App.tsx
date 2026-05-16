@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { FormEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
 
 /* ===== Types ===== */
@@ -34,13 +34,16 @@ type ConditionExpr =
   | { type: 'leaf'; conditionType: ConditionType; key?: string | null; claimPath?: string | null; operator: Operator; value?: string | null }
   | { type: 'and'; children: ConditionExpr[] }
   | { type: 'or'; children: ConditionExpr[] };
+type MatchSet = { name: string; conditions?: ConditionExpr | null };
 type Rule = {
   id: string;
   name: string;
   priority: number;
+  match_set?: string | null;
   conditions?: ConditionExpr | null;
   upstream: string;
   weight: number;
+  is_fallback?: boolean;
   listen?: string | null;
   tls?: RuleTls | null;
 };
@@ -53,14 +56,16 @@ type AppConfig = {
   pool_max_idle_per_host?: number;
   pool_idle_timeout?: number;
   tcp_keepalive?: number;
+  certificate_dir?: string;
   certificates?: Certificate[];
   tls_listeners?: TlsListener[];
+  match_sets?: MatchSet[];
   rules: Rule[];
   upstreams: Record<string, Upstream>;
   fallback: { url: string };
 };
 
-type View = 'operations' | 'rules' | 'upstreams' | 'certificates' | 'config';
+type View = 'operations' | 'rules' | 'match-sets' | 'upstreams' | 'certificates' | 'config';
 type Notice = { type: 'success' | 'error'; message: string } | null;
 type DataProps = { config: AppConfig; token: string; setConfig: (config: AppConfig) => void; setNotice: (notice: Notice) => void };
 type DropdownOption = { value: string; label: string; description?: string };
@@ -78,6 +83,7 @@ const T: Record<string, [string, string]> = {
   'nav.control': ['CONTROL', '控制'],
   'nav.operations': ['Operations', '运维概览'],
   'nav.rules': ['Rules', '路由规则'],
+  'nav.matchSets': ['Match Sets', '匹配集'],
   'nav.upstreams': ['Upstreams', '上游服务'],
   'nav.certificates': ['Certificates', '证书'],
   'nav.config': ['Config File', '配置文件'],
@@ -93,6 +99,9 @@ const T: Record<string, [string, string]> = {
   'ops.sub': ['Live proxy health, weighted routing, reload status, and request pressure across listeners.', '代理健康状态、加权路由、重载状态和请求压力概览。'],
   'rules.title': ['Routing Rules', '路由规则'],
   'rules.sub': ['Manage request matching rules with priority-based routing to upstream pools.', '管理请求匹配规则，按优先级路由到上游池。'],
+  'matchSets.title': ['Match Sets', '匹配集'],
+  'matchSets.sub': ['Create reusable request match trees and attach them to routing rules.', '创建可复用的请求匹配树，并在路由规则中引用。'],
+  'matchSets.empty': ['No match sets configured', '暂无匹配集'],
   'upstreams.title': ['Upstreams', '上游服务'],
   'upstreams.sub': ['Manage upstream target pools with weighted load balancing and health checks.', '管理上游目标池，支持加权负载均衡和健康检查。'],
   'config.title': ['Config File', '配置文件'],
@@ -103,6 +112,7 @@ const T: Record<string, [string, string]> = {
   'config.proxyListen': ['Proxy listen', '代理监听'],
   'config.tlsListeners': ['HTTPS Listeners', 'HTTPS 监听'],
   'config.certificates': ['Certificates', '证书'],
+  'config.certificateDir': ['Certificate directory', '证书目录'],
   'config.certName': ['Certificate name', '证书名称'],
   'config.certFile': ['Certificate / chain', '证书 / 证书链'],
   'config.keyFile': ['Private key', '私钥'],
@@ -121,6 +131,9 @@ const T: Record<string, [string, string]> = {
   'rule.tlsHelp': ['Rules sharing one HTTPS port can use different certificates when SNI and exact Host conditions are configured.', '多个规则可以共用同一个 HTTPS 端口；配置精确 Host 条件并且客户端发送 SNI 时，可选择不同证书。'],
   'rule.noCertificates': ['Upload a certificate first from the Certificates menu.', '请先在证书菜单上传证书。'],
   'rule.protocolConflict': ['This port is already used by the other protocol. HTTP and HTTPS cannot share one port yet.', '该端口已经被另一种协议占用，当前暂不支持 HTTP 和 HTTPS 共用同一端口。'],
+  'rule.fallback': ['Fallback rule', '兜底规则'],
+  'rule.enableFallback': ['Use when no other rule matches', '所有规则都未命中时使用'],
+  'rule.fallbackHelp': ['Fallback rules run after normal rules and only need an upstream.', '兜底规则会在普通规则全部未命中后执行，只需要选择上游。'],
   'config.fallbackUrl': ['Fallback target', '兜底目标'],
   'config.skipSsl': ['Skip SSL verification', '跳过 SSL 验证'],
   'config.websocket': ['Enable WebSocket proxy', '启用 WebSocket 代理'],
@@ -131,6 +144,7 @@ const T: Record<string, [string, string]> = {
   'config.tcpKeepalive': ['TCP keepalive (s)', 'TCP Keepalive (秒)'],
   'action.reload': ['Reload config', '重新加载'],
   'action.newRule': ['New rule', '新建规则'],
+  'action.newMatchSet': ['New match set', '新建匹配集'],
   'action.newUpstream': ['New upstream', '新建上游'],
   'action.save': ['Save', '保存'],
   'action.cancel': ['Cancel', '取消'],
@@ -184,11 +198,21 @@ const T: Record<string, [string, string]> = {
   'inspector.wsDisabled': ['WebSocket proxy disabled', 'WebSocket 代理未启用'],
   'inspector.snapshot': ['Config snapshot', '配置快照'],
   'inspector.prometheus': ['Prometheus', 'Prometheus'],
-  'inspector.prometheusDesc': ['Counters, histograms, active connection gauge, and config reload counter are exposed from /metrics without auth.', '计数器、直方图、活跃连接指标和配置重载计数器从 /metrics 暴露，无需认证。'],
+  'inspector.prometheusDesc': ['Runtime resource gauges scraped from /metrics.', '从 /metrics 抓取的运行时资源指标。'],
+  'inspector.memory': ['Memory', '内存'],
+  'inspector.cpu': ['CPU', 'CPU'],
+  'inspector.connections': ['Connections', '连接数'],
+  'inspector.fds': ['Open FDs', '打开 FD'],
+  'inspector.cpuHint': ['process CPU', '进程占用'],
+  'inspector.rssHint': ['resident set', '常驻内存'],
+  'inspector.fdHint': ['file descriptors', '文件描述符'],
   'form.condition': ['Condition', '匹配条件'],
   'form.identity': ['Identity', '基础信息'],
   'form.routing': ['Routing target', '路由目标'],
   'form.matching': ['Match condition', '匹配条件'],
+  'form.matchSource': ['Match source', '匹配来源'],
+  'form.inlineMatch': ['Inline condition', '规则内新建匹配'],
+  'form.reusableMatch': ['Reusable match set', '复用匹配集'],
   'form.pool': ['Pool details', '上游池信息'],
   'form.nodeType': ['Node type', '节点类型'],
   'form.leaf': ['Condition', '条件'],
@@ -224,6 +248,8 @@ const T: Record<string, [string, string]> = {
   'health.hostPort': ['host:port', '主机:端口'],
   'modal.editRule': ['Edit Rule', '编辑规则'],
   'modal.newRule': ['New Rule', '新建规则'],
+  'modal.editMatchSet': ['Edit Match Set', '编辑匹配集'],
+  'modal.newMatchSet': ['New Match Set', '新建匹配集'],
   'modal.editUpstream': ['Edit Upstream', '编辑上游'],
   'modal.newUpstream': ['New Upstream', '新建上游'],
   'config.schema': ['Schema Reference', 'Schema 参考'],
@@ -252,6 +278,9 @@ const T: Record<string, [string, string]> = {
   'notice.ruleCreated': ['Rule created', '规则已创建'],
   'notice.ruleUpdated': ['Rule updated', '规则已更新'],
   'notice.ruleDeleted': ['Rule deleted', '规则已删除'],
+  'notice.matchSetCreated': ['Match set created', '匹配集已创建'],
+  'notice.matchSetUpdated': ['Match set updated', '匹配集已更新'],
+  'notice.matchSetDeleted': ['Match set deleted', '匹配集已删除'],
   'notice.upstreamCreated': ['Upstream created', '上游已创建'],
   'notice.upstreamUpdated': ['Upstream updated', '上游已更新'],
   'notice.upstreamDeleted': ['Upstream deleted', '上游已删除'],
@@ -276,6 +305,7 @@ const defaultHealthCheck: HealthCheck = {
 const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
   { id: 'operations', labelKey: 'nav.operations', icon: 'monitoring' },
   { id: 'rules', labelKey: 'nav.rules', icon: 'route' },
+  { id: 'match-sets', labelKey: 'nav.matchSets', icon: 'rule_settings' },
   { id: 'upstreams', labelKey: 'nav.upstreams', icon: 'lan' },
   { id: 'certificates', labelKey: 'nav.certificates', icon: 'workspace_premium' },
   { id: 'config', labelKey: 'nav.config', icon: 'database' },
@@ -285,7 +315,7 @@ const ROUTE_FLOW_COLORS = ['#FF8400', '#000066', '#804200', '#004D1A'];
 
 const emptyConfig: AppConfig = {
   version: '1.0', listen: '127.0.0.1:3000', proxy_listen: '0.0.0.0:80',
-  certificates: [], tls_listeners: [],
+  certificate_dir: '/etc/rustproxy/cert.d', certificates: [], tls_listeners: [], match_sets: [],
   rules: [], upstreams: {}, fallback: { url: '404' },
 };
 
@@ -359,7 +389,7 @@ function Splash({ label }: { label: string }) {
   return (
     <main className="splash-screen">
       <div className="splash-logo">
-        <span className="material-symbols-sharp" style={{ fontSize: 32, color: 'var(--primary)' }}>hub</span>
+        <img src="/admin/favicon.svg" width="32" height="32" alt="" />
         <span>RustProxy</span>
       </div>
       <p>{label}</p>
@@ -459,6 +489,7 @@ function App() {
           {notice && <Toast notice={notice} onClose={() => setNotice(null)} />}
           {view === 'operations' && <OperationsView config={config} token={token} />}
           {view === 'rules' && <RulesView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
+          {view === 'match-sets' && <MatchSetsView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
           {view === 'upstreams' && <UpstreamsView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
           {view === 'certificates' && <CertificatesView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
           {view === 'config' && <ConfigView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
@@ -477,7 +508,7 @@ function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, chan
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
-        <div className="sidebar-logo"><Icon name="hub" size={24} /></div>
+        <div className="sidebar-logo"><img src="/admin/favicon.svg" alt="RustProxy" /></div>
         <div className="sidebar-brand-text">
           <div className="sidebar-name">RustProxy</div>
           <div className="sidebar-subtitle">{t('brand.subtitle')}</div>
@@ -539,10 +570,35 @@ function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, chan
 function OperationsView({ config, token }: { config: AppConfig; token: string }) {
   const { lang, t } = useI18n();
   const [metrics, setMetrics] = useState<PrometheusMetric[]>([]);
-  useEffect(() => { fetch('/metrics').then((r) => r.text()).then((text) => setMetrics(parsePrometheus(text))).catch(() => {}); }, []);
+  const [cpuUsage, setCpuUsage] = useState(0);
+  const previousCpu = useRef<{ total: number; at: number } | null>(null);
+  useEffect(() => {
+    let active = true;
+    async function loadMetrics() {
+      try {
+        const text = await fetch('/metrics').then((r) => r.text());
+        if (!active) return;
+        const nextMetrics = parsePrometheus(text);
+        const cpuTotal = metricValue(nextMetrics, 'process_cpu_seconds_total');
+        const now = Date.now();
+        if (cpuTotal !== null && previousCpu.current) {
+          const cpuDelta = Math.max(0, cpuTotal - previousCpu.current.total);
+          const secondsDelta = Math.max(1, (now - previousCpu.current.at) / 1000);
+          setCpuUsage((cpuDelta / secondsDelta) * 100);
+        }
+        if (cpuTotal !== null) previousCpu.current = { total: cpuTotal, at: now };
+        setMetrics(nextMetrics);
+      } catch (_) {}
+    }
+    loadMetrics();
+    const timer = window.setInterval(loadMetrics, 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
 
   const totalRequests = useMemo(() => metrics.filter((m) => m.name === 'proxy_requests_total').reduce((s, m) => s + m.value, 0), [metrics]);
   const activeConns = useMemo(() => metrics.find((m) => m.name === 'proxy_active_connections')?.value ?? 0, [metrics]);
+  const residentMemory = useMemo(() => metricValue(metrics, 'process_resident_memory_bytes') ?? 0, [metrics]);
+  const openFds = useMemo(() => metricValue(metrics, 'process_open_fds') ?? 0, [metrics]);
   const avgLatency = useMemo(() => {
     const sum = metrics.find((m) => m.name === 'proxy_request_duration_seconds_sum')?.value;
     const count = metrics.find((m) => m.name === 'proxy_request_duration_seconds_count')?.value;
@@ -565,18 +621,35 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
     upstream: m.labels.upstream || '-', status: m.labels.status || '-', count: m.value,
   })), [metrics, ruleNameById]);
   const upstreams = useMemo(() => Object.values(config.upstreams ?? {}), [config]);
-  const routeFlows = useMemo(() => [...config.rules]
-    .sort((a, b) => b.priority - a.priority)
-    .map((rule, index) => {
-      const upstream = config.upstreams?.[rule.upstream];
-      return {
-        rule,
-        upstream,
-        entry: `${rule.tls?.enabled ? 'https' : 'http'}://${rule.listen || config.proxy_listen || '0.0.0.0:80'}`,
-        requests: requestsByRule[rule.id] ?? 0,
-        color: ROUTE_FLOW_COLORS[index % ROUTE_FLOW_COLORS.length],
-      };
-    }), [config, requestsByRule]);
+  const routeFlowGroups = useMemo(() => {
+    const defaultListen = config.proxy_listen || '0.0.0.0:80';
+    const grouped = new Map<string, {
+      entry: string;
+      color: string;
+      flows: {
+        rule: Rule;
+        upstream?: Upstream;
+        requests: number;
+        color: string;
+      }[];
+    }>();
+    [...config.rules]
+      .sort((a, b) => Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority)
+      .forEach((rule) => {
+        const entry = `${rule.tls?.enabled ? 'https' : 'http'}://${rule.listen || defaultListen}`;
+        if (!grouped.has(entry)) {
+          grouped.set(entry, { entry, color: ROUTE_FLOW_COLORS[grouped.size % ROUTE_FLOW_COLORS.length], flows: [] });
+        }
+        const group = grouped.get(entry)!;
+        group.flows.push({
+          rule,
+          upstream: config.upstreams?.[rule.upstream],
+          requests: requestsByRule[rule.id] ?? 0,
+          color: ROUTE_FLOW_COLORS[group.flows.length % ROUTE_FLOW_COLORS.length],
+        });
+      });
+    return [...grouped.values()];
+  }, [config, requestsByRule]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, flex: 1 }}>
@@ -618,25 +691,41 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
               </div>
             </div>
             <div className="routing-flow-list">
-              {routeFlows.length > 0 ? routeFlows.slice(0, 5).map(({ rule, upstream, entry, requests, color }) => (
-                <div className="flow-row" key={rule.id} style={{ borderLeftColor: color }}>
+              {routeFlowGroups.length > 0 ? routeFlowGroups.map((group) => (
+                <div className="flow-group" key={group.entry} style={{ borderLeftColor: group.color }}>
                   <div className="flow-node flow-entry">
                     <span className="flow-node-label">{t('ops.entry')}</span>
-                    <strong>{entry}</strong>
+                    <strong>{group.entry}</strong>
+                    <small>{lang === 'en' ? `${group.flows.length} route${group.flows.length !== 1 ? 's' : ''}` : `${group.flows.length} 条链路`}</small>
                   </div>
-                  <Icon name="arrow_forward" size={18} />
-                  <div className="flow-node flow-rule">
-                    <span className="flow-node-label">{t('table.rule')} · {t('ops.priorityShort')}{rule.priority}</span>
-                    <strong title={rule.id}>{rule.name || rule.id}</strong>
-                    <small>{summarizeCondition(rule.conditions)}</small>
+                  <div className="flow-branches">
+                    {group.flows.map(({ rule, upstream, requests, color }, index) => (
+                      <div className={`flow-branch ${rule.is_fallback ? 'is-fallback' : ''}`} key={rule.id || `${group.entry}-${index}`}>
+                        <span className="flow-branch-rail" style={{ background: color }} />
+                        <div className="flow-priority">
+                          <span>{rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
+                          {rule.is_fallback && <Icon name="shield" size={15} />}
+                        </div>
+                        <Icon name="arrow_forward" size={16} />
+                        <div className="flow-node flow-rule-name">
+                          <span className="flow-node-label">{t('table.rule')}</span>
+                          <strong title={rule.id}>{rule.name || rule.id || '-'}</strong>
+                        </div>
+                        <Icon name="arrow_forward" size={16} />
+                        <div className="flow-node flow-upstream">
+                          <span className="flow-node-label">{t('table.upstream')}</span>
+                          <strong>{rule.upstream}</strong>
+                          <small>{upstream ? targetSummary(upstream, lang) : 'missing upstream'}</small>
+                        </div>
+                        <div className="flow-count">{formatNumber(requests)} {t('ops.requestsShort')}</div>
+                        <div className="flow-rule-popover" role="tooltip">
+                          <span>{t('table.rule')} · {rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
+                          <strong>{rule.name || rule.id || '-'}</strong>
+                          <small>{rule.is_fallback ? t('rule.fallbackHelp') : summarizeRuleMatch(rule)}</small>
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                  <Icon name="arrow_forward" size={18} />
-                  <div className="flow-node flow-upstream">
-                    <span className="flow-node-label">{t('table.upstream')}</span>
-                    <strong>{rule.upstream}</strong>
-                    <small>{upstream ? targetSummary(upstream, lang) : 'missing upstream'}</small>
-                  </div>
-                  <div className="flow-count">{formatNumber(requests)} {t('ops.requestsShort')}</div>
                 </div>
               )) : (
                 <div className="flow-empty">
@@ -674,13 +763,64 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
             <div className="config-row"><span className="config-key">pool_idle_timeout</span><span className="config-val">{config.pool_idle_timeout ?? 90}s</span></div>
           </div>
           <div className="card" style={{ flex: 1 }}>
-            <h3 className="card-title">{t('inspector.prometheus')}</h3>
-            <p className="card-desc">{t('inspector.prometheusDesc')}</p>
-            <div className="metric-line"><span className="metric-line-name">proxy_requests_total</span><div className="metric-bar-track"><div className="metric-bar-fill" style={{ width: '60%' }} /></div></div>
-            <div className="metric-line"><span className="metric-line-name">proxy_request_duration_seconds</span><div className="metric-bar-track"><div className="metric-bar-fill" style={{ width: '40%' }} /></div></div>
+            <div className="resource-card-head">
+              <div>
+                <h3 className="card-title">{t('inspector.prometheus')}</h3>
+                <p className="card-desc">{t('inspector.prometheusDesc')}</p>
+              </div>
+              <span className="resource-live-dot">{t('metric.live')}</span>
+            </div>
+            <div className="resource-grid">
+              <ResourceMetric
+                label={t('inspector.memory')}
+                value={formatBytes(residentMemory)}
+                hint={t('inspector.rssHint')}
+                icon="memory"
+                tone="success"
+                progress={clampPercent((residentMemory / (512 * 1024 * 1024)) * 100)}
+              />
+              <ResourceMetric
+                label={t('inspector.cpu')}
+                value={`${cpuUsage.toFixed(cpuUsage >= 10 ? 0 : 1)}%`}
+                hint={t('inspector.cpuHint')}
+                icon="speed"
+                tone="warning"
+                progress={clampPercent(cpuUsage)}
+              />
+              <ResourceMetric
+                label={t('inspector.connections')}
+                value={formatNumber(activeConns)}
+                hint="proxy_active_connections"
+                icon="hub"
+                tone="info"
+                progress={clampPercent((activeConns / 100) * 100)}
+              />
+              <ResourceMetric
+                label={t('inspector.fds')}
+                value={formatNumber(openFds)}
+                hint={t('inspector.fdHint')}
+                icon="folder_open"
+                tone="neutral"
+                progress={clampPercent((openFds / 1024) * 100)}
+              />
+            </div>
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ResourceMetric({ label, value, hint, icon, tone, progress }: { label: string; value: string; hint: string; icon: string; tone: 'success' | 'warning' | 'info' | 'neutral'; progress: number }) {
+  return (
+    <div className={`resource-metric tone-${tone}`}>
+      <div className="resource-metric-top">
+        <span className="resource-icon"><Icon name={icon} size={18} /></span>
+        <span className="resource-label">{label}</span>
+      </div>
+      <strong>{value}</strong>
+      <div className="resource-bar-track"><span className="resource-bar-fill" style={{ width: `${progress}%` }} /></div>
+      <small>{hint}</small>
     </div>
   );
 }
@@ -689,23 +829,28 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
 
 function RulesView({ config, token, setConfig, setNotice }: DataProps) {
   const { t } = useI18n();
-  const [draft, setDraft] = useState<Rule>(() => newRule(Object.keys(config.upstreams)[0]));
+  const defaultListen = config.proxy_listen || '0.0.0.0:80';
+  const [draft, setDraft] = useState<Rule>(() => newRule(Object.keys(config.upstreams)[0], defaultListen));
   const [editing, setEditing] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const upstreamNames = Object.keys(config.upstreams);
   const certificates = config.certificates ?? [];
+  const matchSets = config.match_sets ?? [];
   const protocolConflict = listenerProtocolConflict(config, draft, editing);
 
-  function openCreate() { setEditing(null); setDraft(newRule(upstreamNames[0])); setShowModal(true); }
-  function openEdit(rule: Rule) { setEditing(rule.id); setDraft({ ...rule, conditions: normalizeCondition(rule.conditions) }); setShowModal(true); }
+  function openCreate() { setEditing(null); setDraft(newRule(upstreamNames[0], defaultListen)); setShowModal(true); }
+  function openEdit(rule: Rule) { setEditing(rule.id); setDraft({ ...rule, listen: rule.listen || defaultListen, conditions: rule.match_set ? null : normalizeCondition(rule.conditions) }); setShowModal(true); }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     const body = {
       ...draft,
-      conditions: normalizeCondition(draft.conditions),
-      listen: draft.listen || null,
-      tls: draft.tls?.enabled ? { enabled: true, certificate: draft.tls.certificate } : null,
+      match_set: draft.is_fallback ? null : draft.match_set || null,
+      conditions: draft.is_fallback || draft.match_set ? null : normalizeCondition(draft.conditions),
+      priority: draft.is_fallback ? 0 : draft.priority,
+      weight: draft.is_fallback ? 100 : draft.weight,
+      listen: draft.listen || defaultListen,
+      tls: draft.is_fallback ? null : draft.tls?.enabled ? { enabled: true, certificate: draft.tls.certificate } : null,
     };
     await api<Rule>(editing ? `/api/rules/${encodeURIComponent(editing)}` : '/api/rules', { method: editing ? 'PUT' : 'POST', token, body });
     await refreshConfig(token, setConfig, setNotice);
@@ -721,7 +866,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
 
   async function handleReload() { await refreshConfig(token, setConfig, setNotice); setNotice({ type: 'success', message: t('notice.configReloaded') }); }
 
-  const sorted = [...config.rules].sort((a, b) => b.priority - a.priority);
+  const sorted = [...config.rules].sort((a, b) => Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 16 }}>
@@ -743,10 +888,10 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               <td className="td-mono">{rule.id}</td>
               <td style={{ fontWeight: 500 }}>{rule.name || rule.id}</td>
               <td className="td-mono">{rule.priority}</td>
-              <td className="td-mono">{rule.listen ? `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen}` : '—'}</td>
+              <td className="td-mono">{rule.is_fallback ? `${t('rule.fallback')} · ${rule.listen || defaultListen}` : `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen || defaultListen}`}</td>
               <td><span className="td-badge">{rule.upstream}</span></td>
               <td className="td-mono">{rule.weight}</td>
-              <td className="td-mono">{summarizeCondition(rule.conditions)}</td>
+              <td className="td-mono">{rule.is_fallback ? t('rule.enableFallback') : summarizeRuleMatch(rule)}</td>
               <td className="td-actions">
                 <button className="btn btn-ghost btn-sm" onClick={() => openEdit(rule)}>{t('action.edit')}</button>
                 <button className="btn btn-danger btn-sm" onClick={() => remove(rule.id)}>{t('action.del')}</button>
@@ -764,12 +909,28 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 <Field label={t('table.name')}><input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} required /></Field>
                 {editing && <Field label={t('table.id')}><input value={draft.id} disabled /></Field>}
               </div>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(draft.is_fallback)}
+                  onChange={(e) => setDraft({
+                    ...draft,
+                    is_fallback: e.target.checked,
+                    match_set: e.target.checked ? null : draft.match_set,
+                    conditions: e.target.checked ? null : draft.conditions ?? createLeafCondition(),
+                    listen: draft.listen || defaultListen,
+                    tls: e.target.checked ? null : draft.tls,
+                  })}
+                />
+                <span>{t('rule.enableFallback')}</span>
+              </label>
+              {draft.is_fallback && <p className="card-desc">{t('rule.fallbackHelp')}</p>}
             </section>
-            <section className="form-section">
+            {!draft.is_fallback && <section className="form-section">
               <h3 className="form-section-title">{t('form.routing')}</h3>
               <div className="form-grid-3">
                 <Field label={t('table.priority')}><input type="number" value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: Number(e.target.value) })} /></Field>
-                <Field label={t('table.listen')}><input placeholder="0.0.0.0:9090" value={draft.listen ?? ''} onChange={(e) => setDraft({ ...draft, listen: e.target.value })} /></Field>
+                <Field label={t('table.listen')}><input placeholder={config.proxy_listen || '0.0.0.0:80'} value={draft.listen ?? ''} onChange={(e) => setDraft({ ...draft, listen: e.target.value })} /></Field>
                 <Field label={t('table.weight')}><input type="number" min="0" max="100" value={draft.weight} onChange={(e) => setDraft({ ...draft, weight: Number(e.target.value) })} /></Field>
               </div>
               <Field label={t('table.pool')}>
@@ -779,8 +940,19 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                   onChange={(upstream) => setDraft({ ...draft, upstream })}
                 />
               </Field>
-            </section>
+            </section>}
             <section className="form-section">
+              {draft.is_fallback && <h3 className="form-section-title">{t('form.routing')}</h3>}
+              {draft.is_fallback && (
+                <Field label={t('table.pool')}>
+                  <Dropdown
+                    value={draft.upstream}
+                    options={upstreamNames.length > 0 ? upstreamNames.map((name) => ({ value: name, label: name })) : [{ value: '', label: '—' }]}
+                    onChange={(upstream) => setDraft({ ...draft, upstream })}
+                  />
+                </Field>
+              )}
+              {!draft.is_fallback && (
               <div className="tls-rule-card">
                 <div className="tls-rule-head">
                   <div>
@@ -818,14 +990,110 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 )}
                 {protocolConflict && <div className="form-warning"><Icon name="warning" size={16} />{t('rule.protocolConflict')}</div>}
               </div>
+              )}
             </section>
-            <section className="form-section">
+            {!draft.is_fallback && <section className="form-section">
               <h3 className="form-section-title">{t('form.matching')}</h3>
-              <ConditionEditor draft={draft} setDraft={setDraft} />
-            </section>
+              <Field label={t('form.matchSource')}>
+                <Dropdown
+                  value={draft.match_set || '__inline__'}
+                  options={[
+                    { value: '__inline__', label: t('form.inlineMatch'), description: t('form.matching') },
+                    ...matchSets.map((set) => ({ value: set.name, label: set.name, description: summarizeCondition(set.conditions) })),
+                  ]}
+                  onChange={(value) => setDraft(value === '__inline__'
+                    ? { ...draft, match_set: null, conditions: draft.conditions ?? createLeafCondition() }
+                    : { ...draft, match_set: value, conditions: null })}
+                />
+              </Field>
+              {!draft.match_set && <ConditionEditor draft={draft} setDraft={setDraft} />}
+            </section>}
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
               <button type="submit" className="btn btn-primary" disabled={protocolConflict}>{editing ? t('action.save') : t('action.create')}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ===== Match Sets View ===== */
+
+function MatchSetsView({ config, token, setConfig, setNotice }: DataProps) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState<MatchSet>(() => newMatchSet());
+  const [editing, setEditing] = useState<string | null>(null);
+  const [showModal, setShowModal] = useState(false);
+  const matchSets = [...(config.match_sets ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+  const usedBy: Record<string, number> = {};
+  (config.rules ?? []).forEach((rule) => {
+    if (rule.match_set) usedBy[rule.match_set] = (usedBy[rule.match_set] || 0) + 1;
+  });
+
+  function openCreate() { setEditing(null); setDraft(newMatchSet()); setShowModal(true); }
+  function openEdit(matchSet: MatchSet) { setEditing(matchSet.name); setDraft({ name: matchSet.name, conditions: normalizeCondition(matchSet.conditions) ?? createLeafCondition() }); setShowModal(true); }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const body = { ...draft, conditions: normalizeCondition(draft.conditions) };
+    await api<MatchSet>(editing ? `/api/match-sets/${encodeURIComponent(editing)}` : '/api/match-sets', { method: editing ? 'PUT' : 'POST', token, body });
+    await refreshConfig(token, setConfig, setNotice);
+    setNotice({ type: 'success', message: editing ? t('notice.matchSetUpdated') : t('notice.matchSetCreated') });
+    setShowModal(false);
+  }
+
+  async function remove(name: string) {
+    await api(`/api/match-sets/${encodeURIComponent(name)}`, { method: 'DELETE', token });
+    await refreshConfig(token, setConfig, setNotice);
+    setNotice({ type: 'success', message: t('notice.matchSetDeleted') });
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 16 }}>
+      <ViewHeader title={t('matchSets.title')} subtitle={t('matchSets.sub')} actions={
+        <button className="btn btn-primary btn-rect" onClick={openCreate}><Icon name="add" size={18} />{t('action.newMatchSet')}</button>
+      } />
+      <div className="table-card"><div className="table-wrap">
+        <table><thead><tr>
+          <th style={{ width: 180 }}>{t('table.name')}</th>
+          <th>{t('table.match')}</th>
+          <th style={{ width: 100 }}>{t('table.rule')}</th>
+          <th style={{ width: 80 }}>{t('table.actions')}</th>
+        </tr></thead><tbody>
+          {matchSets.length === 0 ? (
+            <tr><td colSpan={4} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 40 }}>{t('matchSets.empty')}</td></tr>
+          ) : matchSets.map((matchSet) => (
+            <tr key={matchSet.name}>
+              <td style={{ fontWeight: 600 }}>{matchSet.name}</td>
+              <td className="td-mono">{summarizeCondition(matchSet.conditions)}</td>
+              <td className="td-mono">{usedBy[matchSet.name] || 0}</td>
+              <td className="td-actions">
+                <button className="btn btn-ghost btn-sm" onClick={() => openEdit(matchSet)}>{t('action.edit')}</button>
+                <button className="btn btn-danger btn-sm" onClick={() => remove(matchSet.name)}>{t('action.del')}</button>
+              </td>
+            </tr>
+          ))}
+        </tbody></table>
+      </div></div>
+      {showModal && (
+        <Modal title={editing ? t('modal.editMatchSet') : t('modal.newMatchSet')} onClose={() => setShowModal(false)}>
+          <form onSubmit={submit} className="config-form">
+            <section className="form-section">
+              <h3 className="form-section-title">{t('form.identity')}</h3>
+              <Field label={t('table.name')}><input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} disabled={Boolean(editing)} required /></Field>
+            </section>
+            <section className="form-section">
+              <h3 className="form-section-title">{t('form.matching')}</h3>
+              <ConditionTreeEditor
+                condition={draft.conditions ?? createLeafCondition()}
+                onChange={(conditions) => setDraft({ ...draft, conditions })}
+              />
+            </section>
+            <div className="modal-footer">
+              <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
+              <button type="submit" className="btn btn-primary">{editing ? t('action.save') : t('action.create')}</button>
             </div>
           </form>
         </Modal>
@@ -838,12 +1106,16 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
 
 function ConditionEditor({ draft, setDraft }: { draft: Rule; setDraft: (r: Rule) => void }) {
   const condition = draft.conditions ?? createLeafCondition();
+  return <ConditionTreeEditor condition={condition} onChange={(next) => setDraft({ ...draft, conditions: next })} />;
+}
+
+function ConditionTreeEditor({ condition, onChange }: { condition: ConditionExpr; onChange: (expr: ConditionExpr) => void }) {
   return (
     <div className="condition-tree">
       <ConditionNodeEditor
         expr={condition}
         depth={0}
-        onChange={(next) => setDraft({ ...draft, conditions: next })}
+        onChange={onChange}
       />
     </div>
   );
@@ -1134,9 +1406,17 @@ function CertificatesView({ config, token, setConfig, setNotice }: DataProps) {
 
   async function submit() {
     try {
-      const next = { ...config, certificates };
+      for (const certificate of certificates) {
+        if (!certificate.name.trim()) continue;
+        if (isUploadedCertificate(certificate)) continue;
+        await api<Certificate>('/api/certificates', { method: 'POST', token, body: certificate });
+      }
+      const uploadedNames = new Set(certificates.map((certificate) => certificate.name).filter(Boolean));
+      const latest = await api<AppConfig>('/api/config', { token });
+      const next = { ...latest, certificates: (latest.certificates ?? []).filter((certificate) => uploadedNames.has(certificate.name)) };
       await api<AppConfig>('/api/config', { method: 'PUT', token, body: next });
       setConfig(next);
+      setCertificates(structuredClone(next.certificates ?? []));
       setNotice({ type: 'success', message: t('cert.saved') });
     } catch (e) { setNotice({ type: 'error', message: errorMessage(e) }); }
   }
@@ -1149,7 +1429,7 @@ function CertificatesView({ config, token, setConfig, setNotice }: DataProps) {
       <div className="cert-page">
         <div className="section-title-row">
           <h3 className="card-title-sm">{t('config.certificates')}</h3>
-          <button className="btn btn-secondary btn-sm" onClick={() => setCertificates([...certificates, { name: `cert-${Date.now().toString(36)}`, cert: '', key: '' }])}>
+          <button className="btn btn-secondary btn-sm" onClick={() => setCertificates([...certificates, { name: '', cert: '', key: '' }])}>
             <Icon name="upload_file" size={16} />{t('config.addCertificate')}
           </button>
         </div>
@@ -1163,13 +1443,13 @@ function CertificatesView({ config, token, setConfig, setNotice }: DataProps) {
                 <div className="upload-grid">
                   <label className="upload-box">
                     <Icon name="verified_user" size={18} />
-                    <span>{certificate.cert ? certificate.cert.split('\n')[0].slice(0, 34) : t('config.certFile')}</span>
+                    <span>{certificate.cert ? certificate.cert.split('\n')[0].slice(0, 54) : t('config.certFile')}</span>
                     <small>{t('config.certFormat')}</small>
                     <input type="file" accept=".pem,.crt,.cer,.der" onChange={(e) => importCertificateFile(index, 'cert', e.target.files?.[0] ?? null)} />
                   </label>
                   <label className="upload-box">
                     <Icon name="key" size={18} />
-                    <span>{certificate.key ? certificate.key.split('\n')[0].slice(0, 34) : t('config.keyFile')}</span>
+                    <span>{certificate.key ? certificate.key.split('\n')[0].slice(0, 54) : t('config.keyFile')}</span>
                     <small>{t('config.keyFormat')}</small>
                     <input type="file" accept=".pem,.key,.der" onChange={(e) => importCertificateFile(index, 'key', e.target.files?.[0] ?? null)} />
                   </label>
@@ -1232,6 +1512,7 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <h3 className="card-title-sm">{t('config.global')}</h3>
             <Field label={t('config.listen')}><input value={globalConfig.listen ?? '127.0.0.1:3000'} onChange={(e) => updateGlobal({ listen: e.target.value })} /></Field>
             <Field label={t('config.proxyListen')}><input value={globalConfig.proxy_listen ?? '0.0.0.0:80'} onChange={(e) => updateGlobal({ proxy_listen: e.target.value })} /></Field>
+            <Field label={t('config.certificateDir')}><input value={globalConfig.certificate_dir ?? '/etc/rustproxy/cert.d'} onChange={(e) => updateGlobal({ certificate_dir: e.target.value })} /></Field>
             <Field label={t('config.fallbackUrl')}><input value={globalConfig.fallback?.url ?? ''} onChange={(e) => updateFallbackUrl(e.target.value)} /></Field>
             <Field label={t('config.requestTimeout')}><input type="number" min="0" value={globalConfig.request_timeout ?? 60} onChange={(e) => updateGlobal({ request_timeout: Number(e.target.value) })} /></Field>
           </div>
@@ -1244,16 +1525,18 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.schema')}</h3>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificates, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, name, priority, listen, tls.enabled, tls.certificate, upstream_pool, weight, match</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, name, priority, listen, tls.enabled, tls.certificate, match_set, conditions, upstream</span></div>
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.validation')}</h3>
             <div className="validation-row"><span className="validation-dot" style={{ background: isValid ? '#4ADE80' : '#FF5C33' }} /><span className="validation-text">{isValid ? t('config.valid') : t('config.invalid')}</span></div>
             <div className="validation-row"><span className="validation-dot" style={{ background: '#4ADE80' }} /><span className="validation-text">{Object.keys(config.upstreams).length} {t('config.poolsDefined')}</span></div>
+            <div className="validation-row"><span className="validation-dot" style={{ background: '#C792EA' }} /><span className="validation-text">{config.match_sets?.length ?? 0} {t('matchSets.title')}</span></div>
             <div className="validation-row"><span className="validation-dot" style={{ background: 'var(--primary)' }} /><span className="validation-text">{config.rules.length} {t('config.routesConfigured')}</span></div>
           </div>
           <div className="card">
@@ -1290,7 +1573,7 @@ function SetupScreen({ onDone, notice, setNotice }: { onDone: () => void; notice
   return (
     <main className="auth-screen"><div className="auth-card">
       <div className="auth-header">
-        <div className="auth-logo"><span className="material-symbols-sharp" style={{ fontSize: 32, color: 'var(--primary)' }}>hub</span><span className="auth-logo-text">RustProxy</span></div>
+        <div className="auth-logo"><img src="/admin/favicon.svg" width="32" height="32" alt="" /><span className="auth-logo-text">RustProxy</span></div>
         <h1 className="auth-title">{t('auth.createAccount')}</h1>
         <p className="auth-subtitle">{t('auth.createDesc')}</p>
       </div>
@@ -1326,7 +1609,7 @@ function LoginScreen({ onDone, notice, setNotice }: { onDone: (token: string) =>
   return (
     <main className="auth-screen"><div className="auth-card auth-card-login">
       <div className="auth-header">
-        <div className="auth-logo"><span className="material-symbols-sharp" style={{ fontSize: 32, color: 'var(--primary)' }}>hub</span><span className="auth-logo-text">RustProxy</span></div>
+        <div className="auth-logo"><img src="/admin/favicon.svg" width="32" height="32" alt="" /><span className="auth-logo-text">RustProxy</span></div>
         <h1 className="auth-title">{t('auth.welcome')}</h1>
         <p className="auth-subtitle">{t('auth.signInDesc')}</p>
       </div>
@@ -1371,14 +1654,34 @@ function parsePrometheus(text: string): PrometheusMetric[] {
   return metrics;
 }
 
+function metricValue(metrics: PrometheusMetric[], name: string): number | null {
+  return metrics.find((metric) => metric.name === name)?.value ?? null;
+}
+
 function formatNumber(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
   if (n >= 1_000) return n.toLocaleString();
   return String(n);
 }
 
-function newRule(upstream = ''): Rule {
-  return { id: '', name: '', priority: 10, upstream, weight: 100, conditions: createLeafCondition() };
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function newRule(upstream = '', listen = '0.0.0.0:80'): Rule {
+  return { id: '', name: '', priority: 10, match_set: null, upstream, weight: 100, is_fallback: false, listen, conditions: createLeafCondition() };
+}
+
+function newMatchSet(): MatchSet {
+  return { name: '', conditions: createLeafCondition() };
 }
 
 function tlsRuleListeners(config: AppConfig): string[] {
@@ -1392,7 +1695,16 @@ function tlsRuleListeners(config: AppConfig): string[] {
   return [...listeners].sort();
 }
 
+function isUploadedCertificate(certificate: Certificate): boolean {
+  return isFilePath(certificate.cert) && isFilePath(certificate.key);
+}
+
+function isFilePath(value: string): boolean {
+  return value.startsWith('/') || value.startsWith('./') || value.startsWith('../');
+}
+
 function listenerProtocolConflict(config: AppConfig, draft: Rule, editingId: string | null): boolean {
+  if (draft.is_fallback) return false;
   const port = extractPort(draft.listen);
   if (!port) return false;
 
@@ -1422,7 +1734,7 @@ function extractPort(listen?: string | null): string | null {
 }
 
 function newUpstream(): Upstream {
-  return { name: `upstream-${Date.now().toString(36)}`, skip_ssl: false, websocket: false, targets: [{ url: 'http://127.0.0.1:8080', weight: 100 }], health_check: { ...defaultHealthCheck } };
+  return { name: '', skip_ssl: false, websocket: false, targets: [{ url: 'http://127.0.0.1:8080', weight: 100 }], health_check: { ...defaultHealthCheck } };
 }
 
 function targetSummary(upstream: Upstream, lang: Lang): string {
@@ -1514,6 +1826,11 @@ function summarizeCondition(condition?: ConditionExpr | null): string {
     return [condition.conditionType, key, condition.operator, value].filter(Boolean).join(' ');
   }
   return `${condition.type.toUpperCase()} (${condition.children.map(summarizeCondition).join(', ')})`;
+}
+
+function summarizeRuleMatch(rule: Rule): string {
+  if (rule.match_set) return `@${rule.match_set}`;
+  return summarizeCondition(rule.conditions);
 }
 
 function resolveInitialView(): View {

@@ -30,6 +30,7 @@ fn build_config() -> AppConfig {
             id: "canary-header".to_string(),
             name: "Route canary header".to_string(),
             priority: 100,
+            match_set: None,
             conditions: Some(ConditionExpr::Leaf {
                 condition_type: ConditionType::Header,
                 key: Some("x-route".to_string()),
@@ -39,6 +40,7 @@ fn build_config() -> AppConfig {
             }),
             upstream: "canary".to_string(),
             weight: 100,
+            is_fallback: false,
             listen: None,
             tls: None,
         }],
@@ -51,8 +53,10 @@ fn build_config() -> AppConfig {
         pool_max_idle_per_host: 32,
         pool_idle_timeout: 90,
         tcp_keepalive: 60,
+        certificate_dir: "/etc/rustproxy/cert.d".to_string(),
         certificates: Vec::new(),
         tls_listeners: Vec::new(),
+        match_sets: Vec::new(),
     }
 }
 
