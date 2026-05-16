@@ -146,9 +146,10 @@ impl Collector for SelfProcessCollector {
             Ok(guard) => guard,
             Err(_) => return vec![],
         };
+        let pids = [self.pid];
         system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
+            ProcessesToUpdate::Some(&pids),
+            false,
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
 

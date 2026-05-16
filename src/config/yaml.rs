@@ -1,4 +1,4 @@
-use crate::models::{MatchSet, Rule, Upstream};
+use crate::models::{HostMatchType, LocationMatchType, MatchSet, Rule, Upstream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -110,6 +110,19 @@ impl AppConfig {
         if rule.listen.as_deref().unwrap_or_default().trim().is_empty() {
             rule.listen = Some(default_listen.to_string());
         }
+        if matches!(rule.host.match_type, HostMatchType::Any) {
+            rule.host.value = None;
+        }
+        if rule.location.value.trim().is_empty() {
+            rule.location.value = "/".to_string();
+        }
+        if matches!(
+            rule.location.match_type,
+            LocationMatchType::Exact | LocationMatchType::Prefix
+        ) && !rule.location.value.starts_with('/')
+        {
+            rule.location.value = format!("/{}", rule.location.value);
+        }
         if rule.is_fallback {
             rule.priority = 0;
             rule.conditions = None;
@@ -117,11 +130,6 @@ impl AppConfig {
             rule.weight = 100;
             rule.tls = None;
         }
-    }
-
-    pub fn reload(&mut self) -> anyhow::Result<()> {
-        // reload from same path - path stored in config
-        Ok(())
     }
 }
 
@@ -260,23 +268,5 @@ fallback:
         let file = create_test_config_file(yaml_content);
         let result = AppConfig::load(file.path().to_str().unwrap());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_app_config_reload() {
-        let yaml_content = r#"
-version: "1.0"
-listen: "0.0.0.0:8080"
-rules: []
-upstreams: {}
-fallback:
-  url: "http://fallback.example.com"
-"#;
-        let file = create_test_config_file(yaml_content);
-        let mut config = AppConfig::load(file.path().to_str().unwrap()).unwrap();
-
-        // reload should succeed (currently a no-op, but shouldn't error)
-        let result = config.reload();
-        assert!(result.is_ok());
     }
 }

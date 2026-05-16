@@ -199,7 +199,7 @@ pub async fn put_config(
         *config = new_config.clone();
     }
 
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     state.metrics.config_reloads.inc();
     Ok(Json(ApiResponse::success(new_config)))
@@ -266,7 +266,7 @@ pub async fn upload_certificate(
         let mut config = state.config.write().await;
         *config = new_config.clone();
     }
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(certificate)))
 }
@@ -353,7 +353,7 @@ pub async fn create_match_set(
         let mut config = state.config.write().await;
         *config = new_config.clone();
     }
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(match_set))))
 }
@@ -388,7 +388,7 @@ pub async fn update_match_set(
         let mut config = state.config.write().await;
         *config = new_config.clone();
     }
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(match_set)))
 }
@@ -427,7 +427,7 @@ pub async fn delete_match_set(
         let mut config = state.config.write().await;
         *config = new_config.clone();
     }
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(json!({ "name": name }))))
 }
@@ -444,21 +444,21 @@ pub async fn create_rule(
     if rule.id.trim().is_empty() {
         rule.id = format!("rule-{}", uuid::Uuid::new_v4().simple());
     }
-    let default_listen = state.config.read().await.proxy_listen.clone();
-    AppConfig::normalize_rule_with_default(&mut rule, &default_listen);
 
-    {
+    let old_config = {
         let config = state.config.read().await;
+        AppConfig::normalize_rule_with_default(&mut rule, &config.proxy_listen);
         if config.rules.iter().any(|existing| existing.id == rule.id) {
             return Err(error_response(
                 StatusCode::CONFLICT,
                 format!("rule '{}' already exists", rule.id),
             ));
         }
-    }
+        config.clone()
+    };
 
     {
-        let mut next = state.config.read().await.clone();
+        let mut next = old_config.clone();
         next.rules.push(rule.clone());
         super::routes::validate_tls_config(&next)
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -469,7 +469,6 @@ pub async fn create_rule(
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
     }
 
-    let old_config = state.config.read().await.clone();
     if let Err(error) = state.db.create_rule(&rule) {
         rollback_listeners(&state, &old_config, "rule create failure").await;
         return Err(error_response(
@@ -483,7 +482,7 @@ pub async fn create_rule(
         config.rules.push(rule.clone());
         config.clone()
     };
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(rule))))
 }
@@ -494,17 +493,26 @@ pub async fn update_rule(
     Json(mut rule): Json<Rule>,
 ) -> Result<Json<ApiResponse<Rule>>, Response> {
     rule.id = id.clone();
-    let default_listen = state.config.read().await.proxy_listen.clone();
-    AppConfig::normalize_rule_with_default(&mut rule, &default_listen);
 
-    {
-        let mut next = state.config.read().await.clone();
-        let Some(existing_rule) = next.rules.iter_mut().find(|existing| existing.id == id) else {
+    let old_config = {
+        let config = state.config.read().await;
+        AppConfig::normalize_rule_with_default(&mut rule, &config.proxy_listen);
+        if !config.rules.iter().any(|existing| existing.id == id) {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("rule '{id}' not found"),
             ));
-        };
+        }
+        config.clone()
+    };
+
+    {
+        let mut next = old_config.clone();
+        let existing_rule = next
+            .rules
+            .iter_mut()
+            .find(|existing| existing.id == id)
+            .unwrap();
         *existing_rule = rule.clone();
         super::routes::validate_tls_config(&next)
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -515,7 +523,6 @@ pub async fn update_rule(
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
     }
 
-    let old_config = state.config.read().await.clone();
     if let Err(error) = state.db.update_rule(&rule) {
         rollback_listeners(&state, &old_config, "rule update failure").await;
         return Err(error_response(
@@ -535,7 +542,7 @@ pub async fn update_rule(
         *existing_rule = rule.clone();
         config.clone()
     };
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(rule)))
 }
@@ -586,7 +593,7 @@ pub async fn delete_rule(
         let mut config = state.config.write().await;
         *config = next_config.clone();
     }
-    state.rebuild_proxy_runtime(&old_config, &next_config).await;
+    state.rebuild_proxy_runtime(&old_config, &next_config);
 
     Ok(Json(ApiResponse::success(json!({ "id": id }))))
 }
@@ -639,7 +646,7 @@ pub async fn create_upstream(
         let new_config = config.clone();
         (old_config, new_config)
     };
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(upstream))))
 }
@@ -669,7 +676,7 @@ pub async fn update_upstream(
         let new_config = config.clone();
         (old_config, new_config)
     };
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(upstream)))
 }
@@ -678,6 +685,16 @@ pub async fn delete_upstream(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Value>>, Response> {
+    {
+        let config = state.config.read().await;
+        if config.rules.iter().any(|rule| rule.upstream == id) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("upstream '{id}' is still used by routing rules"),
+            ));
+        }
+    }
+
     let deleted = state
         .db
         .delete_upstream(&id)
@@ -697,7 +714,7 @@ pub async fn delete_upstream(
         let new_config = config.clone();
         (old_config, new_config)
     };
-    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+    state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(json!({ "id": id }))))
 }

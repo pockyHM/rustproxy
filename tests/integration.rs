@@ -30,6 +30,8 @@ fn build_config() -> AppConfig {
             id: "canary-header".to_string(),
             name: "Route canary header".to_string(),
             priority: 100,
+            host: Default::default(),
+            location: Default::default(),
             match_set: None,
             conditions: Some(ConditionExpr::Leaf {
                 condition_type: ConditionType::Header,

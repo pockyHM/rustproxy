@@ -99,61 +99,65 @@ certificates:
     key: "/etc/rustproxy/cert.d/example/key.pem"
 
 match_sets:
-  - name: "api-host"
+  - name: "tenant-a"
     conditions:
-      type: and
-      children:
-        - type: leaf
-          conditionType: host
-          key: null
-          claimPath: null
-          operator: exact
-          value: "api.example.com"
-        - type: leaf
-          conditionType: path
-          key: null
-          claimPath: null
-          operator: prefix
-          value: "/v1"
+      type: leaf
+      conditionType: header
+      key: "x-tenant"
+      claimPath: null
+      operator: exact
+      value: "a"
 
 rules:
   - id: "rule-api"
     name: "API traffic"
+    listen: "0.0.0.0:80"
+    host:
+      type: exact
+      value: "api.example.com"
+    location:
+      type: prefix
+      value: "/api"
     priority: 100
-    match_set: "api-host"
+    match_set: "tenant-a"
     conditions: null
     upstream: "api"
     weight: 100
     is_fallback: false
-    listen: "0.0.0.0:80"
     tls: null
 
   - id: "rule-web-https"
     name: "HTTPS web traffic"
-    priority: 90
-    conditions:
-      type: leaf
-      conditionType: host
-      key: null
-      claimPath: null
-      operator: exact
+    listen: "0.0.0.0:443"
+    host:
+      type: exact
       value: "www.example.com"
+    location:
+      type: prefix
+      value: "/"
+    priority: 90
+    conditions: null
     upstream: "web"
     weight: 100
     is_fallback: false
-    listen: "0.0.0.0:443"
     tls:
       enabled: true
       certificate: "example"
 
   - id: "rule-default"
     name: "Default backend"
+    listen: "0.0.0.0:80"
+    host:
+      type: any
+      value: null
+    location:
+      type: prefix
+      value: "/"
     priority: 0
     conditions: null
     upstream: "web"
     weight: 100
     is_fallback: true
-    listen: "0.0.0.0:80"
     tls: null
 
 upstreams:
@@ -198,10 +202,13 @@ fallback:
 ### 匹配规则说明
 
 - 请求只会匹配当前监听入口下的规则，例如访问 `0.0.0.0:80` 只匹配 `listen: "0.0.0.0:80"` 的规则。
-- 普通规则按 `priority` 从高到低匹配。
+- 先按 `host` 匹配，优先级为 `exact > wildcard > any`。
+- 再按 `location` 匹配，优先级为 `exact > 最长 prefix > regex`。
+- 选定最具体的 `host + location` 后，只在这个分组内按 `priority` 从高到低匹配普通规则。
 - 如果优先级相同，按创建顺序优先匹配。
-- 兜底规则只在普通规则全部未命中后执行。
+- 兜底规则按 `listen + host + location` 生效，只在同一分组普通规则全部未命中后执行；不会自动回退到父 location。
 - 规则配置了 `match_set` 时，运行时使用匹配集里的条件；未配置 `match_set` 时，使用规则自身的 `conditions`。
+- `match_set` 和规则内条件只允许 header / cookie / jwt，host 和 location 需要在规则上单独配置。
 - `listen` 不建议为空；未设置时会归一化为全局 `proxy_listen`，默认是 `0.0.0.0:80`。
 
 ### TLS 与证书
@@ -209,7 +216,7 @@ fallback:
 - 证书通过管理后台上传，默认保存到 `certificate_dir/<证书名称>/cert.pem` 和 `key.pem`。
 - 配置文件中只保存证书文件绝对路径和证书名称。
 - 支持 PEM、CRT、CER、DER 等常见证书/私钥输入格式。
-- 多个 HTTPS 规则可以监听同一个端口，并通过 SNI / 精确 Host 条件选择证书。
+- 多个 HTTPS 规则可以监听同一个端口，并通过 SNI / 规则 `host` 选择证书；`host:any` 可作为默认 HTTPS 证书。
 - HTTP 与 HTTPS 监听端口不能冲突。
 
 ### 常用 CLI
@@ -236,7 +243,7 @@ rustproxy config upstream delete api
 
 # 规则管理
 rustproxy config rule list
-rustproxy config rule add rule-api --name "API" --upstream api --priority 100 --listen 0.0.0.0:80 --condition-type path --operator prefix --value /api
+rustproxy config rule add rule-api --name "API" --upstream api --priority 100 --listen 0.0.0.0:80 --host-type exact --host api.example.com --location-type prefix --location /api --condition-type header --key x-tenant --operator exact --value a
 rustproxy config rule delete rule-api
 
 # 配置导入导出
@@ -347,12 +354,14 @@ or:
 - `listen` is the admin API and admin UI address.
 - `proxy_listen` is the default HTTP reverse proxy listener.
 - `certificate_dir` controls where uploaded certificates are stored. The default is `/etc/rustproxy/cert.d`.
-- `match_sets` defines reusable condition trees.
+- `match_sets` defines reusable header/cookie/JWT condition trees.
 - A rule with `match_set` uses that match set at runtime. A rule without `match_set` uses its inline `conditions`.
 - Requests are matched only against rules on the current listener.
-- Higher `priority` matches first.
+- Host is matched before rule conditions. Host priority is `exact > wildcard > any`.
+- Location is matched after host. Location priority is `exact > longest prefix > regex`.
+- Higher `priority` matches first only inside the selected listener + host + location group.
 - Equal priorities preserve creation order.
-- Fallback rules are evaluated after all normal rules miss.
+- Fallback rules are evaluated after all normal rules miss in the same listener + host + location group.
 - HTTP and HTTPS listeners cannot share the same port yet.
 
 ### CLI
@@ -379,7 +388,7 @@ rustproxy config upstream delete api
 
 # Rules
 rustproxy config rule list
-rustproxy config rule add rule-api --name "API" --upstream api --priority 100 --listen 0.0.0.0:80 --condition-type path --operator prefix --value /api
+rustproxy config rule add rule-api --name "API" --upstream api --priority 100 --listen 0.0.0.0:80 --host-type exact --host api.example.com --location-type prefix --location /api --condition-type header --key x-tenant --operator exact --value a
 rustproxy config rule delete rule-api
 
 # Import / export
@@ -420,4 +429,3 @@ Useful metric groups include:
 - active connection gauges
 - config reload counters
 - process memory, CPU time, and file descriptor gauges
-

@@ -38,5 +38,6 @@ rand = "0.8"
 rpassword = "7"
 tempfile = "3"
 tokio-rustls = "0.26"
+arc-swap = "1"
 
 [dev-dependencies]

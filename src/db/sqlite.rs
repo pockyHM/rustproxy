@@ -6,8 +6,8 @@ use rusqlite::{params, Connection};
 
 use crate::config::yaml::{AppConfig, Certificate, Fallback, TlsListener};
 use crate::models::{
-    ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, MatchSet, Operator, Rule, RuleTls,
-    Target, Upstream,
+    ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType, HostMatcher,
+    LocationMatchType, LocationMatcher, MatchSet, Operator, Rule, RuleTls, Target, Upstream,
 };
 
 pub struct Database {
@@ -377,7 +377,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
 
 fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set FROM rules ORDER BY priority DESC, rowid ASC"
+        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value FROM rules ORDER BY priority DESC, rowid ASC"
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -391,12 +391,24 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
         let tls_certificate: Option<String> = row.get(8)?;
         let is_fallback: bool = row.get::<_, i64>(9)? != 0;
         let match_set: Option<String> = row.get(10)?;
+        let host_type: Option<String> = row.get(11)?;
+        let host_value: Option<String> = row.get(12)?;
+        let location_type: Option<String> = row.get(13)?;
+        let location_value: Option<String> = row.get(14)?;
         let conditions =
             expr_json.and_then(|json| serde_json::from_str::<ConditionExpr>(&json).ok());
         Ok(Rule {
             id,
             name,
             priority,
+            host: HostMatcher {
+                match_type: parse_host_match_type(host_type.as_deref()),
+                value: host_value,
+            },
+            location: LocationMatcher {
+                match_type: parse_location_match_type(location_type.as_deref()),
+                value: location_value.unwrap_or_else(|| "/".to_string()),
+            },
             match_set,
             conditions,
             upstream,
@@ -426,8 +438,8 @@ fn insert_rule(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
     let tls_enabled = rule.tls.as_ref().is_some_and(|tls| tls.enabled);
     let tls_certificate = rule.tls.as_ref().map(|tls| tls.certificate.as_str());
     tx.execute(
-        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set],
+        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value],
     )?;
     Ok(())
 }
@@ -619,13 +631,45 @@ fn update_rule_row(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
     let tls_enabled = rule.tls.as_ref().is_some_and(|tls| tls.enabled);
     let tls_certificate = rule.tls.as_ref().map(|tls| tls.certificate.as_str());
     let changes = tx.execute(
-        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10 WHERE id = ?11",
-        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, rule.id],
+        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14 WHERE id = ?15",
+        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.id],
     )?;
     if changes == 0 {
         anyhow::bail!("rule '{}' not found", rule.id);
     }
     Ok(())
+}
+
+fn parse_host_match_type(value: Option<&str>) -> HostMatchType {
+    match value.unwrap_or("any") {
+        "exact" => HostMatchType::Exact,
+        "wildcard" => HostMatchType::Wildcard,
+        _ => HostMatchType::Any,
+    }
+}
+
+fn host_match_type_str(value: &HostMatchType) -> &'static str {
+    match value {
+        HostMatchType::Any => "any",
+        HostMatchType::Exact => "exact",
+        HostMatchType::Wildcard => "wildcard",
+    }
+}
+
+fn parse_location_match_type(value: Option<&str>) -> LocationMatchType {
+    match value.unwrap_or("prefix") {
+        "exact" => LocationMatchType::Exact,
+        "regex" => LocationMatchType::Regex,
+        _ => LocationMatchType::Prefix,
+    }
+}
+
+fn location_match_type_str(value: &LocationMatchType) -> &'static str {
+    match value {
+        LocationMatchType::Exact => "exact",
+        LocationMatchType::Prefix => "prefix",
+        LocationMatchType::Regex => "regex",
+    }
 }
 
 fn delete_upstream_targets(tx: &rusqlite::Transaction, upstream_name: &str) -> Result<()> {
@@ -701,6 +745,10 @@ CREATE TABLE IF NOT EXISTS rules (
     tls_certificate TEXT,
     is_fallback     INTEGER NOT NULL DEFAULT 0,
     match_set       TEXT,
+    host_type       TEXT NOT NULL DEFAULT 'any',
+    host_value      TEXT,
+    location_type   TEXT NOT NULL DEFAULT 'prefix',
+    location_value  TEXT NOT NULL DEFAULT '/',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -755,6 +803,15 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "rules", "tls_certificate", "TEXT")?;
     add_column_if_missing(conn, "rules", "is_fallback", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "rules", "match_set", "TEXT")?;
+    add_column_if_missing(conn, "rules", "host_type", "TEXT NOT NULL DEFAULT 'any'")?;
+    add_column_if_missing(conn, "rules", "host_value", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "rules",
+        "location_type",
+        "TEXT NOT NULL DEFAULT 'prefix'",
+    )?;
+    add_column_if_missing(conn, "rules", "location_value", "TEXT NOT NULL DEFAULT '/'")?;
 
     add_column_if_missing(conn, "upstreams", "skip_ssl", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "upstreams", "websocket", "INTEGER NOT NULL DEFAULT 0")?;
@@ -907,6 +964,8 @@ mod tests {
                 id: "rule-1".to_string(),
                 name: "Test Rule".to_string(),
                 priority: 10,
+                host: Default::default(),
+                location: Default::default(),
                 match_set: None,
                 conditions: Some(ConditionExpr::And {
                     children: vec![
@@ -1018,6 +1077,8 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Updated".to_string(),
             priority: 20,
+            host: Default::default(),
+            location: Default::default(),
             match_set: None,
             conditions: Some(ConditionExpr::Leaf {
                 condition_type: ConditionType::Cookie,

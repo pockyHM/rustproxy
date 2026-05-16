@@ -5,7 +5,9 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::models::rule::{ConditionExpr, ConditionType, MatchSet, Operator, Rule};
+use crate::models::rule::{
+    ConditionExpr, ConditionType, HostMatchType, LocationMatchType, MatchSet, Operator, Rule,
+};
 
 pub struct Matcher {
     rules: Vec<CompiledRule>,
@@ -22,6 +24,20 @@ enum JwtValidation {
 struct CompiledRule {
     rule: Rule,
     conditions: Option<CompiledExpr>,
+    host: CompiledHost,
+    location: CompiledLocation,
+    order: usize,
+}
+
+struct CompiledHost {
+    match_type: HostMatchType,
+    value: Option<String>,
+}
+
+struct CompiledLocation {
+    match_type: LocationMatchType,
+    value: String,
+    regex: Option<Regex>,
 }
 
 enum CompiledExpr {
@@ -46,9 +62,15 @@ struct EvalContext<'a> {
 
 #[derive(Default)]
 struct RuleBucket {
-    general: Vec<usize>,
-    host_exact: HashMap<String, Vec<usize>>,
-    fallback: Vec<usize>,
+    rules: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct RouteKey {
+    host_rank: u8,
+    host_specificity: usize,
+    location_rank: u8,
+    location_specificity: usize,
 }
 
 impl Matcher {
@@ -92,14 +114,23 @@ impl Matcher {
         rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         let rules: Vec<_> = rules
             .into_iter()
-            .map(|rule| {
+            .enumerate()
+            .map(|(order, rule)| {
                 let conditions = rule
                     .match_set
                     .as_ref()
                     .and_then(|name| match_set_map.get(name))
                     .or(rule.conditions.as_ref())
                     .map(CompiledExpr::from_expr);
-                CompiledRule { rule, conditions }
+                let host = CompiledHost::from_rule(&rule);
+                let location = CompiledLocation::from_rule(&rule);
+                CompiledRule {
+                    rule,
+                    conditions,
+                    host,
+                    location,
+                    order,
+                }
             })
             .collect();
         let (default_rules, listen_rules) = Self::build_index(&rules);
@@ -125,7 +156,7 @@ impl Matcher {
             .headers()
             .get("Host")
             .and_then(|value| value.to_str().ok())
-            .map(|host| host.to_ascii_lowercase());
+            .map(normalize_host);
 
         bucket
             .first_matching(&self.rules, &self.jwt_validation, request, host.as_deref())
@@ -141,7 +172,7 @@ impl Matcher {
                 Some(listen) => listen_rules.entry(listen.to_string()).or_default(),
                 None => &mut default_rules,
             };
-            bucket.insert(idx, compiled.rule.is_fallback, compiled.exact_host());
+            bucket.insert(idx);
         }
 
         (default_rules, listen_rules)
@@ -253,26 +284,9 @@ impl Matcher {
     }
 }
 
-impl CompiledRule {
-    fn exact_host(&self) -> Option<&str> {
-        self.conditions.as_ref().and_then(CompiledExpr::exact_host)
-    }
-}
-
 impl RuleBucket {
-    fn insert(&mut self, idx: usize, is_fallback: bool, exact_host: Option<&str>) {
-        if is_fallback {
-            self.fallback.push(idx);
-            return;
-        }
-        match exact_host {
-            Some(host) => self
-                .host_exact
-                .entry(host.to_ascii_lowercase())
-                .or_default()
-                .push(idx),
-            None => self.general.push(idx),
-        }
+    fn insert(&mut self, idx: usize) {
+        self.rules.push(idx);
     }
 
     fn first_matching<'a>(
@@ -282,45 +296,116 @@ impl RuleBucket {
         request: &Request<()>,
         host: Option<&str>,
     ) -> Option<&'a CompiledRule> {
-        let host_rules = host.and_then(|host| self.host_exact.get(host));
-        let mut general_idx = 0;
-        let mut host_idx = 0;
+        let path = request.uri().path();
+        let mut best_key: Option<RouteKey> = None;
+        let mut candidates = Vec::new();
 
-        loop {
-            let general_rule_idx = self.general.get(general_idx).copied();
-            let host_rule_idx = host_rules.and_then(|rules| rules.get(host_idx).copied());
-
-            let next_rule_idx = match (general_rule_idx, host_rule_idx) {
-                (Some(general_rule_idx), Some(host_rule_idx)) => {
-                    if general_rule_idx < host_rule_idx {
-                        general_idx += 1;
-                        general_rule_idx
-                    } else {
-                        host_idx += 1;
-                        host_rule_idx
-                    }
-                }
-                (Some(general_rule_idx), None) => {
-                    general_idx += 1;
-                    general_rule_idx
-                }
-                (None, Some(host_rule_idx)) => {
-                    host_idx += 1;
-                    host_rule_idx
-                }
-                (None, None) => break,
+        for idx in &self.rules {
+            let Some(compiled) = rules.get(*idx) else {
+                continue;
             };
-
-            let compiled = &rules[next_rule_idx];
-            if Matcher::rule_matches(compiled, jwt_validation, request) {
-                return Some(compiled);
+            let Some(host_match) = compiled.host.matches(host) else {
+                continue;
+            };
+            let Some(location_match) = compiled.location.matches(path) else {
+                continue;
+            };
+            let key = RouteKey {
+                host_rank: host_match.0,
+                host_specificity: host_match.1,
+                location_rank: location_match.0,
+                location_specificity: location_match.1,
+            };
+            match best_key {
+                Some(best) if key < best => continue,
+                Some(best) if key > best => {
+                    best_key = Some(key);
+                    candidates.clear();
+                    candidates.push(*idx);
+                }
+                Some(_) => candidates.push(*idx),
+                None => {
+                    best_key = Some(key);
+                    candidates.push(*idx);
+                }
             }
         }
 
-        self.fallback
+        candidates
             .iter()
             .filter_map(|idx| rules.get(*idx))
-            .find(|compiled| Matcher::rule_matches(compiled, jwt_validation, request))
+            .filter(|compiled| !compiled.rule.is_fallback)
+            .filter(|compiled| Matcher::rule_matches(compiled, jwt_validation, request))
+            .min_by_key(|compiled| (std::cmp::Reverse(compiled.rule.priority), compiled.order))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter_map(|idx| rules.get(*idx))
+                    .filter(|compiled| compiled.rule.is_fallback)
+                    .filter(|compiled| Matcher::rule_matches(compiled, jwt_validation, request))
+                    .min_by_key(|compiled| compiled.order)
+            })
+    }
+}
+
+impl CompiledHost {
+    fn from_rule(rule: &Rule) -> Self {
+        Self {
+            match_type: rule.host.match_type.clone(),
+            value: rule.host.value.as_ref().map(|value| normalize_host(value)),
+        }
+    }
+
+    fn matches(&self, request_host: Option<&str>) -> Option<(u8, usize)> {
+        match self.match_type {
+            HostMatchType::Any => Some((1, 0)),
+            HostMatchType::Exact => {
+                let expected = self.value.as_deref()?;
+                let actual = request_host?;
+                (actual == expected).then_some((3, expected.len()))
+            }
+            HostMatchType::Wildcard => {
+                let pattern = self.value.as_deref()?;
+                let suffix = pattern.strip_prefix("*.")?;
+                let actual = request_host?;
+                let suffix_match = actual != suffix
+                    && actual
+                        .strip_suffix(suffix)
+                        .is_some_and(|prefix| prefix.ends_with('.'));
+                suffix_match.then_some((2, suffix.len()))
+            }
+        }
+    }
+}
+
+impl CompiledLocation {
+    fn from_rule(rule: &Rule) -> Self {
+        let regex = if rule.location.match_type == LocationMatchType::Regex {
+            Regex::new(&rule.location.value).ok()
+        } else {
+            None
+        };
+        Self {
+            match_type: rule.location.match_type.clone(),
+            value: rule.location.value.clone(),
+            regex,
+        }
+    }
+
+    fn matches(&self, request_path: &str) -> Option<(u8, usize)> {
+        match self.match_type {
+            LocationMatchType::Exact => {
+                (request_path == self.value).then_some((3, self.value.len()))
+            }
+            LocationMatchType::Prefix => {
+                path_prefix_matches(request_path, &self.value).then_some((2, self.value.len()))
+            }
+            LocationMatchType::Regex => self
+                .regex
+                .as_ref()
+                .is_some_and(|regex| regex.is_match(request_path))
+                .then_some((1, 0)),
+        }
     }
 }
 
@@ -346,20 +431,6 @@ impl CompiledExpr {
                 key.clone(),
                 claim_path.clone(),
             )),
-        }
-    }
-
-    fn exact_host(&self) -> Option<&str> {
-        match self {
-            CompiledExpr::And { children } => children.iter().find_map(Self::exact_host),
-            CompiledExpr::Or { .. } => None,
-            CompiledExpr::Leaf(leaf) => {
-                if leaf.condition_type == ConditionType::Host && leaf.operator == Operator::Exact {
-                    leaf.value.as_deref()
-                } else {
-                    None
-                }
-            }
         }
     }
 }
@@ -482,6 +553,34 @@ fn match_text(
     }
 }
 
+fn normalize_host(host: &str) -> String {
+    host.split(':')
+        .next()
+        .unwrap_or(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    let prefix = normalize_location_prefix(prefix);
+    if prefix == "/" {
+        return true;
+    }
+    path == prefix.as_str()
+        || path
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn normalize_location_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    if trimmed == "/" {
+        return "/".to_string();
+    }
+    trimmed.trim_end_matches('/').to_string()
+}
+
 fn starts_with_ignore_ascii_case(actual: &str, expected: &str) -> bool {
     actual
         .get(..expected.len())
@@ -567,7 +666,10 @@ fn value_to_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::Matcher;
-    use crate::models::rule::{ConditionExpr, ConditionType, MatchSet, Operator, Rule};
+    use crate::models::rule::{
+        ConditionExpr, ConditionType, HostMatchType, HostMatcher, LocationMatchType,
+        LocationMatcher, MatchSet, Operator, Rule,
+    };
     use http::{HeaderMap, HeaderValue, Request};
 
     fn create_request_with_headers(headers: &[(&str, &str)]) -> Request<()> {
@@ -585,6 +687,8 @@ mod tests {
             id: "test-rule".to_string(),
             name: "Test Rule".to_string(),
             priority,
+            host: Default::default(),
+            location: Default::default(),
             match_set: None,
             conditions,
             upstream: "backend-1".to_string(),
@@ -635,6 +739,22 @@ mod tests {
 
     fn leaf(expr: ConditionExpr) -> Option<ConditionExpr> {
         Some(expr)
+    }
+
+    fn with_prefix_location(mut rule: Rule, location: &str) -> Rule {
+        rule.location = LocationMatcher {
+            match_type: LocationMatchType::Prefix,
+            value: location.to_string(),
+        };
+        rule
+    }
+
+    fn with_exact_host(mut rule: Rule, host: &str) -> Rule {
+        rule.host = HostMatcher {
+            match_type: HostMatchType::Exact,
+            value: Some(host.to_string()),
+        };
+        rule
     }
 
     // Helper to create a test JWT (header.payload.signature with base64url encoding)
@@ -698,6 +818,68 @@ mod tests {
         let request = create_request_with_headers(&[]);
         let result = matcher.match_request(&request, None).unwrap();
         assert_eq!(result.id, "first");
+    }
+
+    #[test]
+    fn test_longest_prefix_location_wins_before_priority() {
+        let mut api = with_prefix_location(create_rule(100, None), "/api");
+        api.id = "api".to_string();
+        let mut api_v1 = with_prefix_location(create_rule(10, None), "/api/v1");
+        api_v1.id = "api-v1".to_string();
+        let matcher = Matcher::new(vec![api, api_v1]);
+        let request = Request::builder().uri("/api/v1/test").body(()).unwrap();
+
+        let result = matcher.match_request(&request, None).unwrap();
+        assert_eq!(result.id, "api-v1");
+    }
+
+    #[test]
+    fn test_prefix_location_accepts_trailing_slash_in_config() {
+        let mut api = with_prefix_location(create_rule(10, None), "/api/");
+        api.id = "api".to_string();
+        let matcher = Matcher::new(vec![api]);
+
+        let child = Request::builder().uri("/api/v1/test").body(()).unwrap();
+        let exact = Request::builder().uri("/api").body(()).unwrap();
+        let sibling = Request::builder().uri("/apix").body(()).unwrap();
+
+        assert!(matcher.match_request(&child, None).is_some());
+        assert!(matcher.match_request(&exact, None).is_some());
+        assert!(matcher.match_request(&sibling, None).is_none());
+    }
+
+    #[test]
+    fn test_selected_location_does_not_fall_back_to_parent_location() {
+        let mut api = with_prefix_location(create_rule(100, None), "/api");
+        api.id = "api".to_string();
+        api.is_fallback = true;
+
+        let mut api_v1 = with_prefix_location(
+            create_rule(
+                10,
+                leaf(create_header_leaf("x-tenant", Operator::Exact, Some("a"))),
+            ),
+            "/api/v1",
+        );
+        api_v1.id = "api-v1".to_string();
+
+        let matcher = Matcher::new(vec![api, api_v1]);
+        let request = Request::builder().uri("/api/v1/test").body(()).unwrap();
+
+        assert!(matcher.match_request(&request, None).is_none());
+    }
+
+    #[test]
+    fn test_exact_host_wins_over_any_host_before_priority() {
+        let mut any_host = create_rule(100, None);
+        any_host.id = "any".to_string();
+        let mut exact_host = with_exact_host(create_rule(10, None), "api.example.com");
+        exact_host.id = "exact".to_string();
+        let matcher = Matcher::new(vec![any_host, exact_host]);
+        let request = create_request_with_headers(&[("Host", "api.example.com")]);
+
+        let result = matcher.match_request(&request, None).unwrap();
+        assert_eq!(result.id, "exact");
     }
 
     #[test]

@@ -6,7 +6,6 @@ use std::{
 
 use axum::body::Body;
 use http::{Method, Request, Uri};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use tokio::net::TcpStream;
 
 use crate::models::{HealthCheck, HealthCheckMode, Upstream};
@@ -87,7 +86,11 @@ impl HealthRegistry {
     }
 }
 
-pub async fn run_health_checks(registry: HealthRegistry, config_rx: ConfigSnapshot) {
+pub async fn run_health_checks(
+    registry: HealthRegistry,
+    config_rx: ConfigSnapshot,
+    clients: Arc<super::ProxyClients>,
+) {
     let mut last_checked = HashMap::<String, Instant>::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
@@ -109,7 +112,8 @@ pub async fn run_health_checks(registry: HealthRegistry, config_rx: ConfigSnapsh
             }
 
             last_checked.insert(probe.key.clone(), now);
-            handles.push(tokio::spawn(run_probe(probe)));
+            let clients = clients.clone();
+            handles.push(tokio::spawn(run_probe(probe, clients)));
         }
 
         for handle in handles {
@@ -178,11 +182,11 @@ impl Clone for ConfigSnapshot {
     }
 }
 
-async fn run_probe(probe: HealthProbe) -> (HealthProbe, bool) {
+async fn run_probe(probe: HealthProbe, clients: Arc<super::ProxyClients>) -> (HealthProbe, bool) {
     let timeout = Duration::from_secs(probe.check.timeout_seconds.max(1));
     let passed = match probe.check.mode {
         HealthCheckMode::Tcp => check_tcp(&probe.target_url, timeout).await,
-        HealthCheckMode::Http => check_http(&probe, timeout).await,
+        HealthCheckMode::Http => check_http(&probe, timeout, &clients).await,
     };
     (probe, passed)
 }
@@ -198,7 +202,7 @@ async fn check_tcp(target_url: &str, timeout: Duration) -> bool {
     )
 }
 
-async fn check_http(probe: &HealthProbe, timeout: Duration) -> bool {
+async fn check_http(probe: &HealthProbe, timeout: Duration, clients: &super::ProxyClients) -> bool {
     let Some(uri) = health_uri(&probe.target_url, &probe.check.path) else {
         return false;
     };
@@ -212,75 +216,14 @@ async fn check_http(probe: &HealthProbe, timeout: Duration) -> bool {
         Err(_) => return false,
     };
 
-    let result = if uri
+    let is_https = uri
         .scheme_str()
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
-    {
-        send_https_health_request(request, timeout, probe.skip_ssl).await
-    } else {
-        send_http_health_request(request, timeout).await
-    };
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
 
+    let result = clients
+        .health_check_request(request, is_https, probe.skip_ssl, timeout)
+        .await;
     result.is_some_and(|status| status.as_u16() == probe.check.expected_status)
-}
-
-async fn send_http_health_request(
-    request: Request<Body>,
-    timeout: Duration,
-) -> Option<http::StatusCode> {
-    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-    connector.set_connect_timeout(Some(timeout));
-    let client: Client<_, Body> = Client::builder(TokioExecutor::new()).build(connector);
-    tokio::time::timeout(timeout, client.request(request))
-        .await
-        .ok()?
-        .ok()
-        .map(|response| response.status())
-}
-
-async fn send_https_health_request(
-    request: Request<Body>,
-    timeout: Duration,
-    skip_ssl: bool,
-) -> Option<http::StatusCode> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let tls_config = if skip_ssl {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(super::NoCertificateVerification))
-            .with_no_client_auth()
-    } else {
-        let mut root_certs = rustls::RootCertStore::empty();
-        let native_certs = rustls_native_certs::load_native_certs();
-        for error in native_certs.errors {
-            tracing::warn!(%error, "failed to load a native certificate for health check");
-        }
-        if native_certs.certs.is_empty() {
-            return None;
-        }
-        for cert in native_certs.certs {
-            root_certs.add(cert).ok();
-        }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_certs)
-            .with_no_client_auth()
-    };
-
-    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
-    http_connector.set_connect_timeout(Some(timeout));
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_only()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(http_connector);
-    let client: Client<_, Body> = Client::builder(TokioExecutor::new()).build(https);
-
-    tokio::time::timeout(timeout, client.request(request))
-        .await
-        .ok()?
-        .ok()
-        .map(|response| response.status())
 }
 
 fn health_uri(target_url: &str, path: &str) -> Option<Uri> {

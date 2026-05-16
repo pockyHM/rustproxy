@@ -28,7 +28,11 @@ type Upstream = {
 type Certificate = { name: string; cert: string; key: string };
 type TlsListener = { enabled: boolean; listen: string; certificate: string };
 type RuleTls = { enabled: boolean; certificate: string };
-type ConditionType = 'host' | 'path' | 'header' | 'cookie' | 'jwt';
+type HostMatchType = 'any' | 'exact' | 'wildcard';
+type LocationMatchType = 'exact' | 'prefix' | 'regex';
+type HostMatcher = { type: HostMatchType; value?: string | null };
+type LocationMatcher = { type: LocationMatchType; value: string };
+type ConditionType = 'header' | 'cookie' | 'jwt';
 type Operator = 'exact' | 'prefix' | 'regex' | 'exists' | 'contains';
 type ConditionExpr =
   | { type: 'leaf'; conditionType: ConditionType; key?: string | null; claimPath?: string | null; operator: Operator; value?: string | null }
@@ -39,6 +43,8 @@ type Rule = {
   id: string;
   name: string;
   priority: number;
+  host: HostMatcher;
+  location: LocationMatcher;
   match_set?: string | null;
   conditions?: ConditionExpr | null;
   upstream: string;
@@ -182,6 +188,8 @@ const T: Record<string, [string, string]> = {
   'table.name': ['Name', '名称'],
   'table.priority': ['Priority', '优先级'],
   'table.listen': ['Listen', '监听地址'],
+  'table.host': ['Host', '域名'],
+  'table.location': ['Location', '路径'],
   'table.pool': ['Upstream Pool', '上游池'],
   'table.weight': ['Weight', '权重'],
   'table.match': ['Match', '匹配'],
@@ -209,6 +217,8 @@ const T: Record<string, [string, string]> = {
   'form.condition': ['Condition', '匹配条件'],
   'form.identity': ['Identity', '基础信息'],
   'form.routing': ['Routing target', '路由目标'],
+  'form.entryHost': ['Entry and host', '入口与域名'],
+  'form.location': ['Location', '路径规则'],
   'form.matching': ['Match condition', '匹配条件'],
   'form.matchSource': ['Match source', '匹配来源'],
   'form.inlineMatch': ['Inline condition', '规则内新建匹配'],
@@ -221,11 +231,19 @@ const T: Record<string, [string, string]> = {
   'form.addCondition': ['Add condition', '添加条件'],
   'form.addGroup': ['Add group', '添加条件组'],
   'form.type': ['Type', '类型'],
-  'form.type.host': ['Match request host', '匹配请求 Host'],
-  'form.type.path': ['Match request path', '匹配请求路径'],
   'form.type.header': ['Match request header', '匹配请求头'],
   'form.type.cookie': ['Match cookie value', '匹配 Cookie 值'],
   'form.type.jwt': ['Match JWT claim', '匹配 JWT Claim'],
+  'form.hostType': ['Host type', '域名类型'],
+  'form.hostValue': ['Host value', '域名值'],
+  'form.host.any': ['Any host', '任意域名'],
+  'form.host.exact': ['Exact host', '精确域名'],
+  'form.host.wildcard': ['Wildcard host', '通配域名'],
+  'form.locationType': ['Location type', '路径类型'],
+  'form.locationValue': ['Location value', '路径值'],
+  'form.location.exact': ['Exact', '精确'],
+  'form.location.prefix': ['Prefix', '前缀'],
+  'form.location.regex': ['Regex', '正则'],
   'form.key': ['Key', '键'],
   'form.operator': ['Operator', '操作符'],
   'form.value': ['Value', '值'],
@@ -634,7 +652,7 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
       }[];
     }>();
     [...config.rules]
-      .sort((a, b) => Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority)
+      .sort((a, b) => summarizeHost(a.host).localeCompare(summarizeHost(b.host)) || summarizeLocation(a.location).localeCompare(summarizeLocation(b.location)) || Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority)
       .forEach((rule) => {
         const entry = `${rule.tls?.enabled ? 'https' : 'http'}://${rule.listen || defaultListen}`;
         if (!grouped.has(entry)) {
@@ -705,6 +723,16 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
                         <div className="flow-priority">
                           <span>{rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
                           {rule.is_fallback && <Icon name="shield" size={15} />}
+                        </div>
+                        <Icon name="arrow_forward" size={16} />
+                        <div className="flow-node flow-host">
+                          <span className="flow-node-label">{t('table.host')}</span>
+                          <strong>{summarizeHost(rule.host, t)}</strong>
+                        </div>
+                        <Icon name="arrow_forward" size={16} />
+                        <div className="flow-node flow-location">
+                          <span className="flow-node-label">{t('table.location')}</span>
+                          <strong>{summarizeLocation(rule.location)}</strong>
                         </div>
                         <Icon name="arrow_forward" size={16} />
                         <div className="flow-node flow-rule-name">
@@ -839,16 +867,18 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
   const protocolConflict = listenerProtocolConflict(config, draft, editing);
 
   function openCreate() { setEditing(null); setDraft(newRule(upstreamNames[0], defaultListen)); setShowModal(true); }
-  function openEdit(rule: Rule) { setEditing(rule.id); setDraft({ ...rule, listen: rule.listen || defaultListen, conditions: rule.match_set ? null : normalizeCondition(rule.conditions) }); setShowModal(true); }
+  function openEdit(rule: Rule) { setEditing(rule.id); setDraft({ ...rule, host: normalizeHostMatcher(rule.host), location: normalizeLocationMatcher(rule.location), listen: rule.listen || defaultListen, conditions: rule.match_set ? null : normalizeCondition(rule.conditions) }); setShowModal(true); }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     const body = {
       ...draft,
+      host: normalizeHostMatcher(draft.host),
+      location: normalizeLocationMatcher(draft.location),
       match_set: draft.is_fallback ? null : draft.match_set || null,
       conditions: draft.is_fallback || draft.match_set ? null : normalizeCondition(draft.conditions),
       priority: draft.is_fallback ? 0 : draft.priority,
-      weight: draft.is_fallback ? 100 : draft.weight,
+      weight: 100,
       listen: draft.listen || defaultListen,
       tls: draft.is_fallback ? null : draft.tls?.enabled ? { enabled: true, certificate: draft.tls.certificate } : null,
     };
@@ -878,19 +908,21 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
         <table><thead><tr>
           <th style={{ width: 70 }}>{t('table.id')}</th><th style={{ width: 130 }}>{t('table.name')}</th>
           <th style={{ width: 80 }}>{t('table.priority')}</th><th style={{ width: 90 }}>{t('table.listen')}</th>
-          <th style={{ width: 130 }}>{t('table.pool')}</th><th style={{ width: 70 }}>{t('table.weight')}</th>
+          <th style={{ width: 130 }}>{t('table.host')}</th><th style={{ width: 130 }}>{t('table.location')}</th>
+          <th style={{ width: 130 }}>{t('table.pool')}</th>
           <th>{t('table.match')}</th><th style={{ width: 80 }}>{t('table.actions')}</th>
         </tr></thead><tbody>
           {sorted.length === 0 ? (
-            <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 40 }}>{t('table.noRules')}</td></tr>
+            <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 40 }}>{t('table.noRules')}</td></tr>
           ) : sorted.map((rule) => (
             <tr key={rule.id}>
               <td className="td-mono">{rule.id}</td>
               <td style={{ fontWeight: 500 }}>{rule.name || rule.id}</td>
               <td className="td-mono">{rule.priority}</td>
               <td className="td-mono">{rule.is_fallback ? `${t('rule.fallback')} · ${rule.listen || defaultListen}` : `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen || defaultListen}`}</td>
+              <td className="td-mono">{summarizeHost(rule.host, t)}</td>
+              <td className="td-mono">{summarizeLocation(rule.location)}</td>
               <td><span className="td-badge">{rule.upstream}</span></td>
-              <td className="td-mono">{rule.weight}</td>
               <td className="td-mono">{rule.is_fallback ? t('rule.enableFallback') : summarizeRuleMatch(rule)}</td>
               <td className="td-actions">
                 <button className="btn btn-ghost btn-sm" onClick={() => openEdit(rule)}>{t('action.edit')}</button>
@@ -926,13 +958,28 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               </label>
               {draft.is_fallback && <p className="card-desc">{t('rule.fallbackHelp')}</p>}
             </section>
+            <section className="form-section">
+              <h3 className="form-section-title">{t('form.entryHost')}</h3>
+              <div className="form-grid-3">
+                <Field label={t('table.listen')}><input placeholder={config.proxy_listen || '0.0.0.0:80'} value={draft.listen ?? ''} onChange={(e) => setDraft({ ...draft, listen: e.target.value })} /></Field>
+                <Field label={t('form.hostType')}>
+                  <Dropdown value={draft.host.type} options={hostTypeOptions(t)} onChange={(type) => setDraft({ ...draft, host: { type: type as HostMatchType, value: type === 'any' ? null : draft.host.value || '' } })} />
+                </Field>
+                {draft.host.type !== 'any' && <Field label={t('form.hostValue')}><input placeholder={draft.host.type === 'wildcard' ? '*.example.com' : 'api.example.com'} value={draft.host.value ?? ''} onChange={(e) => setDraft({ ...draft, host: { ...draft.host, value: e.target.value } })} required /></Field>}
+              </div>
+            </section>
+            <section className="form-section">
+              <h3 className="form-section-title">{t('form.location')}</h3>
+              <div className="form-grid">
+                <Field label={t('form.locationType')}>
+                  <Dropdown value={draft.location.type} options={locationTypeOptions(t)} onChange={(type) => setDraft({ ...draft, location: { type: type as LocationMatchType, value: draft.location.value || '/' } })} />
+                </Field>
+                <Field label={t('form.locationValue')}><input placeholder={draft.location.type === 'regex' ? '^/api/v[0-9]+/' : '/api'} value={draft.location.value} onChange={(e) => setDraft({ ...draft, location: { ...draft.location, value: e.target.value } })} required /></Field>
+              </div>
+            </section>
             {!draft.is_fallback && <section className="form-section">
               <h3 className="form-section-title">{t('form.routing')}</h3>
-              <div className="form-grid-3">
-                <Field label={t('table.priority')}><input type="number" value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: Number(e.target.value) })} /></Field>
-                <Field label={t('table.listen')}><input placeholder={config.proxy_listen || '0.0.0.0:80'} value={draft.listen ?? ''} onChange={(e) => setDraft({ ...draft, listen: e.target.value })} /></Field>
-                <Field label={t('table.weight')}><input type="number" min="0" max="100" value={draft.weight} onChange={(e) => setDraft({ ...draft, weight: Number(e.target.value) })} /></Field>
-              </div>
+              <Field label={t('table.priority')}><input type="number" value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: Number(e.target.value) })} /></Field>
               <Field label={t('table.pool')}>
                 <Dropdown
                   value={draft.upstream}
@@ -1529,8 +1576,8 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions</span></div>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, name, priority, listen, tls.enabled, tls.certificate, match_set, conditions, upstream</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions(header/cookie/jwt)</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, host, location, priority, tls, match_set, conditions, upstream</span></div>
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.validation')}</h3>
@@ -1677,7 +1724,7 @@ function clampPercent(value: number): number {
 }
 
 function newRule(upstream = '', listen = '0.0.0.0:80'): Rule {
-  return { id: '', name: '', priority: 10, match_set: null, upstream, weight: 100, is_fallback: false, listen, conditions: createLeafCondition() };
+  return { id: '', name: '', priority: 10, host: { type: 'any', value: null }, location: { type: 'prefix', value: '/' }, match_set: null, upstream, weight: 100, is_fallback: false, listen, conditions: createLeafCondition() };
 }
 
 function newMatchSet(): MatchSet {
@@ -1751,11 +1798,19 @@ function replaceTarget(upstream: Upstream, index: number, target: Target): Upstr
 }
 
 function conditionTypeOptions(t: (key: string) => string): DropdownOption[] {
-  return (['path', 'header', 'host', 'cookie', 'jwt'] as const).map((value) => ({
+  return (['header', 'cookie', 'jwt'] as const).map((value) => ({
     value,
     label: value,
     description: t(`form.type.${value}`),
   }));
+}
+
+function hostTypeOptions(t: (key: string) => string): DropdownOption[] {
+  return (['any', 'exact', 'wildcard'] as const).map((value) => ({ value, label: t(`form.host.${value}`) }));
+}
+
+function locationTypeOptions(t: (key: string) => string): DropdownOption[] {
+  return (['prefix', 'exact', 'regex'] as const).map((value) => ({ value, label: t(`form.location.${value}`) }));
 }
 
 function operatorOptions(): DropdownOption[] {
@@ -1782,7 +1837,7 @@ function clampInt(value: string, min: number, max: number, fallback: number): nu
 }
 
 function createLeafCondition(): Extract<ConditionExpr, { type: 'leaf' }> {
-  return { type: 'leaf', conditionType: 'host', key: null, claimPath: null, operator: 'exact', value: '' };
+  return { type: 'leaf', conditionType: 'header', key: '', claimPath: null, operator: 'exact', value: '' };
 }
 
 function normalizeLeafForType(leaf: Extract<ConditionExpr, { type: 'leaf' }>): Extract<ConditionExpr, { type: 'leaf' }> {
@@ -1804,6 +1859,18 @@ function normalizeConditionExpr(condition: ConditionExpr): ConditionExpr {
 
 function normalizeCondition(condition?: ConditionExpr | null): ConditionExpr | null {
   return condition ? normalizeConditionExpr(condition) : null;
+}
+
+function normalizeHostMatcher(host?: HostMatcher | null): HostMatcher {
+  const type = host?.type === 'exact' || host?.type === 'wildcard' ? host.type : 'any';
+  return type === 'any' ? { type, value: null } : { type, value: host?.value?.trim() || '' };
+}
+
+function normalizeLocationMatcher(location?: LocationMatcher | null): LocationMatcher {
+  const type = location?.type === 'exact' || location?.type === 'regex' ? location.type : 'prefix';
+  let value = location?.value?.trim() || '/';
+  if (type !== 'regex' && !value.startsWith('/')) value = `/${value}`;
+  return { type, value };
 }
 
 async function readCertificateFile(file: File): Promise<string> {
@@ -1831,6 +1898,17 @@ function summarizeCondition(condition?: ConditionExpr | null): string {
 function summarizeRuleMatch(rule: Rule): string {
   if (rule.match_set) return `@${rule.match_set}`;
   return summarizeCondition(rule.conditions);
+}
+
+function summarizeHost(host?: HostMatcher | null, t?: (key: string) => string): string {
+  const normalized = normalizeHostMatcher(host);
+  if (normalized.type === 'any') return t ? t('form.host.any') : '*';
+  return `${normalized.type}:${normalized.value || '-'}`;
+}
+
+function summarizeLocation(location?: LocationMatcher | null): string {
+  const normalized = normalizeLocationMatcher(location);
+  return `${normalized.type}:${normalized.value}`;
 }
 
 function resolveInitialView(): View {

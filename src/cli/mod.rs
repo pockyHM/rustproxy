@@ -158,7 +158,23 @@ pub enum RuleCommands {
         #[arg(long)]
         listen: Option<String>,
 
-        /// Condition type: host, path, header, cookie, jwt
+        /// Host match type: any, exact, wildcard
+        #[arg(long, default_value = "any")]
+        host_type: String,
+
+        /// Host value for exact/wildcard host matching
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Location match type: exact, prefix, regex
+        #[arg(long, default_value = "prefix")]
+        location_type: String,
+
+        /// Location value
+        #[arg(long, default_value = "/")]
+        location: String,
+
+        /// Condition type: header, cookie, jwt
         #[arg(long)]
         condition_type: Option<String>,
 

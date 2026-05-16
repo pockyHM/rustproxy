@@ -99,6 +99,8 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Test Rule".to_string(),
             priority: 10,
+            host: HostMatcher::default(),
+            location: LocationMatcher::default(),
             match_set: None,
             conditions: Some(ConditionExpr::And {
                 children: vec![ConditionExpr::Leaf {
@@ -167,6 +169,8 @@ mod tests {
             id: "rule-1".to_string(),
             name: "OR Rule".to_string(),
             priority: 10,
+            host: HostMatcher::default(),
+            location: LocationMatcher::default(),
             match_set: None,
             conditions: Some(ConditionExpr::Or {
                 children: vec![
@@ -206,6 +210,8 @@ mod tests {
             id: "rule-1".to_string(),
             name: "Test".to_string(),
             priority: 1,
+            host: HostMatcher::default(),
+            location: LocationMatcher::default(),
             match_set: None,
             conditions: None,
             upstream: "up".to_string(),
@@ -267,6 +273,8 @@ pub struct Rule {
     pub id: String,
     pub name: String,
     pub priority: i32,
+    pub host: HostMatcher,
+    pub location: LocationMatcher,
     pub match_set: Option<String>,
     pub conditions: Option<ConditionExpr>,
     pub upstream: String,
@@ -277,6 +285,54 @@ pub struct Rule {
     /// on that port through this rule's upstream. If None, uses the default port.
     pub listen: Option<String>,
     pub tls: Option<RuleTls>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostMatcher {
+    #[serde(rename = "type")]
+    pub match_type: HostMatchType,
+    pub value: Option<String>,
+}
+
+impl Default for HostMatcher {
+    fn default() -> Self {
+        Self {
+            match_type: HostMatchType::Any,
+            value: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostMatchType {
+    Any,
+    Exact,
+    Wildcard,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationMatcher {
+    #[serde(rename = "type")]
+    pub match_type: LocationMatchType,
+    pub value: String,
+}
+
+impl Default for LocationMatcher {
+    fn default() -> Self {
+        Self {
+            match_type: LocationMatchType::Prefix,
+            value: "/".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocationMatchType {
+    Exact,
+    Prefix,
+    Regex,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -333,10 +389,12 @@ impl Serialize for Rule {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Rule", 10)?;
+        let mut state = serializer.serialize_struct("Rule", 12)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("priority", &self.priority)?;
+        state.serialize_field("host", &self.host)?;
+        state.serialize_field("location", &self.location)?;
         state.serialize_field("match_set", &self.match_set)?;
         state.serialize_field("conditions", &self.conditions)?;
         state.serialize_field("upstream", &self.upstream)?;
@@ -360,6 +418,10 @@ impl<'de> Deserialize<'de> for Rule {
             name: String,
             priority: i32,
             #[serde(default)]
+            host: HostMatcher,
+            #[serde(default)]
+            location: LocationMatcher,
+            #[serde(default)]
             match_set: Option<String>,
             #[serde(default, deserialize_with = "deserialize_conditions")]
             conditions: Option<ConditionExpr>,
@@ -377,6 +439,8 @@ impl<'de> Deserialize<'de> for Rule {
             id: helper.id,
             name: helper.name,
             priority: helper.priority,
+            host: helper.host,
+            location: helper.location,
             match_set: helper.match_set,
             conditions: helper.conditions,
             upstream: helper.upstream,

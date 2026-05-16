@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{Extension, State},
@@ -22,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tower_http::trace::TraceLayer;
 
-use crate::models::{ConditionExpr, ConditionType, Operator, Rule};
+use crate::models::{ConditionExpr, ConditionType, HostMatchType, LocationMatchType, Rule};
 use crate::{
     auth::middleware::{self as auth_mw},
     config::yaml::AppConfig,
@@ -81,13 +82,13 @@ pub struct AppState {
     pub metrics: Arc<ProxyMetrics>,
     pub health: HealthRegistry,
     health_config: ConfigSnapshot,
-    /// Hot-path proxy runtime — read-locked per request, atomically swapped on config change.
-    proxy_runtime: Arc<RwLock<ProxyRuntime>>,
+    /// Hot-path proxy runtime — lock-free reads via ArcSwap, atomically swapped on config change.
+    proxy_runtime: Arc<ArcSwap<ProxyRuntime>>,
     listener_manager: Arc<ListenerManager>,
 }
 
 impl AppState {
-    pub(crate) async fn rebuild_proxy_runtime(&self, old: &AppConfig, new: &AppConfig) {
+    pub(crate) fn rebuild_proxy_runtime(&self, old: &AppConfig, new: &AppConfig) {
         let clients_changed = old.connect_timeout != new.connect_timeout
             || old.pool_max_idle_per_host != new.pool_max_idle_per_host
             || old.pool_idle_timeout != new.pool_idle_timeout
@@ -114,7 +115,7 @@ impl AppState {
             ))
         } else {
             // Reuse existing connection pool
-            self.proxy_runtime.read().await.clients.clone()
+            self.proxy_runtime.load().clients.clone()
         };
 
         let runtime = ProxyRuntime {
@@ -132,11 +133,7 @@ impl AppState {
         };
 
         self.health_config.update(&new.upstreams);
-
-        {
-            let mut guard = self.proxy_runtime.write().await;
-            *guard = runtime;
-        }
+        self.proxy_runtime.store(Arc::new(runtime));
     }
 
     pub(crate) async fn sync_proxy_listeners(&self, config: &AppConfig) -> anyhow::Result<()> {
@@ -371,6 +368,12 @@ fn validate_match_sets(config: &AppConfig) -> anyhow::Result<()> {
         if set.conditions.is_none() {
             anyhow::bail!("match set '{}' must define conditions", name);
         }
+        if contains_route_condition(set.conditions.as_ref()) {
+            anyhow::bail!(
+                "match set '{}' cannot contain host or path conditions; configure host and location on the route rule",
+                name
+            );
+        }
     }
     for rule in &config.rules {
         if let Some(name) = rule
@@ -382,8 +385,65 @@ fn validate_match_sets(config: &AppConfig) -> anyhow::Result<()> {
                 anyhow::bail!("rule '{}' references missing match set '{}'", rule.id, name);
             }
         }
+        validate_rule_route_dimensions(rule)?;
+        if contains_route_condition(rule.conditions.as_ref()) {
+            anyhow::bail!(
+                "rule '{}' cannot contain host or path conditions; configure host and location on the route rule",
+                rule.id
+            );
+        }
     }
     Ok(())
+}
+
+fn validate_rule_route_dimensions(rule: &Rule) -> anyhow::Result<()> {
+    match rule.host.match_type {
+        HostMatchType::Any => {}
+        HostMatchType::Exact => {
+            let value = rule.host.value.as_deref().unwrap_or("").trim();
+            if value.is_empty() {
+                anyhow::bail!("rule '{}' exact host requires a value", rule.id);
+            }
+            if value.contains('/') {
+                anyhow::bail!("rule '{}' host cannot contain a path", rule.id);
+            }
+        }
+        HostMatchType::Wildcard => {
+            let value = rule.host.value.as_deref().unwrap_or("").trim();
+            if !value.starts_with("*.") || value[2..].is_empty() || value[2..].contains('*') {
+                anyhow::bail!(
+                    "rule '{}' wildcard host must use '*.example.com' format",
+                    rule.id
+                );
+            }
+        }
+    }
+
+    match rule.location.match_type {
+        LocationMatchType::Exact | LocationMatchType::Prefix => {
+            if !rule.location.value.starts_with('/') {
+                anyhow::bail!("rule '{}' location must start with '/'", rule.id);
+            }
+        }
+        LocationMatchType::Regex => {
+            regex::Regex::new(&rule.location.value)
+                .with_context(|| format!("rule '{}' has invalid location regex", rule.id))?;
+        }
+    }
+    Ok(())
+}
+
+fn contains_route_condition(expr: Option<&ConditionExpr>) -> bool {
+    match expr {
+        Some(ConditionExpr::Leaf {
+            condition_type: ConditionType::Host | ConditionType::Path,
+            ..
+        }) => true,
+        Some(ConditionExpr::And { children }) | Some(ConditionExpr::Or { children }) => children
+            .iter()
+            .any(|child| contains_route_condition(Some(child))),
+        _ => false,
+    }
 }
 
 fn rule_tls_enabled(rule: &Rule) -> bool {
@@ -522,7 +582,7 @@ fn effective_tls_listeners(config: &AppConfig) -> Vec<EffectiveTlsListener> {
         if entry.default_certificate.trim().is_empty() {
             entry.default_certificate = tls.certificate.clone();
         }
-        for host in exact_host_values(rule.conditions.as_ref()) {
+        for host in route_host_values(rule) {
             entry
                 .sni_certificates
                 .insert(host.to_ascii_lowercase(), tls.certificate.clone());
@@ -546,38 +606,26 @@ fn effective_tls_listeners(config: &AppConfig) -> Vec<EffectiveTlsListener> {
     listeners.into_values().collect()
 }
 
-fn exact_host_values(expr: Option<&ConditionExpr>) -> Vec<String> {
-    let mut hosts = Vec::new();
-    collect_exact_host_values(expr, &mut hosts);
-    hosts
-}
-
-fn collect_exact_host_values(expr: Option<&ConditionExpr>, hosts: &mut Vec<String>) {
-    match expr {
-        Some(ConditionExpr::Leaf {
-            condition_type: ConditionType::Host,
-            operator: Operator::Exact,
-            value: Some(value),
-            ..
-        }) => hosts.push(strip_host_port(value)),
-        Some(ConditionExpr::Leaf {
-            condition_type: ConditionType::Header,
-            key: Some(key),
-            operator: Operator::Exact,
-            value: Some(value),
-            ..
-        }) if key.eq_ignore_ascii_case("host") => hosts.push(strip_host_port(value)),
-        Some(ConditionExpr::And { children }) | Some(ConditionExpr::Or { children }) => {
-            for child in children {
-                collect_exact_host_values(Some(child), hosts);
-            }
-        }
-        _ => {}
+fn route_host_values(rule: &Rule) -> Vec<String> {
+    match rule.host.match_type {
+        HostMatchType::Exact | HostMatchType::Wildcard => rule
+            .host
+            .value
+            .as_deref()
+            .map(strip_host_port)
+            .into_iter()
+            .collect(),
+        HostMatchType::Any => Vec::new(),
     }
 }
 
 fn strip_host_port(host: &str) -> String {
-    host.split(':').next().unwrap_or(host).trim().to_string()
+    host.split(':')
+        .next()
+        .unwrap_or(host)
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn parse_cert_chain(
@@ -820,10 +868,9 @@ async fn proxy_handler(
             })
     });
 
-    let (config, balancer, clients, target_base, metric_labels) = {
-        let runtime = state.proxy_runtime.read().await;
+    let (config, clients, target_base, metric_labels) = {
+        let runtime = state.proxy_runtime.load();
         let config = runtime.config.clone();
-        let balancer = runtime.balancer.clone();
         let clients = runtime.clients.clone();
         let match_request = request_for_matching(&request);
 
@@ -843,13 +890,12 @@ async fn proxy_handler(
             Some((rule, upstream, target)) => (target, ProxyMetricLabels { rule, upstream }),
             None => (config.fallback.url.clone(), ProxyMetricLabels::fallback()),
         };
-        (config, balancer, clients, target_base, metric_labels)
+        (config, clients, target_base, metric_labels)
     };
 
     handle_proxy_with_target(
         request,
         config,
-        balancer,
         clients,
         target_base,
         Some(state.metrics),
@@ -882,7 +928,7 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
     let health_config = ConfigSnapshot::new();
     health_config.update(&config.upstreams);
 
-    let proxy_runtime = Arc::new(RwLock::new(ProxyRuntime {
+    let proxy_runtime = Arc::new(ArcSwap::from_pointee(ProxyRuntime {
         matcher: Arc::new(Matcher::new_verified_with_match_sets(
             config.rules.clone(),
             config.match_sets.clone(),
@@ -971,7 +1017,7 @@ fn spawn_config_reloader(state: AppState) {
                         let mut config = state.config.write().await;
                         *config = new_config.clone();
                     }
-                    state.rebuild_proxy_runtime(&old_config, &new_config).await;
+                    state.rebuild_proxy_runtime(&old_config, &new_config);
                 }
                 Err(e) => {
                     tracing::warn!("failed to reload config from DB: {e}");
@@ -982,7 +1028,8 @@ fn spawn_config_reloader(state: AppState) {
 }
 
 fn spawn_health_checker(state: AppState) {
+    let clients = state.proxy_runtime.load().clients.clone();
     tokio::spawn(async move {
-        run_health_checks(state.health.clone(), state.health_config.clone()).await;
+        run_health_checks(state.health.clone(), state.health_config.clone(), clients).await;
     });
 }

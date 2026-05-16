@@ -1,5 +1,4 @@
 pub mod balancer;
-pub mod conditions;
 pub mod health;
 pub mod matcher;
 pub mod upstream;
@@ -12,10 +11,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_native_certs::load_native_certs;
 
-use crate::{
-    config::yaml::AppConfig, observability::metrics::ProxyMetrics, proxy::balancer::Balancer,
-    proxy::matcher::Matcher,
-};
+use crate::{config::yaml::AppConfig, observability::metrics::ProxyMetrics};
 
 // ── TLS verification bypass ──
 
@@ -105,9 +101,6 @@ impl ProxyClients {
         pool_idle_timeout: Option<Duration>,
         tcp_keepalive: Option<Duration>,
     ) -> Self {
-        // Ensure a crypto provider is installed (required by rustls 0.23+)
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         // HTTP client with connection pooling
         let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
         http_connector.set_connect_timeout(connect_timeout);
@@ -152,6 +145,27 @@ impl ProxyClients {
             https_insecure_client,
         }
     }
+    /// Send a health check request using the appropriate client, with timeout.
+    pub async fn health_check_request(
+        &self,
+        request: Request<Body>,
+        is_https: bool,
+        skip_ssl: bool,
+        timeout: Duration,
+    ) -> Option<StatusCode> {
+        let future = if is_https && skip_ssl {
+            self.https_insecure_client.request(request)
+        } else if is_https {
+            self.https_client.request(request)
+        } else {
+            self.http_client.request(request)
+        };
+        tokio::time::timeout(timeout, future)
+            .await
+            .ok()?
+            .ok()
+            .map(|response| response.status())
+    }
 }
 
 fn https_connector(
@@ -167,39 +181,10 @@ fn https_connector(
 
 // ── Proxy handler ──
 
-/// Full proxy handler: match rule, select upstream, forward request.
-pub async fn handle_proxy(
-    request: Request<Body>,
-    config: Arc<AppConfig>,
-    matcher: Arc<Matcher>,
-    balancer: Arc<Balancer>,
-    clients: Arc<ProxyClients>,
-    listen_addr: Option<String>,
-) -> Result<Response<Body>, Infallible> {
-    let match_request = request_for_matching(&request);
-    let target_base = listen_addr
-        .as_deref()
-        .and_then(|addr| matcher.match_request(&match_request, Some(addr)))
-        .and_then(|rule| balancer.select(&rule.upstream))
-        .unwrap_or_else(|| config.fallback.url.clone());
-
-    handle_proxy_with_target(
-        request,
-        config,
-        balancer,
-        clients,
-        target_base,
-        None,
-        ProxyMetricLabels::fallback(),
-    )
-    .await
-}
-
 /// Forward a request to the given target base URL.
 pub async fn handle_proxy_with_target(
     mut request: Request<Body>,
     config: Arc<AppConfig>,
-    _balancer: Arc<Balancer>,
     clients: Arc<ProxyClients>,
     target_base: String,
     metrics: Option<Arc<ProxyMetrics>>,

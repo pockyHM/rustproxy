@@ -4,7 +4,10 @@ use std::fs;
 use crate::cli::{RuleCommands, UpstreamCommands};
 use crate::config::yaml::{AppConfig, Fallback};
 use crate::db::{migration, Database};
-use crate::models::{ConditionExpr, ConditionType, Operator, Rule, Target, Upstream};
+use crate::models::{
+    ConditionExpr, ConditionType, HostMatchType, HostMatcher, LocationMatchType, LocationMatcher,
+    Operator, Rule, Target, Upstream,
+};
 
 const CONFIG_KEYS: &[&str] = &[
     "version",
@@ -127,6 +130,10 @@ pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
             priority,
             weight,
             listen,
+            host_type,
+            host,
+            location_type,
+            location,
             condition_type,
             operator,
             value,
@@ -145,10 +152,14 @@ pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
             }
 
             let conditions = build_condition(condition_type, operator, value, key, claim_path)?;
+            let host = build_host_matcher(&host_type, host)?;
+            let location = build_location_matcher(&location_type, location)?;
             config.rules.push(Rule {
                 id: id.clone(),
                 name,
                 priority,
+                host,
+                location,
                 match_set: None,
                 conditions,
                 upstream,
@@ -370,7 +381,9 @@ fn build_condition(
                 anyhow::bail!("--claim-path is required for jwt conditions");
             }
         }
-        ConditionType::Host | ConditionType::Path => {}
+        ConditionType::Host | ConditionType::Path => {
+            anyhow::bail!("host and path must be configured with --host-* and --location-* options")
+        }
     }
 
     if operator != Operator::Exists && value.is_none() {
@@ -386,14 +399,55 @@ fn build_condition(
     }))
 }
 
+fn build_host_matcher(host_type: &str, value: Option<String>) -> Result<HostMatcher> {
+    let match_type = match host_type.to_ascii_lowercase().as_str() {
+        "any" => HostMatchType::Any,
+        "exact" => HostMatchType::Exact,
+        "wildcard" => HostMatchType::Wildcard,
+        _ => anyhow::bail!("host type must be one of: any, exact, wildcard"),
+    };
+    let value = match match_type {
+        HostMatchType::Any => None,
+        HostMatchType::Exact => Some(
+            value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("--host is required for exact host matching"))?,
+        ),
+        HostMatchType::Wildcard => {
+            let value = value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("--host is required for wildcard host matching"))?;
+            if !value.starts_with("*.") {
+                anyhow::bail!("wildcard host must use '*.example.com' format");
+            }
+            Some(value)
+        }
+    };
+    Ok(HostMatcher { match_type, value })
+}
+
+fn build_location_matcher(location_type: &str, value: String) -> Result<LocationMatcher> {
+    let match_type = match location_type.to_ascii_lowercase().as_str() {
+        "exact" => LocationMatchType::Exact,
+        "prefix" => LocationMatchType::Prefix,
+        "regex" => LocationMatchType::Regex,
+        _ => anyhow::bail!("location type must be one of: exact, prefix, regex"),
+    };
+    if !matches!(match_type, LocationMatchType::Regex) && !value.starts_with('/') {
+        anyhow::bail!("location must start with '/'");
+    }
+    if matches!(match_type, LocationMatchType::Regex) {
+        regex::Regex::new(&value).with_context(|| "invalid location regex")?;
+    }
+    Ok(LocationMatcher { match_type, value })
+}
+
 fn parse_condition_type(value: &str) -> Result<ConditionType> {
     match value.to_ascii_lowercase().as_str() {
-        "host" => Ok(ConditionType::Host),
-        "path" => Ok(ConditionType::Path),
         "header" => Ok(ConditionType::Header),
         "cookie" => Ok(ConditionType::Cookie),
         "jwt" => Ok(ConditionType::Jwt),
-        _ => anyhow::bail!("condition type must be one of: host, path, header, cookie, jwt"),
+        _ => anyhow::bail!("condition type must be one of: header, cookie, jwt"),
     }
 }
 
