@@ -51,14 +51,20 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM settings WHERE key = 'version'",
-                [],
-                |row| row.get(0),
-            )
+        let settings_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
             .unwrap_or(0);
-        Ok(count == 0)
+        if settings_count > 0 {
+            return Ok(false);
+        }
+
+        let upstream_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM upstreams", [], |row| row.get(0))
+            .unwrap_or(0);
+        let rule_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
+            .unwrap_or(0);
+        Ok(upstream_count == 0 && rule_count == 0)
     }
 
     // ── Config-level operations ──
@@ -303,7 +309,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         .unwrap_or_default();
     let listen = get_setting(conn, "listen")
         .unwrap_or(None)
-        .unwrap_or_else(|| "127.0.0.1:3000".to_string());
+        .unwrap_or_else(|| "0.0.0.0:3000".to_string());
     let proxy_listen = get_setting(conn, "proxy_listen")
         .unwrap_or(None)
         .unwrap_or_else(|| "0.0.0.0:80".to_string());
@@ -1070,7 +1076,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         assert!(db.is_empty().unwrap());
 
-        db.set_setting("version", "1.0").unwrap();
+        db.set_setting("listen", "0.0.0.0:3000").unwrap();
         assert!(!db.is_empty().unwrap());
     }
 

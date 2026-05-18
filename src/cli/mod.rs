@@ -13,7 +13,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        default_value = "rustproxy.db",
+        default_value = "/var/lib/rustproxy/rustproxy.db",
         env = "RUSTPROXY_DB"
     )]
     pub db: String,

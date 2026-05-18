@@ -177,6 +177,7 @@ const T: Record<string, [string, string]> = {
   'ops.entry': ['Entry', '入口'],
   'ops.priorityShort': ['P', 'P'],
   'ops.requestsShort': ['req', '请求'],
+  'ops.avgLatencyShort': ['avg', '平均'],
   'ops.noRoutes': ['No routing rules configured. Traffic falls back to the default upstream URL.', '暂无路由规则，流量会进入默认兜底上游 URL。'],
   'ops.traffic': ['Recent proxy traffic', '近期代理流量'],
   'ops.trafficDesc': ['Requests grouped by rule, upstream, status, and latency histogram bucket.', '按规则、上游、状态和延迟直方图桶分组的请求。'],
@@ -318,6 +319,8 @@ const T: Record<string, [string, string]> = {
 
 const I18nCtx = createContext<{ lang: Lang; t: (key: string) => string }>({ lang: 'zh', t: (k) => k });
 const useI18n = () => useContext(I18nCtx);
+const DEFAULT_LANG: Lang = 'zh';
+const DEFAULT_THEME: Theme = 'light';
 
 /* ===== Constants ===== */
 
@@ -338,7 +341,7 @@ const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
 const ROUTE_FLOW_COLORS = ['#FF8400', '#000066', '#804200', '#004D1A'];
 
 const emptyConfig: AppConfig = {
-  version: '1.0', listen: '127.0.0.1:3000', proxy_listen: '0.0.0.0:80',
+  version: '1.0', listen: '0.0.0.0:3000', proxy_listen: '0.0.0.0:80',
   certificate_dir: '/etc/rustproxy/cert.d', access_log: { enabled: false, path: null, buffer_size: 8192 }, certificates: [], tls_listeners: [], match_sets: [],
   rules: [], upstreams: {}, fallback: { url: '404' },
 };
@@ -346,7 +349,7 @@ const emptyConfig: AppConfig = {
 /* ===== Icon ===== */
 
 function Icon({ name, size = 22 }: { name: string; size?: number }) {
-  return <span className="material-symbols-sharp" style={{ fontSize: size }}>{name}</span>;
+  return <span className="material-symbols-sharp" style={{ fontSize: size }} aria-hidden="true">{name}</span>;
 }
 
 /* ===== Shared Components ===== */
@@ -459,8 +462,8 @@ function App() {
   const [view, setView] = useState<View>(() => resolveInitialView());
   const [notice, setNotice] = useState<Notice>(null);
   const [loading, setLoading] = useState(true);
-  const [lang, setLang] = useState<Lang>(() => (localStorage.getItem('rustproxy_lang') as Lang) || 'zh');
-  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('rustproxy_theme') as Theme) || 'light');
+  const [lang, setLang] = useState<Lang>(() => readStoredLang());
+  const [theme, setTheme] = useState<Theme>(() => readStoredTheme());
 
   const t = useMemo(() => {
     const idx = lang === 'en' ? 0 : 1;
@@ -474,8 +477,29 @@ function App() {
   }, []);
 
   useEffect(() => {
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+  }, [lang]);
+
+  useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const markIconsReady = () => {
+      if (!cancelled) document.documentElement.classList.add('icons-ready');
+    };
+    if (!('fonts' in document)) {
+      markIconsReady();
+      return () => { cancelled = true; };
+    }
+    document.fonts.load('24px "Material Symbols Sharp"', 'route').then((fonts) => {
+      if (fonts.length > 0) markIconsReady();
+    }).catch(() => {
+      document.documentElement.classList.remove('icons-ready');
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     api<{ users_exist: boolean }>('/api/auth/setup-status')
@@ -551,7 +575,7 @@ function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, chan
         <div className="listeners-title">{t('listeners.title')}</div>
         <div className="listener-item">
           <div className="listener-label">{t('listeners.api')}</div>
-          <div className="listener-value">{config.listen || '127.0.0.1:3000'}</div>
+          <div className="listener-value">{config.listen || '0.0.0.0:3000'}</div>
         </div>
         <div className="listener-item">
           <div className="listener-label">{t('listeners.proxy')}</div>
@@ -624,13 +648,12 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
   const residentMemory = useMemo(() => metricValue(metrics, 'process_resident_memory_bytes') ?? 0, [metrics]);
   const openFds = useMemo(() => metricValue(metrics, 'process_open_fds') ?? 0, [metrics]);
   const avgLatency = useMemo(() => {
-    const sum = metrics.find((m) => m.name === 'proxy_request_duration_seconds_sum')?.value;
-    const count = metrics.find((m) => m.name === 'proxy_request_duration_seconds_count')?.value;
-    return sum && count && count > 0 ? (sum / count) * 1000 : 0;
+    const sum = metrics.filter((m) => m.name === 'proxy_request_duration_seconds_sum').reduce((total, metric) => total + metric.value, 0);
+    const count = metrics.filter((m) => m.name === 'proxy_request_duration_seconds_count').reduce((total, metric) => total + metric.value, 0);
+    return count > 0 ? (sum / count) * 1000 : 0;
   }, [metrics]);
   const reloadCount = useMemo(() => metrics.find((m) => m.name === 'proxy_config_reloads_total')?.value ?? 0, [metrics]);
 
-  const ruleNameById = useMemo(() => Object.fromEntries(config.rules.map((r) => [r.id, r.name || r.id])), [config.rules]);
   const requestsByRule = useMemo(() => {
     const byRule: Record<string, number> = {};
     metrics.filter((m) => m.name === 'proxy_requests_total').forEach((m) => {
@@ -640,10 +663,22 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
     return byRule;
   }, [metrics]);
 
+  const avgLatencyByRoute = useMemo(() => {
+    const sums: Record<string, number> = {};
+    const counts: Record<string, number> = {};
+    metrics.forEach((metric) => {
+      if (metric.name !== 'proxy_request_duration_seconds_sum' && metric.name !== 'proxy_request_duration_seconds_count') return;
+      const key = `${metric.labels.rule || 'unknown'}\u0000${metric.labels.upstream || '-'}`;
+      if (metric.name.endsWith('_sum')) sums[key] = (sums[key] || 0) + metric.value;
+      if (metric.name.endsWith('_count')) counts[key] = (counts[key] || 0) + metric.value;
+    });
+    return Object.fromEntries(Object.keys(counts).map((key) => [key, counts[key] > 0 ? (sums[key] || 0) / counts[key] * 1000 : 0]));
+  }, [metrics]);
+
   const trafficRows = useMemo(() => metrics.filter((m) => m.name === 'proxy_requests_total').map((m) => ({
-    rule: ruleNameById[m.labels.rule] || m.labels.rule || '-', ruleId: m.labels.rule || '-',
+    rule: m.labels.rule || '-', ruleId: m.labels.rule || '-',
     upstream: m.labels.upstream || '-', status: m.labels.status || '-', count: m.value,
-  })), [metrics, ruleNameById]);
+  })), [metrics]);
   const upstreams = useMemo(() => Object.values(config.upstreams ?? {}), [config]);
   const routeFlowGroups = useMemo(() => {
     const defaultListen = config.proxy_listen || '0.0.0.0:80';
@@ -654,6 +689,7 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
         rule: Rule;
         upstream?: Upstream;
         requests: number;
+        avgLatency: number;
         color: string;
       }[];
     }>();
@@ -668,12 +704,13 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
         group.flows.push({
           rule,
           upstream: config.upstreams?.[rule.upstream],
-          requests: requestsByRule[rule.id] ?? 0,
+          requests: requestsByRule[rule.name || rule.id] ?? 0,
+          avgLatency: avgLatencyByRoute[`${rule.name || rule.id}\u0000${rule.upstream}`] ?? 0,
           color: ROUTE_FLOW_COLORS[group.flows.length % ROUTE_FLOW_COLORS.length],
         });
       });
     return [...grouped.values()];
-  }, [config, requestsByRule]);
+  }, [config, requestsByRule, avgLatencyByRoute]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, flex: 1 }}>
@@ -723,7 +760,7 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
                     <small>{lang === 'en' ? `${group.flows.length} route${group.flows.length !== 1 ? 's' : ''}` : `${group.flows.length} 条链路`}</small>
                   </div>
                   <div className="flow-branches">
-                    {group.flows.map(({ rule, upstream, requests, color }, index) => (
+                    {group.flows.map(({ rule, upstream, requests, avgLatency, color }, index) => (
                       <div className={`flow-branch ${rule.is_fallback ? 'is-fallback' : ''}`} key={rule.id || `${group.entry}-${index}`}>
                         <span className="flow-branch-rail" style={{ background: color }} />
                         <div className="flow-priority">
@@ -751,7 +788,10 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
                           <strong>{rule.upstream}</strong>
                           <small>{upstream ? targetSummary(upstream, lang) : 'missing upstream'}</small>
                         </div>
-                        <div className="flow-count">{formatNumber(requests)} {t('ops.requestsShort')}</div>
+                        <div className="flow-metrics">
+                          <span>{formatNumber(requests)} {t('ops.requestsShort')}</span>
+                          <strong>{avgLatency > 0 ? `${t('ops.avgLatencyShort')} ${formatLatency(avgLatency)}` : `${t('ops.avgLatencyShort')} —`}</strong>
+                        </div>
                         <div className="flow-rule-popover" role="tooltip">
                           <span>{t('table.rule')} · {rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
                           <strong>{rule.name || rule.id || '-'}</strong>
@@ -915,8 +955,8 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
           <th style={{ width: 70 }}>{t('table.id')}</th><th style={{ width: 130 }}>{t('table.name')}</th>
           <th style={{ width: 80 }}>{t('table.priority')}</th><th style={{ width: 90 }}>{t('table.listen')}</th>
           <th style={{ width: 130 }}>{t('table.host')}</th><th style={{ width: 130 }}>{t('table.location')}</th>
-          <th style={{ width: 130 }}>{t('table.pool')}</th>
-          <th>{t('table.match')}</th><th style={{ width: 80 }}>{t('table.actions')}</th>
+          <th style={{ width: 180 }}>{t('table.pool')}</th>
+          <th>{t('table.match')}</th><th style={{ width: 120 }}>{t('table.actions')}</th>
         </tr></thead><tbody>
           {sorted.length === 0 ? (
             <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 40 }}>{t('table.noRules')}</td></tr>
@@ -928,11 +968,13 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               <td className="td-mono">{rule.is_fallback ? `${t('rule.fallback')} · ${rule.listen || defaultListen}` : `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen || defaultListen}`}</td>
               <td className="td-mono">{summarizeHost(rule.host, t)}</td>
               <td className="td-mono">{summarizeLocation(rule.location)}</td>
-              <td><span className="td-badge">{rule.upstream}</span></td>
+              <td className="td-upstream"><span className="td-badge" title={rule.upstream}>{rule.upstream}</span></td>
               <td className="td-mono">{rule.is_fallback ? t('rule.enableFallback') : summarizeRuleMatch(rule)}</td>
               <td className="td-actions">
-                <button className="btn btn-ghost btn-sm" onClick={() => openEdit(rule)}>{t('action.edit')}</button>
-                <button className="btn btn-danger btn-sm" onClick={() => remove(rule.id)}>{t('action.del')}</button>
+                <div className="td-action-row">
+                  <button className="btn btn-ghost btn-sm" onClick={() => openEdit(rule)}>{t('action.edit')}</button>
+                  <button className="btn btn-danger btn-sm" onClick={() => remove(rule.id)}>{t('action.del')}</button>
+                </div>
               </td>
             </tr>
           ))}
@@ -1568,7 +1610,7 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
         <div className="schema-col">
           <div className="card global-config-card">
             <h3 className="card-title-sm">{t('config.global')}</h3>
-            <Field label={t('config.listen')}><input value={globalConfig.listen ?? '127.0.0.1:3000'} onChange={(e) => updateGlobal({ listen: e.target.value })} /></Field>
+            <Field label={t('config.listen')}><input value={globalConfig.listen ?? '0.0.0.0:3000'} onChange={(e) => updateGlobal({ listen: e.target.value })} /></Field>
             <Field label={t('config.proxyListen')}><input value={globalConfig.proxy_listen ?? '0.0.0.0:80'} onChange={(e) => updateGlobal({ proxy_listen: e.target.value })} /></Field>
             <Field label={t('config.certificateDir')}><input value={globalConfig.certificate_dir ?? '/etc/rustproxy/cert.d'} onChange={(e) => updateGlobal({ certificate_dir: e.target.value })} /></Field>
             <Field label={t('config.fallbackUrl')}><input value={globalConfig.fallback?.url ?? ''} onChange={(e) => updateFallbackUrl(e.target.value)} /></Field>
@@ -1731,6 +1773,13 @@ function formatNumber(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
   if (n >= 1_000) return n.toLocaleString();
   return String(n);
+}
+
+function formatLatency(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  if (ms < 1) return `${ms.toFixed(2)} ms`;
+  if (ms < 100) return `${ms.toFixed(1)} ms`;
+  return `${Math.round(ms)} ms`;
 }
 
 function formatBytes(bytes: number): string {
@@ -1936,6 +1985,16 @@ function summarizeLocation(location?: LocationMatcher | null): string {
 function resolveInitialView(): View {
   const segment = window.location.pathname.replace('/admin', '').split('/').filter(Boolean)[0];
   return NAV_ITEMS.find((item) => item.id === segment)?.id ?? 'operations';
+}
+
+function readStoredLang(): Lang {
+  const stored = localStorage.getItem('rustproxy_lang');
+  return stored === 'en' || stored === 'zh' ? stored : DEFAULT_LANG;
+}
+
+function readStoredTheme(): Theme {
+  const stored = localStorage.getItem('rustproxy_theme');
+  return stored === 'dark' || stored === 'light' ? stored : DEFAULT_THEME;
 }
 
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : 'request failed'; }

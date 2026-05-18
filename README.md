@@ -64,27 +64,34 @@ cargo build --release
 
 默认地址：
 
-- 管理后台：`http://127.0.0.1:3000/admin/`
-- Prometheus 指标：`http://127.0.0.1:3000/metrics`
+- 管理后台：`http://0.0.0.0:3000/admin/`（本机也可用 `http://127.0.0.1:3000/admin/`）
+- Prometheus 指标：`http://0.0.0.0:3000/metrics`
 - 反向代理入口：`0.0.0.0:80`
 
-如果使用 SQLite 数据库路径：
+默认 SQLite 数据库路径是 `/var/lib/rustproxy/rustproxy.db`。首次运行前需要确保目录存在且当前用户可写：
 
 ```bash
-RUSTPROXY_DB=./rustproxy.db ./target/release/rustproxy serve config.yaml
+sudo mkdir -p /var/lib/rustproxy
+sudo chown "$(id -u):$(id -g)" /var/lib/rustproxy
+```
+
+如果需要覆盖数据库路径：
+
+```bash
+RUSTPROXY_DB=/path/to/rustproxy.db ./target/release/rustproxy serve config.yaml
 ```
 
 或：
 
 ```bash
-./target/release/rustproxy --db ./rustproxy.db serve config.yaml
+./target/release/rustproxy --db /path/to/rustproxy.db serve config.yaml
 ```
 
 ### 配置示例
 
 ```yaml
 version: "1.0"
-listen: "127.0.0.1:3000"
+listen: "0.0.0.0:3000"
 proxy_listen: "0.0.0.0:80"
 connect_timeout: 10
 request_timeout: 60
@@ -333,20 +340,27 @@ cargo build --release
 
 Default endpoints:
 
-- Admin UI: `http://127.0.0.1:3000/admin/`
-- Prometheus metrics: `http://127.0.0.1:3000/metrics`
+- Admin UI: `http://0.0.0.0:3000/admin/` (or `http://127.0.0.1:3000/admin/` locally)
+- Prometheus metrics: `http://0.0.0.0:3000/metrics`
 - Reverse proxy listener: `0.0.0.0:80`
 
-Use a custom SQLite database path with:
+The default SQLite database path is `/var/lib/rustproxy/rustproxy.db`. Before the first run, make sure the directory exists and is writable by the current user:
 
 ```bash
-RUSTPROXY_DB=./rustproxy.db ./target/release/rustproxy serve config.yaml
+sudo mkdir -p /var/lib/rustproxy
+sudo chown "$(id -u):$(id -g)" /var/lib/rustproxy
+```
+
+Override the database path with:
+
+```bash
+RUSTPROXY_DB=/path/to/rustproxy.db ./target/release/rustproxy serve config.yaml
 ```
 
 or:
 
 ```bash
-./target/release/rustproxy --db ./rustproxy.db serve config.yaml
+./target/release/rustproxy --db /path/to/rustproxy.db serve config.yaml
 ```
 
 ### Configuration Notes
@@ -419,7 +433,7 @@ cargo test
 RustProxy exposes Prometheus metrics at:
 
 ```text
-http://127.0.0.1:3000/metrics
+http://0.0.0.0:3000/metrics
 ```
 
 Useful metric groups include:

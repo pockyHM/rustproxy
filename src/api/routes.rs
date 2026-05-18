@@ -831,10 +831,9 @@ fn api_router(state: AppState) -> Router {
     Router::new()
         .merge(public)
         .merge(protected)
-        .nest(
-            "/admin",
-            Router::new().fallback(any(super::ui::serve_admin_ui)),
-        )
+        .route("/admin", any(super::ui::serve_admin_ui))
+        .route("/admin/", any(super::ui::serve_admin_ui))
+        .route("/admin/*path", any(super::ui::serve_admin_ui))
         // API port returns 404 for unknown /api/ paths instead of proxying
         .fallback(api_not_found)
         .layer(TraceLayer::new_for_http())
@@ -897,10 +896,15 @@ async fn proxy_handler(
                 .matcher
                 .match_request(&match_request, Some(addr))
                 .and_then(|rule| {
+                    let rule_label = if rule.name.trim().is_empty() {
+                        rule.id.clone()
+                    } else {
+                        rule.name.clone()
+                    };
                     runtime
                         .balancer
                         .select(&rule.upstream)
-                        .map(|target| (rule.id.clone(), rule.upstream.clone(), target))
+                        .map(|target| (rule_label, rule.upstream.clone(), target))
                 })
         });
 

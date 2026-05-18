@@ -347,7 +347,7 @@ fn parse_usize(key: &str, value: &str) -> Result<usize> {
 
 fn validate_listen_addr(value: &str) -> Result<()> {
     let Some((_, port)) = value.rsplit_once(':') else {
-        anyhow::bail!("listen address must include a port, for example 127.0.0.1:3000");
+        anyhow::bail!("listen address must include a port, for example 0.0.0.0:3000");
     };
     port.parse::<u16>()
         .with_context(|| format!("invalid listen port in address: {value}"))?;
@@ -498,7 +498,7 @@ mod tests {
     fn config() -> AppConfig {
         AppConfig {
             version: "1.0".to_string(),
-            listen: "127.0.0.1:3000".to_string(),
+            listen: "0.0.0.0:3000".to_string(),
             proxy_listen: "0.0.0.0:80".to_string(),
             connect_timeout: 10,
             request_timeout: 60,
