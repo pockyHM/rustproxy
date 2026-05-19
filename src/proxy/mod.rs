@@ -1,6 +1,7 @@
 pub mod balancer;
 pub mod headers;
 pub mod health;
+pub mod limits;
 pub mod matcher;
 pub mod path;
 pub mod upstream;
@@ -15,12 +16,15 @@ use rustls_native_certs::load_native_certs;
 
 use crate::{
     config::yaml::AppConfig,
-    models::{HeaderPolicy, PathAction},
+    models::{HeaderPolicy, LimitPolicy, PathAction},
     observability::{
         access_log::{AccessLogEntry, AccessLogger},
         metrics::ProxyMetrics,
     },
-    proxy::balancer::TargetLease,
+    proxy::{
+        balancer::TargetLease,
+        limits::{LimitContext, LimitPermit, LimitState},
+    },
 };
 
 // ── TLS verification bypass ──
@@ -118,6 +122,9 @@ pub struct ProxyRequestContext {
     pub request_timeout_override: u64,
     pub header_policy: HeaderPolicy,
     pub path_actions: Vec<PathAction>,
+    pub limit_state: Option<Arc<LimitState>>,
+    pub limit_context: Option<LimitContext>,
+    pub limit_policy: LimitPolicy,
     pub target_lease: Option<TargetLease>,
 }
 
@@ -233,6 +240,65 @@ pub async fn handle_proxy_with_target(
             metrics: Arc::clone(metrics),
         }
     });
+    let _limit_permit = match (
+        proxy_context.limit_state.as_deref(),
+        proxy_context.limit_context.as_ref(),
+    ) {
+        (Some(limit_state), Some(limit_context)) => {
+            match limit_state
+                .check(limit_context, &proxy_context.limit_policy, request.headers())
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(limits::LimitRejection::RateLimited) => {
+                    return Ok(record_proxy_outcome(
+                        too_many_requests(),
+                        metrics.as_deref(),
+                        access_logger.as_deref(),
+                        &proxy_context.access,
+                        &proxy_context.metric_labels,
+                        start,
+                        &original_method,
+                        &original_host,
+                        &original_uri,
+                        &target_base,
+                        Some("rate limit exceeded".to_string()),
+                    ));
+                }
+                Err(limits::LimitRejection::BodyTooLarge) => {
+                    return Ok(record_proxy_outcome(
+                        payload_too_large(),
+                        metrics.as_deref(),
+                        access_logger.as_deref(),
+                        &proxy_context.access,
+                        &proxy_context.metric_labels,
+                        start,
+                        &original_method,
+                        &original_host,
+                        &original_uri,
+                        &target_base,
+                        Some("request body too large".to_string()),
+                    ));
+                }
+                Err(limits::LimitRejection::QueueTimeout) => {
+                    return Ok(record_proxy_outcome(
+                        service_unavailable(),
+                        metrics.as_deref(),
+                        access_logger.as_deref(),
+                        &proxy_context.access,
+                        &proxy_context.metric_labels,
+                        start,
+                        &original_method,
+                        &original_host,
+                        &original_uri,
+                        &target_base,
+                        Some("connection limit queue timeout".to_string()),
+                    ));
+                }
+            }
+        }
+        _ => None::<LimitPermit>,
+    };
 
     tracing::debug!(
         method = %request.method(),
@@ -644,6 +710,27 @@ fn bad_gateway() -> Response<Body> {
         .status(StatusCode::BAD_GATEWAY)
         .body(Body::from("Bad Gateway"))
         .expect("static bad gateway response is valid")
+}
+
+fn too_many_requests() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .body(Body::from("Too Many Requests"))
+        .expect("static too many requests response is valid")
+}
+
+fn payload_too_large() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(Body::from("Payload Too Large"))
+        .expect("static payload too large response is valid")
+}
+
+fn service_unavailable() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(Body::from("Service Unavailable"))
+        .expect("static service unavailable response is valid")
 }
 
 fn not_found_page() -> Response<Body> {

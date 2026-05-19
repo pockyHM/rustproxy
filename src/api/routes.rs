@@ -31,6 +31,7 @@ use crate::{
     observability::{access_log::AccessLogger, metrics::ProxyMetrics},
     proxy::balancer::{BalanceContext, Balancer},
     proxy::health::{run_health_checks, ConfigSnapshot, HealthRegistry},
+    proxy::limits::{LimitContext, LimitState},
     proxy::matcher::Matcher,
     proxy::request_for_matching,
     proxy::ProxyClients,
@@ -50,6 +51,7 @@ struct ProxyRuntime {
     config: Arc<AppConfig>,
     clients: Arc<ProxyClients>,
     access_logger: Option<Arc<AccessLogger>>,
+    limits: Arc<LimitState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +141,7 @@ impl AppState {
             config: Arc::new(new.clone()),
             clients,
             access_logger,
+            limits: Arc::new(LimitState::default()),
         };
 
         self.health_config.update(&new.upstreams);
@@ -902,13 +905,23 @@ async fn proxy_handler(
         metric_labels,
         header_policy,
         path_actions,
+        limit_policy,
+        limit_context,
+        limit_state,
         target_lease,
     ) = {
         let runtime = state.proxy_runtime.load();
         let config = runtime.config.clone();
         let clients = runtime.clients.clone();
         let access_logger = runtime.access_logger.clone();
+        let limit_state = runtime.limits.clone();
         let match_request = request_for_matching(&request);
+        let request_host = request
+            .headers()
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
 
         let selected = listen_addr.as_deref().and_then(|addr| {
             runtime
@@ -936,6 +949,13 @@ async fn proxy_handler(
                                 rule.request_timeout,
                                 rule.header_policy.clone(),
                                 rule.path_actions.clone(),
+                                rule.limit_policy.clone(),
+                                LimitContext {
+                                    listen: addr.to_string(),
+                                    rule: rule.id.clone(),
+                                    client_ip: source.clone(),
+                                    host: request_host.clone(),
+                                },
                                 target.url,
                                 target.active_connection,
                             )
@@ -946,8 +966,8 @@ async fn proxy_handler(
         let listen_label = listen_addr
             .clone()
             .unwrap_or_else(|| config.proxy_listen.clone());
-        let (target_base, rule_request_timeout, metric_labels, header_policy, path_actions, target_lease) = match selected {
-            Some((rule, upstream, request_timeout, header_policy, path_actions, target, target_lease)) => (
+        let (target_base, rule_request_timeout, metric_labels, header_policy, path_actions, limit_policy, limit_context, target_lease) = match selected {
+            Some((rule, upstream, request_timeout, header_policy, path_actions, limit_policy, limit_context, target, target_lease)) => (
                 target,
                 request_timeout,
                 ProxyMetricLabels {
@@ -957,6 +977,8 @@ async fn proxy_handler(
                 },
                 header_policy,
                 path_actions,
+                limit_policy,
+                Some(limit_context),
                 Some(target_lease),
             ),
             None => (
@@ -965,6 +987,8 @@ async fn proxy_handler(
                 ProxyMetricLabels::fallback(listen_label),
                 Default::default(),
                 Vec::new(),
+                Default::default(),
+                None,
                 None,
             ),
         };
@@ -977,6 +1001,9 @@ async fn proxy_handler(
             metric_labels,
             header_policy,
             path_actions,
+            limit_policy,
+            limit_context,
+            limit_state,
             target_lease,
         )
     };
@@ -994,6 +1021,9 @@ async fn proxy_handler(
             request_timeout_override: rule_request_timeout,
             header_policy,
             path_actions,
+            limit_state: Some(limit_state),
+            limit_context,
+            limit_policy,
             target_lease,
         },
     )
@@ -1054,6 +1084,7 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
             },
         )),
         access_logger: AccessLogger::from_config(&config.access_log).map(Arc::new),
+        limits: Arc::new(LimitState::default()),
     }));
 
     let state = AppState {
