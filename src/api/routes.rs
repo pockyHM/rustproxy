@@ -908,6 +908,10 @@ async fn proxy_handler(
         limit_policy,
         limit_context,
         limit_state,
+        retry_policy,
+        balancer,
+        balance_client_ip,
+        balance_path,
         target_lease,
     ) = {
         let runtime = state.proxy_runtime.load();
@@ -915,6 +919,7 @@ async fn proxy_handler(
         let clients = runtime.clients.clone();
         let access_logger = runtime.access_logger.clone();
         let limit_state = runtime.limits.clone();
+        let balancer = runtime.balancer.clone();
         let match_request = request_for_matching(&request);
         let request_host = request
             .headers()
@@ -950,6 +955,11 @@ async fn proxy_handler(
                                 rule.header_policy.clone(),
                                 rule.path_actions.clone(),
                                 rule.limit_policy.clone(),
+                                config
+                                    .upstreams
+                                    .get(&rule.upstream)
+                                    .map(|upstream| upstream.retry.clone())
+                                    .unwrap_or_default(),
                                 LimitContext {
                                     listen: addr.to_string(),
                                     rule: rule.id.clone(),
@@ -966,8 +976,29 @@ async fn proxy_handler(
         let listen_label = listen_addr
             .clone()
             .unwrap_or_else(|| config.proxy_listen.clone());
-        let (target_base, rule_request_timeout, metric_labels, header_policy, path_actions, limit_policy, limit_context, target_lease) = match selected {
-            Some((rule, upstream, request_timeout, header_policy, path_actions, limit_policy, limit_context, target, target_lease)) => (
+        let (
+            target_base,
+            rule_request_timeout,
+            metric_labels,
+            header_policy,
+            path_actions,
+            limit_policy,
+            retry_policy,
+            limit_context,
+            target_lease,
+        ) = match selected {
+            Some((
+                rule,
+                upstream,
+                request_timeout,
+                header_policy,
+                path_actions,
+                limit_policy,
+                retry_policy,
+                limit_context,
+                target,
+                target_lease,
+            )) => (
                 target,
                 request_timeout,
                 ProxyMetricLabels {
@@ -978,6 +1009,7 @@ async fn proxy_handler(
                 header_policy,
                 path_actions,
                 limit_policy,
+                retry_policy,
                 Some(limit_context),
                 Some(target_lease),
             ),
@@ -987,6 +1019,7 @@ async fn proxy_handler(
                 ProxyMetricLabels::fallback(listen_label),
                 Default::default(),
                 Vec::new(),
+                Default::default(),
                 Default::default(),
                 None,
                 None,
@@ -1004,6 +1037,10 @@ async fn proxy_handler(
             limit_policy,
             limit_context,
             limit_state,
+            retry_policy,
+            balancer,
+            source.clone(),
+            request_path,
             target_lease,
         )
     };
@@ -1024,6 +1061,10 @@ async fn proxy_handler(
             limit_state: Some(limit_state),
             limit_context,
             limit_policy,
+            retry_policy,
+            balancer: Some(balancer),
+            balance_client_ip,
+            balance_path,
             target_lease,
         },
     )

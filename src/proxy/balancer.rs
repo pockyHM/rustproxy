@@ -68,20 +68,35 @@ impl Balancer {
     }
 
     pub fn select(&self, upstream_name: &str, ctx: BalanceContext<'_>) -> Option<SelectedTarget> {
+        self.select_excluding(upstream_name, ctx, None)
+    }
+
+    pub fn select_excluding(
+        &self,
+        upstream_name: &str,
+        ctx: BalanceContext<'_>,
+        excluded_url: Option<&str>,
+    ) -> Option<SelectedTarget> {
         let upstream = self.upstreams.get(upstream_name)?;
         if upstream.targets.is_empty() || upstream.total_weight == 0 {
             return None;
         }
 
         let target = match upstream.balance {
-            BalanceAlgorithm::WeightedRoundRobin => self.select_weighted_round_robin(upstream),
-            BalanceAlgorithm::LeastConnections => self.select_least_connections(upstream),
+            BalanceAlgorithm::WeightedRoundRobin => {
+                self.select_weighted_round_robin(upstream, excluded_url)
+            }
+            BalanceAlgorithm::LeastConnections => {
+                self.select_least_connections(upstream, excluded_url)
+            }
             BalanceAlgorithm::IpHash => {
                 let key = ctx.client_ip.unwrap_or(ctx.path);
-                self.select_modulo_hash(upstream, key)
+                self.select_modulo_hash(upstream, key, excluded_url)
             }
-            BalanceAlgorithm::UrlHash => self.select_modulo_hash(upstream, ctx.path),
-            BalanceAlgorithm::ConsistentHash => self.select_consistent_hash(upstream, ctx.path),
+            BalanceAlgorithm::UrlHash => self.select_modulo_hash(upstream, ctx.path, excluded_url),
+            BalanceAlgorithm::ConsistentHash => {
+                self.select_consistent_hash(upstream, ctx.path, excluded_url)
+            }
         }?;
 
         target.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -97,6 +112,7 @@ impl Balancer {
     fn select_weighted_round_robin<'a>(
         &'a self,
         upstream: &'a WeightedUpstream,
+        excluded_url: Option<&str>,
     ) -> Option<&'a WeightedTarget> {
         let slot = upstream.counter.fetch_add(1, Ordering::Relaxed) % upstream.total_weight;
         let idx = upstream
@@ -106,7 +122,7 @@ impl Balancer {
         for offset in 0..upstream.targets.len() {
             let idx = (idx + offset) % upstream.targets.len();
             let target = &upstream.targets[idx];
-            if self.target_is_healthy(target) {
+            if self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url {
                 return Some(target);
             }
         }
@@ -117,11 +133,14 @@ impl Balancer {
     fn select_least_connections<'a>(
         &'a self,
         upstream: &'a WeightedUpstream,
+        excluded_url: Option<&str>,
     ) -> Option<&'a WeightedTarget> {
         upstream
             .targets
             .iter()
-            .filter(|target| self.target_is_healthy(target))
+            .filter(|target| {
+                self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url
+            })
             .min_by_key(|target| target.active_connections.load(Ordering::Relaxed))
     }
 
@@ -129,11 +148,14 @@ impl Balancer {
         &'a self,
         upstream: &'a WeightedUpstream,
         key: &str,
+        excluded_url: Option<&str>,
     ) -> Option<&'a WeightedTarget> {
         let healthy: Vec<&WeightedTarget> = upstream
             .targets
             .iter()
-            .filter(|target| self.target_is_healthy(target))
+            .filter(|target| {
+                self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url
+            })
             .collect();
         if healthy.is_empty() {
             return None;
@@ -146,9 +168,10 @@ impl Balancer {
         &'a self,
         upstream: &'a WeightedUpstream,
         key: &str,
+        excluded_url: Option<&str>,
     ) -> Option<&'a WeightedTarget> {
         if upstream.hash_ring.is_empty() {
-            return self.select_modulo_hash(upstream, key);
+            return self.select_modulo_hash(upstream, key, excluded_url);
         }
         let key_hash = stable_hash(&key);
         let start = upstream
@@ -157,7 +180,7 @@ impl Balancer {
         for offset in 0..upstream.hash_ring.len() {
             let idx = (start + offset) % upstream.hash_ring.len();
             let target = &upstream.targets[upstream.hash_ring[idx].1];
-            if self.target_is_healthy(target) {
+            if self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url {
                 return Some(target);
             }
         }
@@ -408,6 +431,20 @@ mod tests {
             .url;
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn select_excluding_skips_previous_target() {
+        let balancer = balancer_with(upstream(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+        ));
+
+        let selected = balancer
+            .select_excluding("backend", ctx(None, "/"), Some("http://a"))
+            .unwrap();
+
+        assert_eq!(selected.url, "http://b");
     }
 
     #[test]

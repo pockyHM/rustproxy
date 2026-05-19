@@ -4,26 +4,29 @@ pub mod health;
 pub mod limits;
 pub mod matcher;
 pub mod path;
+pub mod retry;
 pub mod upstream;
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::body::Body;
 use http::{header, HeaderMap, Request, Response, StatusCode, Uri};
+use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_native_certs::load_native_certs;
 
 use crate::{
     config::yaml::AppConfig,
-    models::{HeaderPolicy, LimitPolicy, PathAction},
+    models::{HeaderPolicy, LimitPolicy, PathAction, RetryPolicy},
     observability::{
         access_log::{AccessLogEntry, AccessLogger},
         metrics::ProxyMetrics,
     },
     proxy::{
-        balancer::TargetLease,
+        balancer::{BalanceContext, Balancer, SelectedTarget, TargetLease},
         limits::{LimitContext, LimitPermit, LimitState},
+        retry::{should_retry, AttemptOutcome},
     },
 };
 
@@ -115,7 +118,6 @@ pub struct ProxyAccessLogContext {
     pub source: String,
 }
 
-#[derive(Debug)]
 pub struct ProxyRequestContext {
     pub access: ProxyAccessLogContext,
     pub metric_labels: ProxyMetricLabels,
@@ -125,6 +127,10 @@ pub struct ProxyRequestContext {
     pub limit_state: Option<Arc<LimitState>>,
     pub limit_context: Option<LimitContext>,
     pub limit_policy: LimitPolicy,
+    pub retry_policy: RetryPolicy,
+    pub balancer: Option<Arc<Balancer>>,
+    pub balance_client_ip: String,
+    pub balance_path: String,
     pub target_lease: Option<TargetLease>,
 }
 
@@ -223,7 +229,7 @@ pub async fn handle_proxy_with_target(
     target_base: String,
     metrics: Option<Arc<ProxyMetrics>>,
     access_logger: Option<Arc<AccessLogger>>,
-    proxy_context: ProxyRequestContext,
+    mut proxy_context: ProxyRequestContext,
 ) -> Result<Response<Body>, Infallible> {
     let start = std::time::Instant::now();
     let original_method = request.method().to_string();
@@ -246,7 +252,11 @@ pub async fn handle_proxy_with_target(
     ) {
         (Some(limit_state), Some(limit_context)) => {
             match limit_state
-                .check(limit_context, &proxy_context.limit_policy, request.headers())
+                .check(
+                    limit_context,
+                    &proxy_context.limit_policy,
+                    request.headers(),
+                )
                 .await
             {
                 Ok(permit) => Some(permit),
@@ -363,28 +373,6 @@ pub async fn handle_proxy_with_target(
         }
     };
 
-    let target_uri = match build_target_uri(&target_base, &forward_uri) {
-        Ok(uri) => uri,
-        Err(e) => {
-            tracing::error!(target_base = %target_base, error = %e, "failed to build target URI");
-            return Ok(record_proxy_outcome(
-                bad_gateway(),
-                metrics.as_deref(),
-                access_logger.as_deref(),
-                &proxy_context.access,
-                &proxy_context.metric_labels,
-                start,
-                &original_method,
-                &original_host,
-                &original_uri,
-                &target_base,
-                Some(format!("failed to build target URI: {e}")),
-            ));
-        }
-    };
-
-    tracing::debug!(target_uri = %target_uri, "proxy target resolved");
-
     let upstream_config = config.upstreams.get(&proxy_context.metric_labels.upstream);
     let upstream_websocket = upstream_config.is_some_and(|upstream| upstream.websocket);
     let upstream_skip_ssl = upstream_config.is_some_and(|upstream| upstream.skip_ssl);
@@ -407,7 +395,9 @@ pub async fn handle_proxy_with_target(
         ));
     }
 
-    if let Err(e) = headers::apply_request_headers(request.headers_mut(), &proxy_context.header_policy) {
+    if let Err(e) =
+        headers::apply_request_headers(request.headers_mut(), &proxy_context.header_policy)
+    {
         tracing::error!(error = %e, "failed to apply request header policy");
         return Ok(record_proxy_outcome(
             bad_gateway(),
@@ -424,27 +414,6 @@ pub async fn handle_proxy_with_target(
         ));
     }
 
-    // Set the Host header to match the target
-    if let Some(host) = target_uri.host() {
-        let host_value = if let Some(port) = target_uri.port_u16() {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
-        };
-        if let Ok(value) = http::HeaderValue::from_str(&host_value) {
-            request.headers_mut().insert("host", value);
-        }
-    }
-
-    *request.uri_mut() = target_uri;
-
-    let is_https = request
-        .uri()
-        .scheme_str()
-        .is_some_and(|s| s.eq_ignore_ascii_case("https"));
-
-    tracing::trace!(%is_https, "proxy scheme determined");
-
     let effective_request_timeout = if proxy_context.request_timeout_override > 0 {
         proxy_context.request_timeout_override
     } else {
@@ -456,32 +425,11 @@ pub async fn handle_proxy_with_target(
         None
     };
 
-    let client_upgrade = if is_websocket {
-        Some(hyper::upgrade::on(&mut request))
-    } else {
-        None
-    };
-
-    let send_future = if is_https && upstream_skip_ssl {
-        clients.https_insecure_client.request(request)
-    } else if is_https {
-        clients.https_client.request(request)
-    } else {
-        clients.http_client.request(request)
-    };
-
-    let result = match request_timeout {
-        Some(timeout) => tokio::time::timeout(timeout, send_future).await,
-        None => Ok(send_future.await),
-    };
-
-    match result {
-        Ok(Ok(mut resp)) => {
-            tracing::debug!(status = %resp.status(), "proxy response received");
-            if let Err(e) =
-                headers::apply_response_headers(resp.headers_mut(), &proxy_context.header_policy)
-            {
-                tracing::error!(error = %e, "failed to apply response header policy");
+    if is_websocket {
+        let target_uri = match build_target_uri(&target_base, &forward_uri) {
+            Ok(uri) => uri,
+            Err(e) => {
+                tracing::error!(target_base = %target_base, error = %e, "failed to build target URI");
                 return Ok(record_proxy_outcome(
                     bad_gateway(),
                     metrics.as_deref(),
@@ -493,36 +441,68 @@ pub async fn handle_proxy_with_target(
                     &original_host,
                     &original_uri,
                     &target_base,
-                    Some(format!("failed to apply response header policy: {e}")),
+                    Some(format!("failed to build target URI: {e}")),
                 ));
             }
-            if is_websocket && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-                if let Some(client_upgrade) = client_upgrade {
-                    let upstream_upgrade = hyper::upgrade::on(&mut resp);
-                    tokio::spawn(async move {
-                        if let Err(e) = tunnel_upgraded(client_upgrade, upstream_upgrade).await {
-                            tracing::warn!(%e, "websocket tunnel closed with error");
-                        }
-                    });
+        };
+        set_target_request_parts(&mut request, target_uri);
+        let is_https = request
+            .uri()
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+        let client_upgrade = Some(hyper::upgrade::on(&mut request));
+        let send_future = send_upstream_request(&clients, request, is_https, upstream_skip_ssl);
+        let result = match request_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send_future).await,
+            None => Ok(send_future.await),
+        };
+
+        return match result {
+            Ok(Ok(mut resp)) => {
+                if let Err(e) = headers::apply_response_headers(
+                    resp.headers_mut(),
+                    &proxy_context.header_policy,
+                ) {
+                    return Ok(record_proxy_outcome(
+                        bad_gateway(),
+                        metrics.as_deref(),
+                        access_logger.as_deref(),
+                        &proxy_context.access,
+                        &proxy_context.metric_labels,
+                        start,
+                        &original_method,
+                        &original_host,
+                        &original_uri,
+                        &target_base,
+                        Some(format!("failed to apply response header policy: {e}")),
+                    ));
                 }
+                if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                    if let Some(client_upgrade) = client_upgrade {
+                        let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                        tokio::spawn(async move {
+                            if let Err(e) = tunnel_upgraded(client_upgrade, upstream_upgrade).await
+                            {
+                                tracing::warn!(%e, "websocket tunnel closed with error");
+                            }
+                        });
+                    }
+                }
+                Ok(record_proxy_outcome(
+                    resp.map(Body::new),
+                    metrics.as_deref(),
+                    access_logger.as_deref(),
+                    &proxy_context.access,
+                    &proxy_context.metric_labels,
+                    start,
+                    &original_method,
+                    &original_host,
+                    &original_uri,
+                    &target_base,
+                    None,
+                ))
             }
-            Ok(record_proxy_outcome(
-                resp.map(Body::new),
-                metrics.as_deref(),
-                access_logger.as_deref(),
-                &proxy_context.access,
-                &proxy_context.metric_labels,
-                start,
-                &original_method,
-                &original_host,
-                &original_uri,
-                &target_base,
-                None,
-            ))
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(target = %target_base, %is_https, %e, "proxy request failed");
-            Ok(record_proxy_outcome(
+            Ok(Err(e)) => Ok(record_proxy_outcome(
                 bad_gateway(),
                 metrics.as_deref(),
                 access_logger.as_deref(),
@@ -534,11 +514,8 @@ pub async fn handle_proxy_with_target(
                 &original_uri,
                 &target_base,
                 Some(e.to_string()),
-            ))
-        }
-        Err(_) => {
-            tracing::warn!("proxy request timed out");
-            Ok(record_proxy_outcome(
+            )),
+            Err(_) => Ok(record_proxy_outcome(
                 gateway_timeout(),
                 metrics.as_deref(),
                 access_logger.as_deref(),
@@ -550,9 +527,232 @@ pub async fn handle_proxy_with_target(
                 &original_uri,
                 &target_base,
                 Some("request timed out".to_string()),
-            ))
+            )),
+        };
+    }
+
+    let method = request.method().clone();
+    let version = request.version();
+    let headers = request.headers().clone();
+    let body_bytes = match request.into_body().collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(e) => {
+            return Ok(record_proxy_outcome(
+                bad_gateway(),
+                metrics.as_deref(),
+                access_logger.as_deref(),
+                &proxy_context.access,
+                &proxy_context.metric_labels,
+                start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &target_base,
+                Some(format!("failed to read request body: {e}")),
+            ));
+        }
+    };
+
+    let mut current_target_base = target_base;
+    let mut current_lease = proxy_context.target_lease.take();
+    let mut attempt_index = 0;
+
+    loop {
+        let target_uri = match build_target_uri(&current_target_base, &forward_uri) {
+            Ok(uri) => uri,
+            Err(e) => {
+                tracing::error!(target_base = %current_target_base, error = %e, "failed to build target URI");
+                return Ok(record_proxy_outcome(
+                    bad_gateway(),
+                    metrics.as_deref(),
+                    access_logger.as_deref(),
+                    &proxy_context.access,
+                    &proxy_context.metric_labels,
+                    start,
+                    &original_method,
+                    &original_host,
+                    &original_uri,
+                    &current_target_base,
+                    Some(format!("failed to build target URI: {e}")),
+                ));
+            }
+        };
+        let is_https = target_uri
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"));
+        let mut attempt_request = Request::new(Body::from(body_bytes.clone()));
+        *attempt_request.method_mut() = method.clone();
+        *attempt_request.version_mut() = version;
+        *attempt_request.headers_mut() = headers.clone();
+        set_target_request_parts(&mut attempt_request, target_uri);
+
+        let send_future =
+            send_upstream_request(&clients, attempt_request, is_https, upstream_skip_ssl);
+        let result = match request_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send_future).await,
+            None => Ok(send_future.await),
+        };
+
+        match result {
+            Ok(Ok(mut resp)) => {
+                let status = resp.status();
+                if should_retry(
+                    &proxy_context.retry_policy,
+                    attempt_index,
+                    AttemptOutcome::Response(status),
+                ) {
+                    if let Some(next_target) =
+                        next_retry_target(&proxy_context, Some(current_target_base.as_str()))
+                    {
+                        drop(current_lease.take());
+                        current_target_base = next_target.url;
+                        current_lease = Some(next_target.active_connection);
+                        attempt_index += 1;
+                        continue;
+                    }
+                }
+                tracing::debug!(status = %resp.status(), "proxy response received");
+                if let Err(e) = headers::apply_response_headers(
+                    resp.headers_mut(),
+                    &proxy_context.header_policy,
+                ) {
+                    tracing::error!(error = %e, "failed to apply response header policy");
+                    return Ok(record_proxy_outcome(
+                        bad_gateway(),
+                        metrics.as_deref(),
+                        access_logger.as_deref(),
+                        &proxy_context.access,
+                        &proxy_context.metric_labels,
+                        start,
+                        &original_method,
+                        &original_host,
+                        &original_uri,
+                        &current_target_base,
+                        Some(format!("failed to apply response header policy: {e}")),
+                    ));
+                }
+                return Ok(record_proxy_outcome(
+                    resp.map(Body::new),
+                    metrics.as_deref(),
+                    access_logger.as_deref(),
+                    &proxy_context.access,
+                    &proxy_context.metric_labels,
+                    start,
+                    &original_method,
+                    &original_host,
+                    &original_uri,
+                    &current_target_base,
+                    None,
+                ));
+            }
+            Ok(Err(e)) => {
+                if should_retry(
+                    &proxy_context.retry_policy,
+                    attempt_index,
+                    AttemptOutcome::ConnectError,
+                ) {
+                    if let Some(next_target) =
+                        next_retry_target(&proxy_context, Some(current_target_base.as_str()))
+                    {
+                        drop(current_lease.take());
+                        current_target_base = next_target.url;
+                        current_lease = Some(next_target.active_connection);
+                        attempt_index += 1;
+                        continue;
+                    }
+                }
+                tracing::warn!(target = %current_target_base, %is_https, %e, "proxy request failed");
+                return Ok(record_proxy_outcome(
+                    bad_gateway(),
+                    metrics.as_deref(),
+                    access_logger.as_deref(),
+                    &proxy_context.access,
+                    &proxy_context.metric_labels,
+                    start,
+                    &original_method,
+                    &original_host,
+                    &original_uri,
+                    &current_target_base,
+                    Some(e.to_string()),
+                ));
+            }
+            Err(_) => {
+                if should_retry(
+                    &proxy_context.retry_policy,
+                    attempt_index,
+                    AttemptOutcome::Timeout,
+                ) {
+                    if let Some(next_target) =
+                        next_retry_target(&proxy_context, Some(current_target_base.as_str()))
+                    {
+                        drop(current_lease.take());
+                        current_target_base = next_target.url;
+                        current_lease = Some(next_target.active_connection);
+                        attempt_index += 1;
+                        continue;
+                    }
+                }
+                tracing::warn!("proxy request timed out");
+                return Ok(record_proxy_outcome(
+                    gateway_timeout(),
+                    metrics.as_deref(),
+                    access_logger.as_deref(),
+                    &proxy_context.access,
+                    &proxy_context.metric_labels,
+                    start,
+                    &original_method,
+                    &original_host,
+                    &original_uri,
+                    &current_target_base,
+                    Some("request timed out".to_string()),
+                ));
+            }
         }
     }
+}
+
+async fn send_upstream_request(
+    clients: &ProxyClients,
+    request: Request<Body>,
+    is_https: bool,
+    upstream_skip_ssl: bool,
+) -> Result<Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
+    if is_https && upstream_skip_ssl {
+        clients.https_insecure_client.request(request).await
+    } else if is_https {
+        clients.https_client.request(request).await
+    } else {
+        clients.http_client.request(request).await
+    }
+}
+
+fn set_target_request_parts(request: &mut Request<Body>, target_uri: Uri) {
+    if let Some(host) = target_uri.host() {
+        let host_value = if let Some(port) = target_uri.port_u16() {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        if let Ok(value) = http::HeaderValue::from_str(&host_value) {
+            request.headers_mut().insert(header::HOST, value);
+        }
+    }
+    *request.uri_mut() = target_uri;
+}
+
+fn next_retry_target(
+    proxy_context: &ProxyRequestContext,
+    excluded_url: Option<&str>,
+) -> Option<SelectedTarget> {
+    let balancer = proxy_context.balancer.as_ref()?;
+    balancer.select_excluding(
+        &proxy_context.metric_labels.upstream,
+        BalanceContext {
+            client_ip: Some(proxy_context.balance_client_ip.as_str()),
+            path: proxy_context.balance_path.as_str(),
+        },
+        excluded_url,
+    )
 }
 
 struct ActiveConnectionGuard {
