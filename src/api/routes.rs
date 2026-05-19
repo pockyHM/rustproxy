@@ -900,6 +900,7 @@ async fn proxy_handler(
         target_base,
         rule_request_timeout,
         metric_labels,
+        header_policy,
         target_lease,
     ) = {
         let runtime = state.proxy_runtime.load();
@@ -932,6 +933,7 @@ async fn proxy_handler(
                                 rule_label,
                                 rule.upstream.clone(),
                                 rule.request_timeout,
+                                rule.header_policy.clone(),
                                 target.url,
                                 target.active_connection,
                             )
@@ -942,8 +944,8 @@ async fn proxy_handler(
         let listen_label = listen_addr
             .clone()
             .unwrap_or_else(|| config.proxy_listen.clone());
-        let (target_base, rule_request_timeout, metric_labels, target_lease) = match selected {
-            Some((rule, upstream, request_timeout, target, target_lease)) => (
+        let (target_base, rule_request_timeout, metric_labels, header_policy, target_lease) = match selected {
+            Some((rule, upstream, request_timeout, header_policy, target, target_lease)) => (
                 target,
                 request_timeout,
                 ProxyMetricLabels {
@@ -951,12 +953,14 @@ async fn proxy_handler(
                     rule,
                     upstream,
                 },
+                header_policy,
                 Some(target_lease),
             ),
             None => (
                 config.fallback.url.clone(),
                 0,
                 ProxyMetricLabels::fallback(listen_label),
+                Default::default(),
                 None,
             ),
         };
@@ -967,6 +971,7 @@ async fn proxy_handler(
             target_base,
             rule_request_timeout,
             metric_labels,
+            header_policy,
             target_lease,
         )
     };
@@ -982,6 +987,7 @@ async fn proxy_handler(
             access: ProxyAccessLogContext { source },
             metric_labels,
             request_timeout_override: rule_request_timeout,
+            header_policy,
             target_lease,
         },
     )

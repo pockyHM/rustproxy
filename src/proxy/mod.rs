@@ -1,4 +1,5 @@
 pub mod balancer;
+pub mod headers;
 pub mod health;
 pub mod matcher;
 pub mod upstream;
@@ -13,6 +14,7 @@ use rustls_native_certs::load_native_certs;
 
 use crate::{
     config::yaml::AppConfig,
+    models::HeaderPolicy,
     observability::{
         access_log::{AccessLogEntry, AccessLogger},
         metrics::ProxyMetrics,
@@ -113,6 +115,7 @@ pub struct ProxyRequestContext {
     pub access: ProxyAccessLogContext,
     pub metric_labels: ProxyMetricLabels,
     pub request_timeout_override: u64,
+    pub header_policy: HeaderPolicy,
     pub target_lease: Option<TargetLease>,
 }
 
@@ -296,6 +299,23 @@ pub async fn handle_proxy_with_target(
         ));
     }
 
+    if let Err(e) = headers::apply_request_headers(request.headers_mut(), &proxy_context.header_policy) {
+        tracing::error!(error = %e, "failed to apply request header policy");
+        return Ok(record_proxy_outcome(
+            bad_gateway(),
+            metrics.as_deref(),
+            access_logger.as_deref(),
+            &proxy_context.access,
+            &proxy_context.metric_labels,
+            start,
+            &original_method,
+            &original_host,
+            &original_uri,
+            &target_base,
+            Some(format!("failed to apply request header policy: {e}")),
+        ));
+    }
+
     // Set the Host header to match the target
     if let Some(host) = target_uri.host() {
         let host_value = if let Some(port) = target_uri.port_u16() {
@@ -350,6 +370,24 @@ pub async fn handle_proxy_with_target(
     match result {
         Ok(Ok(mut resp)) => {
             tracing::debug!(status = %resp.status(), "proxy response received");
+            if let Err(e) =
+                headers::apply_response_headers(resp.headers_mut(), &proxy_context.header_policy)
+            {
+                tracing::error!(error = %e, "failed to apply response header policy");
+                return Ok(record_proxy_outcome(
+                    bad_gateway(),
+                    metrics.as_deref(),
+                    access_logger.as_deref(),
+                    &proxy_context.access,
+                    &proxy_context.metric_labels,
+                    start,
+                    &original_method,
+                    &original_host,
+                    &original_uri,
+                    &target_base,
+                    Some(format!("failed to apply response header policy: {e}")),
+                ));
+            }
             if is_websocket && resp.status() == StatusCode::SWITCHING_PROTOCOLS {
                 if let Some(client_upgrade) = client_upgrade {
                     let upstream_upgrade = hyper::upgrade::on(&mut resp);
