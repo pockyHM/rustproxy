@@ -43,6 +43,8 @@ mod tests {
                 },
             ],
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
         let json = serde_json::to_string(&upstream).unwrap();
         let parsed: Upstream = serde_json::from_str(&json).unwrap();
@@ -65,6 +67,8 @@ mod tests {
                 weight: 100,
             }],
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
         assert_eq!(upstream.targets.len(), 1);
         assert_eq!(upstream.targets[0].url, "http://localhost:9090");
@@ -87,6 +91,8 @@ mod tests {
                 },
             ],
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
         let cloned = upstream.clone();
         assert_eq!(upstream, cloned);
@@ -113,6 +119,8 @@ mod tests {
             websocket: false,
             targets: vec![],
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
         let debug_str = format!("{:?}", upstream);
         assert!(debug_str.contains("debug-upstream"));
@@ -152,12 +160,48 @@ targets:
         assert!(!upstream.health_check.enabled);
         assert_eq!(upstream.health_check.mode, HealthCheckMode::Tcp);
     }
+
+    #[test]
+    fn test_upstream_policy_defaults() {
+        let yaml = r#"
+name: api
+targets:
+  - url: http://127.0.0.1:8080
+    weight: 100
+"#;
+        let upstream: Upstream = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(upstream.balance, BalanceAlgorithm::WeightedRoundRobin);
+        assert_eq!(upstream.retry.attempts, 0);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Target {
     pub url: String,
     pub weight: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceAlgorithm {
+    #[default]
+    WeightedRoundRobin,
+    LeastConnections,
+    IpHash,
+    ConsistentHash,
+    UrlHash,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub retry_on_status: Vec<u16>,
+    #[serde(default)]
+    pub retry_on_timeout: bool,
+    #[serde(default)]
+    pub retry_on_connect_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -236,4 +280,8 @@ pub struct Upstream {
     pub targets: Vec<Target>,
     #[serde(default)]
     pub health_check: HealthCheck,
+    #[serde(default)]
+    pub balance: BalanceAlgorithm,
+    #[serde(default)]
+    pub retry: RetryPolicy,
 }

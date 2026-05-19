@@ -124,6 +124,8 @@ mod tests {
             websocket: false,
             targets,
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         }
     }
 
@@ -225,6 +227,8 @@ mod tests {
             websocket: false,
             targets: vec![target("http://a", 1), target("http://b", 1)],
             health_check: check.clone(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
         health.record_probe_result(
             &HealthRegistry::target_key("backend", "http://a"),

@@ -3,7 +3,7 @@ use std::fs;
 
 use crate::cli::{RuleCommands, UpstreamCommands};
 use crate::config::yaml::{AccessLogLevel, AppConfig, Fallback};
-use crate::db::{Database, migration};
+use crate::db::{migration, Database};
 use crate::models::{
     ConditionExpr, ConditionType, HostMatchType, HostMatcher, LocationMatchType, LocationMatcher,
     Operator, Rule, Target, Upstream,
@@ -81,6 +81,8 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
                     websocket: false,
                     targets: vec![Target { url, weight }],
                     health_check: Default::default(),
+                    balance: Default::default(),
+                    retry: Default::default(),
                 },
             );
             db.save_full_config(&config)?;
@@ -171,6 +173,9 @@ pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
                 listen,
                 request_timeout: 0,
                 tls: None,
+                header_policy: Default::default(),
+                path_actions: Vec::new(),
+                limit_policy: Default::default(),
             });
             config
                 .rules

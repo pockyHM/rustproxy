@@ -117,6 +117,9 @@ mod tests {
             listen: None,
             request_timeout: 0,
             tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         };
         let json = serde_json::to_string(&rule).unwrap();
         let parsed: Rule = serde_json::from_str(&json).unwrap();
@@ -197,6 +200,9 @@ mod tests {
             listen: None,
             request_timeout: 0,
             tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         };
         let json = serde_json::to_string(&rule).unwrap();
         let parsed: Rule = serde_json::from_str(&json).unwrap();
@@ -222,9 +228,24 @@ mod tests {
             listen: None,
             request_timeout: 0,
             tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         };
         let rule2 = rule1.clone();
         assert_eq!(rule1, rule2);
+    }
+
+    #[test]
+    fn test_rule_policy_defaults() {
+        let json = r#"{
+            "id":"r1","name":"R1","priority":10,"upstream":"api","weight":100
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(rule.header_policy.request.is_empty());
+        assert!(rule.header_policy.response.is_empty());
+        assert!(rule.path_actions.is_empty());
+        assert_eq!(rule.limit_policy.rate_per_second, None);
     }
 
     #[test]
@@ -243,6 +264,9 @@ mod tests {
             listen: None,
             request_timeout: 0,
             tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         };
 
         let yaml = crate::config::yaml::AppConfig {
@@ -334,6 +358,72 @@ pub struct Rule {
     /// Request timeout override in seconds. 0 inherits the global request_timeout.
     pub request_timeout: u64,
     pub tls: Option<RuleTls>,
+    pub header_policy: HeaderPolicy,
+    pub path_actions: Vec<PathAction>,
+    pub limit_policy: LimitPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderMutationOp {
+    Set,
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeaderMutation {
+    pub op: HeaderMutationOp,
+    pub name: String,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HeaderPolicy {
+    #[serde(default)]
+    pub request: Vec<HeaderMutation>,
+    #[serde(default)]
+    pub response: Vec<HeaderMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathAction {
+    StripPrefix {
+        prefix: String,
+    },
+    Rewrite {
+        pattern: String,
+        replacement: String,
+    },
+    Redirect {
+        status: u16,
+        location: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LimitPolicy {
+    #[serde(default)]
+    pub rate_per_second: Option<u32>,
+    #[serde(default)]
+    pub rate_key: RateLimitKey,
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKey {
+    #[default]
+    Ip,
+    Host,
+    Route,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -438,7 +528,7 @@ impl Serialize for Rule {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Rule", 12)?;
+        let mut state = serializer.serialize_struct("Rule", 16)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("priority", &self.priority)?;
@@ -452,6 +542,9 @@ impl Serialize for Rule {
         state.serialize_field("listen", &self.listen)?;
         state.serialize_field("request_timeout", &self.request_timeout)?;
         state.serialize_field("tls", &self.tls)?;
+        state.serialize_field("header_policy", &self.header_policy)?;
+        state.serialize_field("path_actions", &self.path_actions)?;
+        state.serialize_field("limit_policy", &self.limit_policy)?;
         state.end()
     }
 }
@@ -485,6 +578,12 @@ impl<'de> Deserialize<'de> for Rule {
             request_timeout: u64,
             #[serde(default)]
             tls: Option<RuleTls>,
+            #[serde(default)]
+            header_policy: HeaderPolicy,
+            #[serde(default)]
+            path_actions: Vec<PathAction>,
+            #[serde(default)]
+            limit_policy: LimitPolicy,
         }
         let helper = RuleHelper::deserialize(deserializer)?;
         Ok(Rule {
@@ -501,6 +600,9 @@ impl<'de> Deserialize<'de> for Rule {
             listen: helper.listen,
             request_timeout: helper.request_timeout,
             tls: helper.tls,
+            header_policy: helper.header_policy,
+            path_actions: helper.path_actions,
+            limit_policy: helper.limit_policy,
         })
     }
 }

@@ -287,6 +287,32 @@ fn compact_known_disabled_sections(mapping: &mut serde_yaml::Mapping) {
     {
         mapping.remove(&key("request_timeout"));
     }
+
+    if string_field(mapping, "rate_key") == Some("ip")
+        && mapping.contains_key(&key("rate_per_second"))
+        && mapping.contains_key(&key("max_connections"))
+        && mapping.contains_key(&key("max_body_bytes"))
+        && mapping.contains_key(&key("queue_timeout_ms"))
+    {
+        mapping.remove(&key("rate_key"));
+    }
+
+    if string_field(mapping, "balance") == Some("weighted_round_robin") {
+        mapping.remove(&key("balance"));
+    }
+
+    if numeric_field(mapping, "attempts") == Some(0)
+        && mapping.contains_key(&key("retry_on_timeout"))
+        && mapping.contains_key(&key("retry_on_connect_error"))
+    {
+        mapping.remove(&key("attempts"));
+    }
+    if bool_field(mapping, "retry_on_timeout") == Some(false) {
+        mapping.remove(&key("retry_on_timeout"));
+    }
+    if bool_field(mapping, "retry_on_connect_error") == Some(false) {
+        mapping.remove(&key("retry_on_connect_error"));
+    }
 }
 
 fn bool_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<bool> {
@@ -299,6 +325,13 @@ fn bool_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<bool> {
 fn numeric_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<i64> {
     match mapping.get(&key(field)) {
         Some(serde_yaml::Value::Number(value)) => value.as_i64(),
+        _ => None,
+    }
+}
+
+fn string_field<'a>(mapping: &'a serde_yaml::Mapping, field: &str) -> Option<&'a str> {
+    match mapping.get(&key(field)) {
+        Some(serde_yaml::Value::String(value)) => Some(value),
         _ => None,
     }
 }
@@ -446,6 +479,8 @@ fallback:
                     weight: 100,
                 }],
                 health_check: Default::default(),
+                balance: Default::default(),
+                retry: Default::default(),
             },
         );
         let config = AppConfig {
@@ -494,6 +529,9 @@ fallback:
                 listen: None,
                 request_timeout: 0,
                 tls: None,
+                header_policy: Default::default(),
+                path_actions: Vec::new(),
+                limit_policy: Default::default(),
             }],
             upstreams,
             fallback: Fallback {
@@ -510,6 +548,11 @@ fallback:
         assert!(yaml.contains("health_check:"));
         assert!(!yaml.contains("expected_status:"));
         assert!(!yaml.contains("request_timeout: 0"));
+        assert!(!yaml.contains("header_policy:"));
+        assert!(!yaml.contains("path_actions:"));
+        assert!(!yaml.contains("limit_policy:"));
+        assert!(!yaml.contains("balance: weighted_round_robin"));
+        assert!(!yaml.contains("retry:"));
         assert!(!yaml.contains("certificates: []"));
         assert!(!yaml.contains("path: /tmp/access.log"));
     }

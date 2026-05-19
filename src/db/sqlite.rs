@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::config::yaml::{
     AccessLogConfig, AppConfig, Certificate, Fallback, MonitoringConfig, TlsListener,
@@ -435,6 +435,9 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
                 enabled: tls_enabled,
                 certificate,
             }),
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         })
     })?;
 
@@ -475,6 +478,8 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
             websocket,
             targets,
             health_check,
+            balance: Default::default(),
+            retry: Default::default(),
         });
     }
     Ok(upstreams)
@@ -1022,6 +1027,9 @@ mod tests {
                 listen: None,
                 request_timeout: 0,
                 tls: None,
+                header_policy: Default::default(),
+                path_actions: Vec::new(),
+                limit_policy: Default::default(),
             }],
             upstreams: {
                 let mut m = HashMap::new();
@@ -1042,6 +1050,8 @@ mod tests {
                             },
                         ],
                         health_check: Default::default(),
+                        balance: Default::default(),
+                        retry: Default::default(),
                     },
                 );
                 m
@@ -1126,6 +1136,9 @@ mod tests {
             listen: None,
             request_timeout: 7,
             tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         };
         db.update_rule(&updated_rule).unwrap();
         let rules = db.list_rules().unwrap();
@@ -1156,6 +1169,8 @@ mod tests {
                 weight: 100,
             }],
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
         db.create_upstream(&new_upstream).unwrap();
         assert_eq!(db.list_upstreams().unwrap().len(), 2);

@@ -31,6 +31,8 @@ mod tests {
                 },
             ],
             health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
         };
 
         let targets = selectable_targets(&upstream);

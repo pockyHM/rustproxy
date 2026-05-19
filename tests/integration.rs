@@ -17,6 +17,8 @@ fn build_config() -> AppConfig {
             weight: 100,
         }],
         health_check: Default::default(),
+        balance: Default::default(),
+        retry: Default::default(),
     };
 
     let mut upstreams = HashMap::new();
@@ -45,6 +47,9 @@ fn build_config() -> AppConfig {
             listen: None,
             request_timeout: 0,
             tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
         }],
         upstreams,
         fallback: Fallback {
