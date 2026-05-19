@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
-use crate::models::Upstream;
+use crate::models::{BalanceAlgorithm, Upstream};
 use crate::proxy::health::HealthRegistry;
 
 pub struct Balancer {
@@ -9,16 +11,43 @@ pub struct Balancer {
     health: Option<HealthRegistry>,
 }
 
+pub struct BalanceContext<'a> {
+    pub client_ip: Option<&'a str>,
+    pub path: &'a str,
+}
+
+#[derive(Debug)]
+pub struct SelectedTarget {
+    pub url: String,
+    pub upstream: String,
+    pub active_connection: TargetLease,
+}
+
+#[derive(Debug)]
+pub struct TargetLease {
+    active_connections: Arc<AtomicU32>,
+}
+
+impl Drop for TargetLease {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct WeightedUpstream {
+    name: String,
+    balance: BalanceAlgorithm,
     targets: Vec<WeightedTarget>,
     total_weight: u32,
     counter: AtomicU32,
+    hash_ring: Vec<(u64, usize)>,
 }
 
 struct WeightedTarget {
     url: String,
     health_key: Option<String>,
     cumulative_weight: u32,
+    active_connections: Arc<AtomicU32>,
 }
 
 impl Balancer {
@@ -38,12 +67,37 @@ impl Balancer {
         Self { upstreams, health }
     }
 
-    pub fn select(&self, upstream_name: &str) -> Option<String> {
+    pub fn select(&self, upstream_name: &str, ctx: BalanceContext<'_>) -> Option<SelectedTarget> {
         let upstream = self.upstreams.get(upstream_name)?;
         if upstream.targets.is_empty() || upstream.total_weight == 0 {
             return None;
         }
 
+        let target = match upstream.balance {
+            BalanceAlgorithm::WeightedRoundRobin => self.select_weighted_round_robin(upstream),
+            BalanceAlgorithm::LeastConnections => self.select_least_connections(upstream),
+            BalanceAlgorithm::IpHash => {
+                let key = ctx.client_ip.unwrap_or(ctx.path);
+                self.select_modulo_hash(upstream, key)
+            }
+            BalanceAlgorithm::UrlHash => self.select_modulo_hash(upstream, ctx.path),
+            BalanceAlgorithm::ConsistentHash => self.select_consistent_hash(upstream, ctx.path),
+        }?;
+
+        target.active_connections.fetch_add(1, Ordering::Relaxed);
+        Some(SelectedTarget {
+            url: target.url.clone(),
+            upstream: upstream.name.clone(),
+            active_connection: TargetLease {
+                active_connections: Arc::clone(&target.active_connections),
+            },
+        })
+    }
+
+    fn select_weighted_round_robin<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+    ) -> Option<&'a WeightedTarget> {
         let slot = upstream.counter.fetch_add(1, Ordering::Relaxed) % upstream.total_weight;
         let idx = upstream
             .targets
@@ -53,10 +107,60 @@ impl Balancer {
             let idx = (idx + offset) % upstream.targets.len();
             let target = &upstream.targets[idx];
             if self.target_is_healthy(target) {
-                return Some(target.url.clone());
+                return Some(target);
             }
         }
 
+        None
+    }
+
+    fn select_least_connections<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+    ) -> Option<&'a WeightedTarget> {
+        upstream
+            .targets
+            .iter()
+            .filter(|target| self.target_is_healthy(target))
+            .min_by_key(|target| target.active_connections.load(Ordering::Relaxed))
+    }
+
+    fn select_modulo_hash<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+        key: &str,
+    ) -> Option<&'a WeightedTarget> {
+        let healthy: Vec<&WeightedTarget> = upstream
+            .targets
+            .iter()
+            .filter(|target| self.target_is_healthy(target))
+            .collect();
+        if healthy.is_empty() {
+            return None;
+        }
+        let idx = (stable_hash(&key) as usize) % healthy.len();
+        Some(healthy[idx])
+    }
+
+    fn select_consistent_hash<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+        key: &str,
+    ) -> Option<&'a WeightedTarget> {
+        if upstream.hash_ring.is_empty() {
+            return self.select_modulo_hash(upstream, key);
+        }
+        let key_hash = stable_hash(&key);
+        let start = upstream
+            .hash_ring
+            .partition_point(|(hash, _)| *hash < key_hash);
+        for offset in 0..upstream.hash_ring.len() {
+            let idx = (start + offset) % upstream.hash_ring.len();
+            let target = &upstream.targets[upstream.hash_ring[idx].1];
+            if self.target_is_healthy(target) {
+                return Some(target);
+            }
+        }
         None
     }
 
@@ -75,6 +179,7 @@ impl WeightedUpstream {
         let mut total_weight = 0u32;
         let mut targets = Vec::new();
         let upstream_name = upstream.name;
+        let balance = upstream.balance;
         let health_enabled = upstream.health_check.enabled;
 
         for target in upstream
@@ -92,21 +197,41 @@ impl WeightedUpstream {
                 url: target.url,
                 health_key,
                 cumulative_weight: total_weight,
+                active_connections: Arc::new(AtomicU32::new(0)),
             });
         }
 
+        let mut hash_ring = Vec::new();
+        if matches!(balance, BalanceAlgorithm::ConsistentHash) {
+            for (idx, target) in targets.iter().enumerate() {
+                for replica in 0..128 {
+                    hash_ring.push((stable_hash(&format!("{}#{replica}", target.url)), idx));
+                }
+            }
+            hash_ring.sort_by_key(|(hash, _)| *hash);
+        }
+
         Self {
+            name: upstream_name,
+            balance,
             targets,
             total_weight,
             counter: AtomicU32::new(0),
+            hash_ring,
         }
     }
 }
 
+fn stable_hash<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Balancer;
-    use crate::models::{HealthCheck, Target, Upstream};
+    use super::{BalanceContext, Balancer};
+    use crate::models::{BalanceAlgorithm, HealthCheck, Target, Upstream};
     use crate::proxy::health::HealthRegistry;
     use std::collections::HashMap;
 
@@ -129,6 +254,21 @@ mod tests {
         }
     }
 
+    fn upstream_with_algorithm(
+        name: &str,
+        targets: Vec<Target>,
+        balance: BalanceAlgorithm,
+    ) -> Upstream {
+        Upstream {
+            balance,
+            ..upstream(name, targets)
+        }
+    }
+
+    fn ctx<'a>(client_ip: Option<&'a str>, path: &'a str) -> BalanceContext<'a> {
+        BalanceContext { client_ip, path }
+    }
+
     fn balancer_with(upstream: Upstream) -> Balancer {
         let mut upstreams = HashMap::new();
         upstreams.insert(upstream.name.clone(), upstream);
@@ -144,7 +284,7 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..30 {
-            let selected = balancer.select("backend").unwrap();
+            let selected = balancer.select("backend", ctx(None, "/")).unwrap().url;
             *counts.entry(selected).or_insert(0) += 1;
         }
 
@@ -164,7 +304,7 @@ mod tests {
         ));
 
         let selections: Vec<String> = (0..6)
-            .map(|_| balancer.select("backend").unwrap())
+            .map(|_| balancer.select("backend", ctx(None, "/")).unwrap().url)
             .collect();
 
         assert_eq!(
@@ -184,21 +324,21 @@ mod tests {
     fn returns_none_for_missing_upstream() {
         let balancer = Balancer::new(HashMap::new());
 
-        assert_eq!(balancer.select("missing"), None);
+        assert!(balancer.select("missing", ctx(None, "/")).is_none());
     }
 
     #[test]
     fn returns_none_for_upstream_without_targets() {
         let balancer = balancer_with(upstream("backend", vec![]));
 
-        assert_eq!(balancer.select("backend"), None);
+        assert!(balancer.select("backend", ctx(None, "/")).is_none());
     }
 
     #[test]
     fn returns_none_for_upstream_without_selectable_targets() {
         let balancer = balancer_with(upstream("backend", vec![target("http://a", 0)]));
 
-        assert_eq!(balancer.select("backend"), None);
+        assert!(balancer.select("backend", ctx(None, "/")).is_none());
     }
 
     #[test]
@@ -209,8 +349,118 @@ mod tests {
         ));
 
         for _ in 0..3 {
-            assert_eq!(balancer.select("backend"), Some("http://b".to_string()));
+            assert_eq!(
+                balancer.select("backend", ctx(None, "/")).unwrap().url,
+                "http://b".to_string()
+            );
         }
+    }
+
+    #[test]
+    fn least_connections_selects_lowest_active_target() {
+        let balancer = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+            BalanceAlgorithm::LeastConnections,
+        ));
+
+        let first = balancer.select("backend", ctx(None, "/")).unwrap();
+        let second = balancer.select("backend", ctx(None, "/")).unwrap();
+
+        assert_ne!(first.url, second.url);
+    }
+
+    #[test]
+    fn ip_hash_maps_same_client_to_same_target() {
+        let balancer = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+            BalanceAlgorithm::IpHash,
+        ));
+
+        let first = balancer
+            .select("backend", ctx(Some("203.0.113.7"), "/users"))
+            .unwrap()
+            .url;
+        let second = balancer
+            .select("backend", ctx(Some("203.0.113.7"), "/orders"))
+            .unwrap()
+            .url;
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn url_hash_maps_same_path_to_same_target() {
+        let balancer = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+            BalanceAlgorithm::UrlHash,
+        ));
+
+        let first = balancer
+            .select("backend", ctx(Some("203.0.113.7"), "/cache/item"))
+            .unwrap()
+            .url;
+        let second = balancer
+            .select("backend", ctx(Some("198.51.100.9"), "/cache/item"))
+            .unwrap()
+            .url;
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn consistent_hash_remaps_fewer_keys_than_modulo_when_target_removed() {
+        let full = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![
+                target("http://a", 1),
+                target("http://b", 1),
+                target("http://c", 1),
+            ],
+            BalanceAlgorithm::ConsistentHash,
+        ));
+        let reduced = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+            BalanceAlgorithm::ConsistentHash,
+        ));
+        let modulo_full = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![
+                target("http://a", 1),
+                target("http://b", 1),
+                target("http://c", 1),
+            ],
+            BalanceAlgorithm::UrlHash,
+        ));
+        let modulo_reduced = balancer_with(upstream_with_algorithm(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+            BalanceAlgorithm::UrlHash,
+        ));
+
+        let keys: Vec<String> = (0..1000).map(|idx| format!("/key/{idx}")).collect();
+        let consistent_remaps = keys
+            .iter()
+            .filter(|key| {
+                full.select("backend", ctx(None, key)).unwrap().url
+                    != reduced.select("backend", ctx(None, key)).unwrap().url
+            })
+            .count();
+        let modulo_remaps = keys
+            .iter()
+            .filter(|key| {
+                modulo_full.select("backend", ctx(None, key)).unwrap().url
+                    != modulo_reduced
+                        .select("backend", ctx(None, key))
+                        .unwrap()
+                        .url
+            })
+            .count();
+
+        assert!(consistent_remaps < modulo_remaps);
     }
 
     #[test]
@@ -240,7 +490,10 @@ mod tests {
         let balancer = Balancer::new_with_health(upstreams, Some(health));
 
         for _ in 0..4 {
-            assert_eq!(balancer.select("backend"), Some("http://b".to_string()));
+            assert_eq!(
+                balancer.select("backend", ctx(None, "/")).unwrap().url,
+                "http://b".to_string()
+            );
         }
     }
 }

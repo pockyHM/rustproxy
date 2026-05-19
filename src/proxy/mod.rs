@@ -6,7 +6,7 @@ pub mod upstream;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::body::Body;
-use http::{HeaderMap, Request, Response, StatusCode, Uri, header};
+use http::{header, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_native_certs::load_native_certs;
@@ -17,6 +17,7 @@ use crate::{
         access_log::{AccessLogEntry, AccessLogger},
         metrics::ProxyMetrics,
     },
+    proxy::balancer::TargetLease,
 };
 
 // ── TLS verification bypass ──
@@ -107,11 +108,12 @@ pub struct ProxyAccessLogContext {
     pub source: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ProxyRequestContext {
     pub access: ProxyAccessLogContext,
     pub metric_labels: ProxyMetricLabels,
     pub request_timeout_override: u64,
+    pub target_lease: Option<TargetLease>,
 }
 
 impl ProxyClients {
@@ -609,8 +611,8 @@ fn websocket_disabled() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyMetricLabels, build_target_uri, is_websocket_upgrade, not_found_page,
-        record_proxy_metrics,
+        build_target_uri, is_websocket_upgrade, not_found_page, record_proxy_metrics,
+        ProxyMetricLabels,
     };
     use crate::observability::metrics::ProxyMetrics;
     use axum::body::Body;

@@ -4,7 +4,10 @@ use http::Request;
 use rustproxy::{
     config::yaml::{AppConfig, Fallback},
     models::{ConditionExpr, ConditionType, Operator, Rule, Target, Upstream},
-    proxy::{balancer::Balancer, matcher::Matcher},
+    proxy::{
+        balancer::{BalanceContext, Balancer},
+        matcher::Matcher,
+    },
 };
 
 fn build_config() -> AppConfig {
@@ -84,12 +87,18 @@ async fn test_header_routing() {
         .match_request(&request, None)
         .expect("header should match canary rule");
     let selected_target = balancer
-        .select(&matched_rule.upstream)
+        .select(
+            &matched_rule.upstream,
+            BalanceContext {
+                client_ip: None,
+                path: request.uri().path(),
+            },
+        )
         .expect("matched upstream should have a selectable target");
 
     assert_eq!(matched_rule.id, "canary-header");
     assert_eq!(matched_rule.upstream, "canary");
-    assert_eq!(selected_target, "http://canary.internal:8080");
+    assert_eq!(selected_target.url, "http://canary.internal:8080");
 }
 
 #[tokio::test]
@@ -101,7 +110,16 @@ async fn test_fallback_when_header_does_not_match() {
 
     let selected_target = matcher
         .match_request(&request, None)
-        .and_then(|rule| balancer.select(&rule.upstream))
+        .and_then(|rule| {
+            balancer.select(
+                &rule.upstream,
+                BalanceContext {
+                    client_ip: None,
+                    path: request.uri().path(),
+                },
+            )
+        })
+        .map(|target| target.url)
         .unwrap_or_else(|| config.fallback.url.clone());
 
     assert!(matcher.match_request(&request, None).is_none());

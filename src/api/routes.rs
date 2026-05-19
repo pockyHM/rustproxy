@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -7,18 +7,18 @@ use std::{
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use axum::{
-    Router,
     body::Body,
     extract::{ConnectInfo, Extension, State},
     http::{Request, Response, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{any, get, post, put},
+    Router,
 };
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use rustls::pki_types::pem::PemObject;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tower_http::trace::TraceLayer;
@@ -29,13 +29,13 @@ use crate::{
     config::yaml::AppConfig,
     db::Database,
     observability::{access_log::AccessLogger, metrics::ProxyMetrics},
-    proxy::ProxyClients,
-    proxy::balancer::Balancer,
-    proxy::health::{ConfigSnapshot, HealthRegistry, run_health_checks},
+    proxy::balancer::{BalanceContext, Balancer},
+    proxy::health::{run_health_checks, ConfigSnapshot, HealthRegistry},
     proxy::matcher::Matcher,
     proxy::request_for_matching,
+    proxy::ProxyClients,
     proxy::{
-        ProxyAccessLogContext, ProxyMetricLabels, ProxyRequestContext, handle_proxy_with_target,
+        handle_proxy_with_target, ProxyAccessLogContext, ProxyMetricLabels, ProxyRequestContext,
     },
 };
 
@@ -892,7 +892,16 @@ async fn proxy_handler(
             })
     });
 
-    let (config, clients, access_logger, target_base, rule_request_timeout, metric_labels) = {
+    let request_path = request.uri().path().to_string();
+    let (
+        config,
+        clients,
+        access_logger,
+        target_base,
+        rule_request_timeout,
+        metric_labels,
+        target_lease,
+    ) = {
         let runtime = state.proxy_runtime.load();
         let config = runtime.config.clone();
         let clients = runtime.clients.clone();
@@ -909,22 +918,32 @@ async fn proxy_handler(
                     } else {
                         rule.name.clone()
                     };
-                    runtime.balancer.select(&rule.upstream).map(|target| {
-                        (
-                            rule_label,
-                            rule.upstream.clone(),
-                            rule.request_timeout,
-                            target,
+                    runtime
+                        .balancer
+                        .select(
+                            &rule.upstream,
+                            BalanceContext {
+                                client_ip: Some(source.as_str()),
+                                path: &request_path,
+                            },
                         )
-                    })
+                        .map(|target| {
+                            (
+                                rule_label,
+                                rule.upstream.clone(),
+                                rule.request_timeout,
+                                target.url,
+                                target.active_connection,
+                            )
+                        })
                 })
         });
 
         let listen_label = listen_addr
             .clone()
             .unwrap_or_else(|| config.proxy_listen.clone());
-        let (target_base, rule_request_timeout, metric_labels) = match selected {
-            Some((rule, upstream, request_timeout, target)) => (
+        let (target_base, rule_request_timeout, metric_labels, target_lease) = match selected {
+            Some((rule, upstream, request_timeout, target, target_lease)) => (
                 target,
                 request_timeout,
                 ProxyMetricLabels {
@@ -932,11 +951,13 @@ async fn proxy_handler(
                     rule,
                     upstream,
                 },
+                Some(target_lease),
             ),
             None => (
                 config.fallback.url.clone(),
                 0,
                 ProxyMetricLabels::fallback(listen_label),
+                None,
             ),
         };
         (
@@ -946,6 +967,7 @@ async fn proxy_handler(
             target_base,
             rule_request_timeout,
             metric_labels,
+            target_lease,
         )
     };
 
@@ -960,6 +982,7 @@ async fn proxy_handler(
             access: ProxyAccessLogContext { source },
             metric_labels,
             request_timeout_override: rule_request_timeout,
+            target_lease,
         },
     )
     .await
