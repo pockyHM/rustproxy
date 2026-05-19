@@ -8,8 +8,9 @@ use crate::config::yaml::{
     AccessLogConfig, AppConfig, Certificate, Fallback, MonitoringConfig, TlsListener,
 };
 use crate::models::{
-    ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType, HostMatcher,
-    LocationMatchType, LocationMatcher, MatchSet, Operator, Rule, RuleTls, Target, Upstream,
+    BalanceAlgorithm, ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType,
+    HostMatcher, LocationMatchType, LocationMatcher, MatchSet, Operator, RetryPolicy, Rule,
+    RuleTls, Target, Upstream,
 };
 
 pub struct Database {
@@ -391,7 +392,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
 
 fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout FROM rules ORDER BY priority DESC, rowid ASC"
+        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy FROM rules ORDER BY priority DESC, rowid ASC"
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -410,6 +411,9 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
         let location_type: Option<String> = row.get(13)?;
         let location_value: Option<String> = row.get(14)?;
         let request_timeout: u64 = row.get::<_, i64>(15)? as u64;
+        let header_policy_json: Option<String> = row.get(16)?;
+        let path_actions_json: Option<String> = row.get(17)?;
+        let limit_policy_json: Option<String> = row.get(18)?;
         let conditions =
             expr_json.and_then(|json| serde_json::from_str::<ConditionExpr>(&json).ok());
         Ok(Rule {
@@ -435,9 +439,9 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
                 enabled: tls_enabled,
                 certificate,
             }),
-            header_policy: Default::default(),
-            path_actions: Vec::new(),
-            limit_policy: Default::default(),
+            header_policy: json_or_default(header_policy_json.as_deref()),
+            path_actions: json_or_default(path_actions_json.as_deref()),
+            limit_policy: json_or_default(limit_policy_json.as_deref()),
         })
     })?;
 
@@ -456,9 +460,12 @@ fn insert_rule(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
         .transpose()?;
     let tls_enabled = rule.tls.as_ref().is_some_and(|tls| tls.enabled);
     let tls_certificate = rule.tls.as_ref().map(|tls| tls.certificate.as_str());
+    let header_policy = serde_json::to_string(&rule.header_policy)?;
+    let path_actions = serde_json::to_string(&rule.path_actions)?;
+    let limit_policy = serde_json::to_string(&rule.limit_policy)?;
     tx.execute(
-        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout],
+        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, header_policy, path_actions, limit_policy],
     )?;
     Ok(())
 }
@@ -472,17 +479,26 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
         let targets = load_targets(conn, &name)?;
         let (skip_ssl, websocket) = load_upstream_options(conn, &name)?;
         let health_check = load_health_check(conn, &name)?;
+        let (balance, retry) = load_upstream_policy(conn, &name)?;
         upstreams.push(Upstream {
             name,
             skip_ssl,
             websocket,
             targets,
             health_check,
-            balance: Default::default(),
-            retry: Default::default(),
+            balance,
+            retry,
         });
     }
     Ok(upstreams)
+}
+
+fn json_or_default<T>(json: Option<&str>) -> T
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    json.and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
 }
 
 fn load_upstream_options(conn: &Connection, upstream_name: &str) -> Result<(bool, bool)> {
@@ -514,6 +530,25 @@ fn load_health_check(conn: &Connection, upstream_name: &str) -> Result<HealthChe
                 healthy_threshold: row.get::<_, i64>(6)? as u32,
                 unhealthy_threshold: row.get::<_, i64>(7)? as u32,
             })
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn load_upstream_policy(
+    conn: &Connection,
+    upstream_name: &str,
+) -> Result<(BalanceAlgorithm, RetryPolicy)> {
+    conn.query_row(
+        "SELECT balance, retry_policy FROM upstreams WHERE name = ?1",
+        params![upstream_name],
+        |row| {
+            let balance: String = row.get(0)?;
+            let retry_json: Option<String> = row.get(1)?;
+            Ok((
+                parse_balance_algorithm(&balance),
+                json_or_default(retry_json.as_deref()),
+            ))
         },
     )
     .map_err(Into::into)
@@ -611,8 +646,9 @@ fn set_setting_tx(tx: &rusqlite::Transaction, key: &str, value: &str) -> Result<
 }
 
 fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
+    let retry_policy = serde_json::to_string(&upstream.retry)?;
     tx.execute(
-        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             upstream.name,
             upstream.skip_ssl,
@@ -625,6 +661,8 @@ fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()
             upstream.health_check.timeout_seconds,
             upstream.health_check.healthy_threshold,
             upstream.health_check.unhealthy_threshold,
+            balance_algorithm_str(upstream.balance),
+            retry_policy,
         ],
     )?;
     insert_targets(tx, &upstream.name, &upstream.targets)?;
@@ -635,6 +673,26 @@ fn health_check_mode_str(mode: &HealthCheckMode) -> &'static str {
     match mode {
         HealthCheckMode::Tcp => "tcp",
         HealthCheckMode::Http => "http",
+    }
+}
+
+fn balance_algorithm_str(balance: BalanceAlgorithm) -> &'static str {
+    match balance {
+        BalanceAlgorithm::WeightedRoundRobin => "weighted_round_robin",
+        BalanceAlgorithm::LeastConnections => "least_connections",
+        BalanceAlgorithm::IpHash => "ip_hash",
+        BalanceAlgorithm::ConsistentHash => "consistent_hash",
+        BalanceAlgorithm::UrlHash => "url_hash",
+    }
+}
+
+fn parse_balance_algorithm(value: &str) -> BalanceAlgorithm {
+    match value {
+        "least_connections" => BalanceAlgorithm::LeastConnections,
+        "ip_hash" => BalanceAlgorithm::IpHash,
+        "consistent_hash" => BalanceAlgorithm::ConsistentHash,
+        "url_hash" => BalanceAlgorithm::UrlHash,
+        _ => BalanceAlgorithm::WeightedRoundRobin,
     }
 }
 
@@ -660,9 +718,12 @@ fn update_rule_row(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
         .transpose()?;
     let tls_enabled = rule.tls.as_ref().is_some_and(|tls| tls.enabled);
     let tls_certificate = rule.tls.as_ref().map(|tls| tls.certificate.as_str());
+    let header_policy = serde_json::to_string(&rule.header_policy)?;
+    let path_actions = serde_json::to_string(&rule.path_actions)?;
+    let limit_policy = serde_json::to_string(&rule.limit_policy)?;
     let changes = tx.execute(
-        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14, request_timeout = ?15 WHERE id = ?16",
-        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, rule.id],
+        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14, request_timeout = ?15, header_policy = ?16, path_actions = ?17, limit_policy = ?18 WHERE id = ?19",
+        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, header_policy, path_actions, limit_policy, rule.id],
     )?;
     if changes == 0 {
         anyhow::bail!("rule '{}' not found", rule.id);
@@ -711,8 +772,9 @@ fn delete_upstream_targets(tx: &rusqlite::Transaction, upstream_name: &str) -> R
 }
 
 fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
+    let retry_policy = serde_json::to_string(&upstream.retry)?;
     let changes = tx.execute(
-        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, updated_at = datetime('now') WHERE name = ?11",
+        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, updated_at = datetime('now') WHERE name = ?13",
         params![
             upstream.skip_ssl,
             upstream.websocket,
@@ -724,6 +786,8 @@ fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Resul
             upstream.health_check.timeout_seconds,
             upstream.health_check.healthy_threshold,
             upstream.health_check.unhealthy_threshold,
+            balance_algorithm_str(upstream.balance),
+            retry_policy,
             upstream.name,
         ],
     )?;
@@ -751,6 +815,8 @@ CREATE TABLE IF NOT EXISTS upstreams (
     health_check_timeout_seconds     INTEGER NOT NULL DEFAULT 2,
     health_check_healthy_threshold   INTEGER NOT NULL DEFAULT 2,
     health_check_unhealthy_threshold INTEGER NOT NULL DEFAULT 2,
+    balance                          TEXT NOT NULL DEFAULT 'weighted_round_robin',
+    retry_policy                     TEXT,
     created_at                       TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at                       TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -780,6 +846,9 @@ CREATE TABLE IF NOT EXISTS rules (
     location_type   TEXT NOT NULL DEFAULT 'prefix',
     location_value  TEXT NOT NULL DEFAULT '/',
     request_timeout INTEGER NOT NULL DEFAULT 0,
+    header_policy   TEXT,
+    path_actions    TEXT,
+    limit_policy    TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -849,6 +918,9 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "request_timeout",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    add_column_if_missing(conn, "rules", "header_policy", "TEXT")?;
+    add_column_if_missing(conn, "rules", "path_actions", "TEXT")?;
+    add_column_if_missing(conn, "rules", "limit_policy", "TEXT")?;
 
     add_column_if_missing(conn, "upstreams", "skip_ssl", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "upstreams", "websocket", "INTEGER NOT NULL DEFAULT 0")?;
@@ -900,6 +972,13 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "health_check_unhealthy_threshold",
         "INTEGER NOT NULL DEFAULT 2",
     )?;
+    add_column_if_missing(
+        conn,
+        "upstreams",
+        "balance",
+        "TEXT NOT NULL DEFAULT 'weighted_round_robin'",
+    )?;
+    add_column_if_missing(conn, "upstreams", "retry_policy", "TEXT")?;
 
     Ok(())
 }
@@ -979,7 +1058,10 @@ fn build_expr_from_conditions(conn: &Connection, rule_id: &str) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ConditionType, Operator};
+    use crate::models::{
+        BalanceAlgorithm, ConditionType, HeaderMutation, HeaderMutationOp, Operator, PathAction,
+        RateLimitKey,
+    };
 
     fn make_test_config() -> AppConfig {
         use crate::models::ConditionExpr;
@@ -1095,6 +1177,59 @@ mod tests {
         }
         assert!(loaded.upstreams.contains_key("backend-1"));
         assert_eq!(loaded.upstreams["backend-1"].targets.len(), 2);
+    }
+
+    #[test]
+    fn round_trips_proxy_policies() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = make_test_config();
+        let rule = config.rules.first_mut().unwrap();
+        rule.header_policy.request.push(HeaderMutation {
+            op: HeaderMutationOp::Set,
+            name: "x-forwarded-proto".to_string(),
+            value: Some("https".to_string()),
+        });
+        rule.header_policy.response.push(HeaderMutation {
+            op: HeaderMutationOp::Remove,
+            name: "server".to_string(),
+            value: None,
+        });
+        rule.path_actions.push(PathAction::StripPrefix {
+            prefix: "/api".to_string(),
+        });
+        rule.limit_policy.rate_per_second = Some(50);
+        rule.limit_policy.rate_key = RateLimitKey::Route;
+        rule.limit_policy.max_connections = Some(12);
+        rule.limit_policy.max_body_bytes = Some(1024 * 1024);
+        rule.limit_policy.queue_timeout_ms = Some(250);
+
+        let upstream = config.upstreams.get_mut("backend-1").unwrap();
+        upstream.balance = BalanceAlgorithm::LeastConnections;
+        upstream.retry.attempts = 2;
+        upstream.retry.retry_on_status = vec![502, 503];
+        upstream.retry.retry_on_timeout = true;
+        upstream.retry.retry_on_connect_error = true;
+        let expected_header_policy = rule.header_policy.clone();
+        let expected_path_actions = rule.path_actions.clone();
+        let expected_limit_policy = rule.limit_policy.clone();
+
+        db.save_full_config(&config).unwrap();
+        let loaded = db.load_config().unwrap();
+        let loaded_rule = loaded
+            .rules
+            .iter()
+            .find(|rule| rule.id == "rule-1")
+            .unwrap();
+        assert_eq!(loaded_rule.header_policy, expected_header_policy);
+        assert_eq!(loaded_rule.path_actions, expected_path_actions);
+        assert_eq!(loaded_rule.limit_policy, expected_limit_policy);
+
+        let loaded_upstream = loaded.upstreams.get("backend-1").unwrap();
+        assert_eq!(loaded_upstream.balance, BalanceAlgorithm::LeastConnections);
+        assert_eq!(loaded_upstream.retry.attempts, 2);
+        assert_eq!(loaded_upstream.retry.retry_on_status, vec![502, 503]);
+        assert!(loaded_upstream.retry.retry_on_timeout);
+        assert!(loaded_upstream.retry.retry_on_connect_error);
     }
 
     #[test]
