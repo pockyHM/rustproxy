@@ -10,7 +10,9 @@ pub fn import_yaml(db: &Database, config: &AppConfig) -> Result<()> {
 
 pub fn export_yaml(db: &Database) -> Result<String> {
     let config = db.load_config()?;
-    serde_yaml::to_string(&config).context("failed to serialize config to YAML")
+    config
+        .to_compact_yaml()
+        .context("failed to serialize config to YAML")
 }
 
 pub fn import_yaml_file(db: &Database, path: &str) -> Result<()> {

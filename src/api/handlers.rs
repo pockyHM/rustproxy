@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -7,11 +7,15 @@ use axum::{
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::{Path as FsPath, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path as FsPath, PathBuf},
+};
 
 use crate::{
     config::yaml::{AppConfig, Certificate},
     models::{MatchSet, Rule, Upstream},
+    version,
 };
 
 use super::routes::AppState;
@@ -85,6 +89,27 @@ pub async fn setup_status(State(state): State<AppState>) -> Json<ApiResponse<Set
     let users = state.db.list_users().unwrap_or_default();
     Json(ApiResponse::success(SetupStatus {
         users_exist: !users.is_empty(),
+    }))
+}
+
+#[derive(Serialize)]
+pub struct VersionInfo {
+    pub version: &'static str,
+    pub package_version: &'static str,
+    pub git_ref: &'static str,
+    pub git_ref_kind: &'static str,
+    pub git_commit: &'static str,
+    pub dirty: bool,
+}
+
+pub async fn version() -> Json<ApiResponse<VersionInfo>> {
+    Json(ApiResponse::success(VersionInfo {
+        version: version::BUILD_VERSION,
+        package_version: version::PACKAGE_VERSION,
+        git_ref: version::GIT_REF,
+        git_ref_kind: version::GIT_REF_KIND,
+        git_commit: version::GIT_COMMIT,
+        dirty: version::git_dirty(),
     }))
 }
 
@@ -723,6 +748,139 @@ pub async fn delete_upstream(
 
 pub async fn health() -> Json<ApiResponse<Value>> {
     Json(ApiResponse::success(json!({ "status": "ok" })))
+}
+
+pub async fn upstream_health(State(state): State<AppState>) -> Json<ApiResponse<Value>> {
+    let config = state.config.read().await;
+    let health = config
+        .upstreams
+        .values()
+        .map(|upstream| {
+            let enabled = upstream.health_check.enabled;
+            let targets = upstream
+                .targets
+                .iter()
+                .map(|target| {
+                    let healthy = if enabled {
+                        state
+                            .health
+                            .is_healthy(&crate::proxy::health::HealthRegistry::target_key(
+                                &upstream.name,
+                                &target.url,
+                            ))
+                    } else {
+                        true
+                    };
+                    json!({
+                        "url": target.url,
+                        "healthy": healthy,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let unhealthy = targets
+                .iter()
+                .filter(|target| target["healthy"].as_bool() == Some(false))
+                .count();
+            json!({
+                "upstream": upstream.name,
+                "enabled": enabled,
+                "total": targets.len(),
+                "unhealthy": unhealthy,
+                "targets": targets,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(ApiResponse::success(json!(health)))
+}
+
+pub async fn prometheus_query_range(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Value>>, Response> {
+    let query = params
+        .get("query")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing query"))?;
+    let start = params
+        .get("start")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing start"))?;
+    let end = params
+        .get("end")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing end"))?;
+    let step = params
+        .get("step")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing step"))?;
+
+    let monitoring = state.config.read().await.monitoring.clone();
+    if !monitoring.enabled {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "monitoring is disabled",
+        ));
+    }
+    let base_url = monitoring.prometheus.url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "prometheus url is empty",
+        ));
+    }
+
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(format!("{base_url}/api/v1/query_range"))
+        .query(&[
+            ("query", query.as_str()),
+            ("start", start.as_str()),
+            ("end", end.as_str()),
+            ("step", step.as_str()),
+        ]);
+
+    let auth = &monitoring.prometheus.auth;
+    match auth.auth_type.as_str() {
+        "basic" => {
+            request = request.basic_auth(
+                auth.username.clone().unwrap_or_default(),
+                auth.password.clone(),
+            );
+        }
+        "bearer" => {
+            if let Some(token) = auth.bearer_token.as_deref().filter(|v| !v.is_empty()) {
+                request = request.bearer_auth(token);
+            }
+        }
+        "header" => {
+            if let (Some(name), Some(value)) = (&auth.header_name, &auth.header_value) {
+                request = request.header(name, value);
+            }
+        }
+        _ => {}
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| error_response(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    let status = response.status();
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| error_response(StatusCode::BAD_GATEWAY, error.to_string()))?;
+    if !status.is_success() {
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            payload
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("prometheus query failed"),
+        ));
+    }
+
+    Ok(Json(ApiResponse::success(payload)))
 }
 
 pub async fn metrics(State(state): State<AppState>) -> Response {

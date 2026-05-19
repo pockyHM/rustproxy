@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::api::server;
 use crate::config::yaml::AppConfig;
-use crate::db::{migration, Database};
+use crate::db::{Database, migration};
 
 pub async fn run(db_path: &str, yaml_path: &str) -> Result<()> {
     let db =

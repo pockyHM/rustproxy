@@ -1,10 +1,11 @@
-import { FormEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { type CSSProperties, FormEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
 
 /* ===== Types ===== */
 
 type Lang = 'en' | 'zh';
 type Theme = 'light' | 'dark';
+type AccessLogLevel = 'debug' | 'info' | 'warn' | 'error';
 type ApiResponse<T> = { success: boolean; data: T; error?: string };
 type Target = { url: string; weight: number };
 type HealthCheckMode = 'tcp' | 'http';
@@ -51,10 +52,10 @@ type Rule = {
   weight: number;
   is_fallback?: boolean;
   listen?: string | null;
+  request_timeout?: number;
   tls?: RuleTls | null;
 };
 type AppConfig = {
-  version: string;
   listen: string;
   proxy_listen?: string;
   connect_timeout?: number;
@@ -63,7 +64,21 @@ type AppConfig = {
   pool_idle_timeout?: number;
   tcp_keepalive?: number;
   certificate_dir?: string;
-  access_log?: { enabled?: boolean; path?: string | null; buffer_size?: number | null };
+  access_log?: { enabled?: boolean; path?: string | null; buffer_size?: number | null; level?: AccessLogLevel };
+  monitoring?: {
+    enabled?: boolean;
+    prometheus?: {
+      url?: string;
+      auth?: {
+        auth_type?: string;
+        username?: string | null;
+        password?: string | null;
+        bearer_token?: string | null;
+        header_name?: string | null;
+        header_value?: string | null;
+      };
+    };
+  };
   certificates?: Certificate[];
   tls_listeners?: TlsListener[];
   match_sets?: MatchSet[];
@@ -72,16 +87,40 @@ type AppConfig = {
   fallback: { url: string };
 };
 
-type View = 'operations' | 'rules' | 'match-sets' | 'upstreams' | 'certificates' | 'config';
+type View = 'operations' | 'monitoring' | 'rules' | 'match-sets' | 'upstreams' | 'certificates' | 'config';
 type Notice = { type: 'success' | 'error'; message: string } | null;
 type DataProps = { config: AppConfig; token: string; setConfig: (config: AppConfig) => void; setNotice: (notice: Notice) => void };
 type DropdownOption = { value: string; label: string; description?: string };
+type VersionInfo = {
+  version: string;
+  package_version: string;
+  git_ref: string;
+  git_ref_kind: string;
+  git_commit: string;
+  dirty: boolean;
+};
 
 type PrometheusMetric = {
   name: string;
   labels: Record<string, string>;
   value: number;
 };
+type UpstreamHealth = {
+  upstream: string;
+  enabled: boolean;
+  total: number;
+  unhealthy: number;
+  targets: { url: string; healthy: boolean }[];
+};
+type PrometheusRangeResult = {
+  status?: string;
+  data?: {
+    resultType?: string;
+    result?: { metric: Record<string, string>; values: [number, string][] }[];
+  };
+  error?: string;
+};
+type ChartPoint = { t: number; v: number };
 
 /* ===== Translations ===== */
 
@@ -89,6 +128,7 @@ const T: Record<string, [string, string]> = {
   'brand.subtitle': ['Reverse Proxy Admin', '反向代理管理'],
   'nav.control': ['CONTROL', '控制'],
   'nav.operations': ['Operations', '运维概览'],
+  'nav.monitoring': ['Monitoring', '监控'],
   'nav.rules': ['Rules', '路由规则'],
   'nav.matchSets': ['Match Sets', '匹配集'],
   'nav.upstreams': ['Upstreams', '上游服务'],
@@ -98,6 +138,7 @@ const T: Record<string, [string, string]> = {
   'listeners.api': ['API + Admin UI', 'API + 管理界面'],
   'listeners.proxy': ['Reverse proxy', '反向代理'],
   'listeners.tls': ['HTTPS proxy', 'HTTPS 代理'],
+  'version.label': ['BUILD', '构建版本'],
   'admin.role': ['JWT protected', 'JWT 保护'],
   'admin.logout': ['Sign out', '退出登录'],
   'theme.light': ['Light mode', '亮色模式'],
@@ -141,6 +182,8 @@ const T: Record<string, [string, string]> = {
   'rule.fallback': ['Fallback rule', '兜底规则'],
   'rule.enableFallback': ['Use when no other rule matches', '所有规则都未命中时使用'],
   'rule.fallbackHelp': ['Fallback rules run after normal rules and only need an upstream.', '兜底规则会在普通规则全部未命中后执行，只需要选择上游。'],
+  'rule.requestTimeout': ['Rule request timeout (s)', '规则请求超时 (秒)'],
+  'rule.requestTimeoutInherit': ['0 inherits the global request timeout', '0 表示沿用全局请求超时'],
   'config.fallbackUrl': ['Fallback target', '兜底目标'],
   'config.skipSsl': ['Skip SSL verification', '跳过 SSL 验证'],
   'config.websocket': ['Enable WebSocket proxy', '启用 WebSocket 代理'],
@@ -150,10 +193,20 @@ const T: Record<string, [string, string]> = {
   'config.poolIdleTimeout': ['Pool idle timeout (s)', '连接池空闲超时 (秒)'],
   'config.tcpKeepalive': ['TCP keepalive (s)', 'TCP Keepalive (秒)'],
   'config.accessLog': ['Access Log', '访问日志'],
+  'config.accessLogLevel': ['Access log level', '访问日志等级'],
   'config.accessLogEnabled': ['Enable access log', '启用访问日志'],
   'config.accessLogPath': ['Log file path', '日志文件路径'],
   'config.accessLogPathHint': ['Leave empty to write to stdout', '留空则输出到标准输出'],
   'config.accessLogBuffer': ['Async buffer size', '异步队列大小'],
+  'config.monitoring': ['Monitoring', '监控配置'],
+  'config.monitoringEnabled': ['Enable Prometheus monitoring', '开启 Prometheus 监控'],
+  'config.prometheusUrl': ['Prometheus URL', 'Prometheus 地址'],
+  'config.authType': ['Auth type', '认证类型'],
+  'config.username': ['Username', '用户名'],
+  'config.password': ['Password', '密码'],
+  'config.bearerToken': ['Bearer token', 'Bearer Token'],
+  'config.headerName': ['Header name', 'Header 名称'],
+  'config.headerValue': ['Header value', 'Header 值'],
   'action.reload': ['Reload config', '重新加载'],
   'action.newRule': ['New rule', '新建规则'],
   'action.newMatchSet': ['New match set', '新建匹配集'],
@@ -178,15 +231,34 @@ const T: Record<string, [string, string]> = {
   'ops.priorityShort': ['P', 'P'],
   'ops.requestsShort': ['req', '请求'],
   'ops.avgLatencyShort': ['avg', '平均'],
+  'ops.zoomOut': ['Zoom out', '缩小'],
+  'ops.zoomIn': ['Zoom in', '放大'],
+  'ops.zoomReset': ['Reset zoom', '重置缩放'],
   'ops.noRoutes': ['No routing rules configured. Traffic falls back to the default upstream URL.', '暂无路由规则，流量会进入默认兜底上游 URL。'],
   'ops.traffic': ['Recent proxy traffic', '近期代理流量'],
   'ops.trafficDesc': ['Requests grouped by rule, upstream, status, and latency histogram bucket.', '按规则、上游、状态和延迟直方图桶分组的请求。'],
   'ops.filterRules': ['Filter rules...', '过滤规则...'],
   'ops.noTraffic': ['No traffic data yet. Metrics will appear when the proxy receives requests.', '暂无流量数据。当代理收到请求时指标将出现。'],
   'ops.last24h': ['Last 24h across all upstreams', '过去 24 小时所有上游'],
-  'ops.histogram': ['Histogram proxy_request_duration_seconds', '直方图 proxy_request_duration_seconds'],
-  'ops.gauge': ['Gauge proxy_active_connections', '指标 proxy_active_connections'],
+  'ops.histogram': ['Histogram rustproxy_proxy_request_duration_seconds', '直方图 rustproxy_proxy_request_duration_seconds'],
+  'ops.gauge': ['Gauge rustproxy_proxy_active_connections', '指标 rustproxy_proxy_active_connections'],
   'ops.sqliteReload': ['SQLite backed hot reload loop', 'SQLite 热重载'],
+  'monitoring.title': ['Monitoring', '监控'],
+  'monitoring.sub': ['Prometheus-backed resource, latency, request, and error trends.', '基于 Prometheus 展示资源、延迟、请求和错误趋势。'],
+  'monitoring.disabled': ['Prometheus monitoring is disabled. Enable it in global configuration and set a Prometheus URL.', 'Prometheus 监控未开启。请在全局配置中开启并配置 Prometheus 地址。'],
+  'monitoring.noData': ['No Prometheus data returned. Add this RustProxy /metrics endpoint to Prometheus scrape_configs and wait for samples.', '没有查询到 Prometheus 数据。请把当前 RustProxy 的 /metrics 端点加入 Prometheus scrape_configs，并等待采样。'],
+  'monitoring.selector': ['Selector', '选择器'],
+  'monitoring.entry': ['Entry', '入口'],
+  'monitoring.route': ['Route', '链路'],
+  'monitoring.allRoutes': ['All routes', '全部链路'],
+  'monitoring.rps': ['RPS', '每秒请求'],
+  'monitoring.errorRate': ['Error rate', '错误率'],
+  'monitoring.memory': ['Memory', '内存'],
+  'monitoring.cpu': ['CPU', 'CPU'],
+  'monitoring.p50': ['P50 latency', 'P50 延迟'],
+  'monitoring.p95': ['P95 latency', 'P95 延迟'],
+  'monitoring.p99': ['P99 latency', 'P99 延迟'],
+  'monitoring.scrapeHint': ['Example scrape target: ', '采集端点示例：'],
   'table.rule': ['Rule', '规则'],
   'table.upstream': ['Upstream', '上游'],
   'table.status': ['Status', '状态'],
@@ -203,6 +275,9 @@ const T: Record<string, [string, string]> = {
   'table.actions': ['Actions', '操作'],
   'table.targets': ['Targets', '目标'],
   'table.healthCheck': ['Health Check', '健康检查'],
+  'table.healthTotal': ['total', '总数'],
+  'table.healthUnhealthy': ['unhealthy', '异常'],
+  'table.healthUnknown': ['unknown', '未知'],
   'table.off': ['Off', '关闭'],
   'table.noRules': ['No rules configured', '暂无路由规则'],
   'table.noUpstreams': ['No upstreams configured', '暂无上游服务'],
@@ -313,6 +388,7 @@ const T: Record<string, [string, string]> = {
   'notice.adminCreated': ['Admin created — please sign in', '管理员已创建 — 请登录'],
   'notice.passwordMismatch': ['Passwords do not match', '密码不匹配'],
   'notice.connecting': ['connecting...', '连接中...'],
+  'notice.sessionExpired': ['Session expired, please sign in again.', '登录已过期，请重新登录。'],
 };
 
 /* ===== I18n Context ===== */
@@ -321,6 +397,7 @@ const I18nCtx = createContext<{ lang: Lang; t: (key: string) => string }>({ lang
 const useI18n = () => useContext(I18nCtx);
 const DEFAULT_LANG: Lang = 'zh';
 const DEFAULT_THEME: Theme = 'light';
+const AUTH_EXPIRED_EVENT = 'rustproxy:auth-expired';
 
 /* ===== Constants ===== */
 
@@ -331,6 +408,7 @@ const defaultHealthCheck: HealthCheck = {
 
 const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
   { id: 'operations', labelKey: 'nav.operations', icon: 'monitoring' },
+  { id: 'monitoring', labelKey: 'nav.monitoring', icon: 'query_stats' },
   { id: 'rules', labelKey: 'nav.rules', icon: 'route' },
   { id: 'match-sets', labelKey: 'nav.matchSets', icon: 'rule_settings' },
   { id: 'upstreams', labelKey: 'nav.upstreams', icon: 'lan' },
@@ -339,12 +417,56 @@ const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
 ];
 
 const ROUTE_FLOW_COLORS = ['#FF8400', '#000066', '#804200', '#004D1A'];
+const ACCESS_LOG_LEVEL_OPTIONS: DropdownOption[] = [
+  { value: 'debug', label: 'debug' },
+  { value: 'info', label: 'info' },
+  { value: 'warn', label: 'warn' },
+  { value: 'error', label: 'error' },
+];
 
 const emptyConfig: AppConfig = {
-  version: '1.0', listen: '0.0.0.0:3000', proxy_listen: '0.0.0.0:80',
-  certificate_dir: '/etc/rustproxy/cert.d', access_log: { enabled: false, path: null, buffer_size: 8192 }, certificates: [], tls_listeners: [], match_sets: [],
+  listen: '0.0.0.0:3000', proxy_listen: '0.0.0.0:80',
+  certificate_dir: '/etc/rustproxy/cert.d', access_log: { enabled: false, path: null, buffer_size: 8192, level: 'info' },
+  monitoring: { enabled: false, prometheus: { url: '', auth: { auth_type: 'none' } } },
+  certificates: [], tls_listeners: [], match_sets: [],
   rules: [], upstreams: {}, fallback: { url: '404' },
 };
+
+function compactConfigForYaml(value: unknown): unknown {
+  if (value == null) return undefined;
+
+  if (Array.isArray(value)) {
+    const compacted = value
+      .map((item) => compactConfigForYaml(item))
+      .filter((item) => item !== undefined);
+    return compacted.length > 0 ? compacted : undefined;
+  }
+
+  if (typeof value !== 'object') return value;
+
+  const source = value as Record<string, unknown>;
+  if (source.enabled === false && 'prometheus' in source) {
+    return { enabled: false };
+  }
+  if (source.enabled === false && 'mode' in source && 'expected_status' in source && 'interval_seconds' in source) {
+    return { enabled: false };
+  }
+  if (source.enabled === false && ('buffer_size' in source || 'level' in source)) {
+    return { enabled: false };
+  }
+
+  const compacted = Object.entries(source).reduce<Record<string, unknown>>((next, [key, item]) => {
+    if (key === 'request_timeout' && item === 0 && 'upstream' in source && 'priority' in source) return next;
+    const compactItem = compactConfigForYaml(item);
+    if (compactItem !== undefined) next[key] = compactItem;
+    return next;
+  }, {});
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function dumpConfigYaml(config: AppConfig): string {
+  return yaml.dump(compactConfigForYaml(config) ?? {}, { lineWidth: 110 });
+}
 
 /* ===== Icon ===== */
 
@@ -464,6 +586,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [lang, setLang] = useState<Lang>(() => readStoredLang());
   const [theme, setTheme] = useState<Theme>(() => readStoredTheme());
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
 
   const t = useMemo(() => {
     const idx = lang === 'en' ? 0 : 1;
@@ -474,7 +597,7 @@ function App() {
   const changeTheme = useCallback((nextTheme: Theme) => {
     setTheme(nextTheme);
     localStorage.setItem('rustproxy_theme', nextTheme);
-  }, []);
+  }, [token]);
 
   useEffect(() => {
     document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
@@ -483,6 +606,17 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    function handleAuthExpired() {
+      localStorage.removeItem('rustproxy_token');
+      setToken('');
+      setConfig(emptyConfig);
+      setNotice({ type: 'error', message: t('notice.sessionExpired') });
+    }
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+  }, [t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -499,7 +633,7 @@ function App() {
       document.documentElement.classList.remove('icons-ready');
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [token]);
 
   useEffect(() => {
     api<{ users_exist: boolean }>('/api/auth/setup-status')
@@ -508,11 +642,25 @@ function App() {
   }, []);
 
   useEffect(() => {
+    api<VersionInfo>('/api/version')
+      .then(setVersionInfo)
+      .catch(() => setVersionInfo(null));
+  }, []);
+
+  useEffect(() => {
     if (!token || needsSetup) { setLoading(false); return; }
     refreshConfig(token, setConfig, setNotice).finally(() => setLoading(false));
   }, [token, needsSetup]);
 
+  useEffect(() => {
+    if (view === 'monitoring' && !monitoringEnabled(config)) {
+      setView('operations');
+      window.history.replaceState(null, '', '/admin/');
+    }
+  }, [config, view]);
+
   function navigate(next: View) {
+    if (next === 'monitoring' && !monitoringEnabled(config)) next = 'operations';
     setView(next);
     window.history.replaceState(null, '', `/admin/${next === 'operations' ? '' : next}`);
   }
@@ -532,10 +680,11 @@ function App() {
   return (
     <I18nCtx.Provider value={{ lang, t }}>
       <div className="shell">
-        <Sidebar view={view} navigate={navigate} config={config} logout={logout} lang={lang} changeLang={changeLang} theme={theme} changeTheme={changeTheme} />
+        <Sidebar view={view} navigate={navigate} config={config} versionInfo={versionInfo} logout={logout} lang={lang} changeLang={changeLang} theme={theme} changeTheme={changeTheme} />
         <main className="workspace">
           {notice && <Toast notice={notice} onClose={() => setNotice(null)} />}
           {view === 'operations' && <OperationsView config={config} token={token} />}
+          {view === 'monitoring' && <MonitoringView config={config} token={token} />}
           {view === 'rules' && <RulesView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
           {view === 'match-sets' && <MatchSetsView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
           {view === 'upstreams' && <UpstreamsView config={config} token={token} setConfig={setConfig} setNotice={setNotice} />}
@@ -549,10 +698,13 @@ function App() {
 
 /* ===== Sidebar ===== */
 
-function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, changeTheme }: {
-  view: View; navigate: (v: View) => void; config: AppConfig; logout: () => void; lang: Lang; changeLang: (l: Lang) => void; theme: Theme; changeTheme: (theme: Theme) => void;
+function Sidebar({ view, navigate, config, versionInfo, logout, lang, changeLang, theme, changeTheme }: {
+  view: View; navigate: (v: View) => void; config: AppConfig; versionInfo: VersionInfo | null; logout: () => void; lang: Lang; changeLang: (l: Lang) => void; theme: Theme; changeTheme: (theme: Theme) => void;
 }) {
   const { t } = useI18n();
+  const versionTitle = versionInfo
+    ? `${versionInfo.git_ref_kind}:${versionInfo.git_ref} ${versionInfo.git_commit}${versionInfo.dirty ? ' dirty' : ''}`
+    : undefined;
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
@@ -564,7 +716,7 @@ function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, chan
       </div>
       <div className="sidebar-nav-title">{t('nav.control')}</div>
       <nav className="sidebar-nav">
-        {NAV_ITEMS.map((item) => (
+        {NAV_ITEMS.filter((item) => item.id !== 'monitoring' || monitoringEnabled(config)).map((item) => (
           <button key={item.id} className={view === item.id ? 'nav-item is-active' : 'nav-item'} onClick={() => navigate(item.id)}>
             <Icon name={item.icon} />
             <span>{t(item.labelKey)}</span>
@@ -589,6 +741,12 @@ function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, chan
         ))}
       </div>
       <div className="sidebar-spacer" />
+      {versionInfo && (
+        <div className="sidebar-build" title={versionTitle}>
+          <div className="sidebar-build-label">{t('version.label')}</div>
+          <div className="sidebar-build-value">{versionInfo.version}</div>
+        </div>
+      )}
       <div className="sidebar-utility-actions">
         <button className="sidebar-toggle" onClick={() => changeTheme(theme === 'light' ? 'dark' : 'light')} title={theme === 'light' ? t('theme.dark') : t('theme.light')}>
           <Icon name={theme === 'light' ? 'dark_mode' : 'light_mode'} size={16} />
@@ -618,16 +776,21 @@ function Sidebar({ view, navigate, config, logout, lang, changeLang, theme, chan
 function OperationsView({ config, token }: { config: AppConfig; token: string }) {
   const { lang, t } = useI18n();
   const [metrics, setMetrics] = useState<PrometheusMetric[]>([]);
+  const [upstreamHealth, setUpstreamHealth] = useState<UpstreamHealth[]>([]);
   const [cpuUsage, setCpuUsage] = useState(0);
+  const [routeZoom, setRouteZoom] = useState(1);
   const previousCpu = useRef<{ total: number; at: number } | null>(null);
   useEffect(() => {
     let active = true;
     async function loadMetrics() {
       try {
-        const text = await fetch('/metrics').then((r) => r.text());
+        const [text, health] = await Promise.all([
+          fetch('/metrics').then((r) => r.text()),
+          api<UpstreamHealth[]>('/api/upstream-health', { token }).catch(() => []),
+        ]);
         if (!active) return;
         const nextMetrics = parsePrometheus(text);
-        const cpuTotal = metricValue(nextMetrics, 'process_cpu_seconds_total');
+        const cpuTotal = metricValue(nextMetrics, 'rustproxy_process_cpu_seconds_total');
         const now = Date.now();
         if (cpuTotal !== null && previousCpu.current) {
           const cpuDelta = Math.max(0, cpuTotal - previousCpu.current.total);
@@ -636,6 +799,7 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
         }
         if (cpuTotal !== null) previousCpu.current = { total: cpuTotal, at: now };
         setMetrics(nextMetrics);
+        setUpstreamHealth(health);
       } catch (_) {}
     }
     loadMetrics();
@@ -643,20 +807,20 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
     return () => { active = false; window.clearInterval(timer); };
   }, []);
 
-  const totalRequests = useMemo(() => metrics.filter((m) => m.name === 'proxy_requests_total').reduce((s, m) => s + m.value, 0), [metrics]);
-  const activeConns = useMemo(() => metrics.find((m) => m.name === 'proxy_active_connections')?.value ?? 0, [metrics]);
-  const residentMemory = useMemo(() => metricValue(metrics, 'process_resident_memory_bytes') ?? 0, [metrics]);
-  const openFds = useMemo(() => metricValue(metrics, 'process_open_fds') ?? 0, [metrics]);
+  const totalRequests = useMemo(() => metrics.filter((m) => m.name === 'rustproxy_proxy_requests_total').reduce((s, m) => s + m.value, 0), [metrics]);
+  const activeConns = useMemo(() => metrics.find((m) => m.name === 'rustproxy_proxy_active_connections')?.value ?? 0, [metrics]);
+  const residentMemory = useMemo(() => metricValue(metrics, 'rustproxy_process_resident_memory_bytes') ?? 0, [metrics]);
+  const openFds = useMemo(() => metricValue(metrics, 'rustproxy_process_open_fds') ?? 0, [metrics]);
   const avgLatency = useMemo(() => {
-    const sum = metrics.filter((m) => m.name === 'proxy_request_duration_seconds_sum').reduce((total, metric) => total + metric.value, 0);
-    const count = metrics.filter((m) => m.name === 'proxy_request_duration_seconds_count').reduce((total, metric) => total + metric.value, 0);
+    const sum = metrics.filter((m) => m.name === 'rustproxy_proxy_request_duration_seconds_sum').reduce((total, metric) => total + metric.value, 0);
+    const count = metrics.filter((m) => m.name === 'rustproxy_proxy_request_duration_seconds_count').reduce((total, metric) => total + metric.value, 0);
     return count > 0 ? (sum / count) * 1000 : 0;
   }, [metrics]);
-  const reloadCount = useMemo(() => metrics.find((m) => m.name === 'proxy_config_reloads_total')?.value ?? 0, [metrics]);
+  const reloadCount = useMemo(() => metrics.find((m) => m.name === 'rustproxy_proxy_config_reloads_total')?.value ?? 0, [metrics]);
 
   const requestsByRule = useMemo(() => {
     const byRule: Record<string, number> = {};
-    metrics.filter((m) => m.name === 'proxy_requests_total').forEach((m) => {
+    metrics.filter((m) => m.name === 'rustproxy_proxy_requests_total').forEach((m) => {
       const rule = m.labels.rule || 'unknown';
       byRule[rule] = (byRule[rule] || 0) + m.value;
     });
@@ -667,7 +831,7 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
     const sums: Record<string, number> = {};
     const counts: Record<string, number> = {};
     metrics.forEach((metric) => {
-      if (metric.name !== 'proxy_request_duration_seconds_sum' && metric.name !== 'proxy_request_duration_seconds_count') return;
+      if (metric.name !== 'rustproxy_proxy_request_duration_seconds_sum' && metric.name !== 'rustproxy_proxy_request_duration_seconds_count') return;
       const key = `${metric.labels.rule || 'unknown'}\u0000${metric.labels.upstream || '-'}`;
       if (metric.name.endsWith('_sum')) sums[key] = (sums[key] || 0) + metric.value;
       if (metric.name.endsWith('_count')) counts[key] = (counts[key] || 0) + metric.value;
@@ -675,11 +839,12 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
     return Object.fromEntries(Object.keys(counts).map((key) => [key, counts[key] > 0 ? (sums[key] || 0) / counts[key] * 1000 : 0]));
   }, [metrics]);
 
-  const trafficRows = useMemo(() => metrics.filter((m) => m.name === 'proxy_requests_total').map((m) => ({
+  const trafficRows = useMemo(() => metrics.filter((m) => m.name === 'rustproxy_proxy_requests_total').map((m) => ({
     rule: m.labels.rule || '-', ruleId: m.labels.rule || '-',
     upstream: m.labels.upstream || '-', status: m.labels.status || '-', count: m.value,
   })), [metrics]);
   const upstreams = useMemo(() => Object.values(config.upstreams ?? {}), [config]);
+  const upstreamHealthByName = useMemo(() => Object.fromEntries(upstreamHealth.map((item) => [item.upstream, item])), [upstreamHealth]);
   const routeFlowGroups = useMemo(() => {
     const defaultListen = config.proxy_listen || '0.0.0.0:80';
     const grouped = new Map<string, {
@@ -708,9 +873,13 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
           avgLatency: avgLatencyByRoute[`${rule.name || rule.id}\u0000${rule.upstream}`] ?? 0,
           color: ROUTE_FLOW_COLORS[group.flows.length % ROUTE_FLOW_COLORS.length],
         });
-      });
+    });
     return [...grouped.values()];
   }, [config, requestsByRule, avgLatencyByRoute]);
+  const routeZoomPercent = Math.round(routeZoom * 100);
+  const updateRouteZoom = useCallback((delta: number) => {
+    setRouteZoom((current) => Math.min(1.4, Math.max(0.8, Number((current + delta).toFixed(2)))));
+  }, []);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, flex: 1 }}>
@@ -751,63 +920,91 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
                   : `${config.rules.length} 条规则激活，${upstreams.length} 个上游池`}
               </div>
             </div>
-            <div className="routing-flow-list">
-              {routeFlowGroups.length > 0 ? routeFlowGroups.map((group) => (
-                <div className="flow-group" key={group.entry} style={{ borderLeftColor: group.color }}>
-                  <div className="flow-node flow-entry">
-                    <span className="flow-node-label">{t('ops.entry')}</span>
-                    <strong>{group.entry}</strong>
-                    <small>{lang === 'en' ? `${group.flows.length} route${group.flows.length !== 1 ? 's' : ''}` : `${group.flows.length} 条链路`}</small>
-                  </div>
-                  <div className="flow-branches">
-                    {group.flows.map(({ rule, upstream, requests, avgLatency, color }, index) => (
-                      <div className={`flow-branch ${rule.is_fallback ? 'is-fallback' : ''}`} key={rule.id || `${group.entry}-${index}`}>
-                        <span className="flow-branch-rail" style={{ background: color }} />
-                        <div className="flow-priority">
-                          <span>{rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
-                          {rule.is_fallback && <Icon name="shield" size={15} />}
-                        </div>
-                        <Icon name="arrow_forward" size={16} />
-                        <div className="flow-node flow-host">
-                          <span className="flow-node-label">{t('table.host')}</span>
-                          <strong>{summarizeHost(rule.host, t)}</strong>
-                        </div>
-                        <Icon name="arrow_forward" size={16} />
-                        <div className="flow-node flow-location">
-                          <span className="flow-node-label">{t('table.location')}</span>
-                          <strong>{summarizeLocation(rule.location)}</strong>
-                        </div>
-                        <Icon name="arrow_forward" size={16} />
-                        <div className="flow-node flow-rule-name">
-                          <span className="flow-node-label">{t('table.rule')}</span>
-                          <strong title={rule.id}>{rule.name || rule.id || '-'}</strong>
-                        </div>
-                        <Icon name="arrow_forward" size={16} />
-                        <div className="flow-node flow-upstream">
-                          <span className="flow-node-label">{t('table.upstream')}</span>
-                          <strong>{rule.upstream}</strong>
-                          <small>{upstream ? targetSummary(upstream, lang) : 'missing upstream'}</small>
-                        </div>
-                        <div className="flow-metrics">
-                          <span>{formatNumber(requests)} {t('ops.requestsShort')}</span>
-                          <strong>{avgLatency > 0 ? `${t('ops.avgLatencyShort')} ${formatLatency(avgLatency)}` : `${t('ops.avgLatencyShort')} —`}</strong>
-                        </div>
-                        <div className="flow-rule-popover" role="tooltip">
-                          <span>{t('table.rule')} · {rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
-                          <strong>{rule.name || rule.id || '-'}</strong>
-                          <small>{rule.is_fallback ? t('rule.fallbackHelp') : summarizeRuleMatch(rule)}</small>
-                        </div>
+            <div className="routing-canvas-shell">
+              <div className="routing-canvas-toolbar">
+                <button className="canvas-tool-btn" type="button" title={t('ops.zoomOut')} onClick={() => updateRouteZoom(-0.1)}><Icon name="remove" size={16} /></button>
+                <button className="canvas-zoom-readout" type="button" title={t('ops.zoomReset')} onClick={() => setRouteZoom(1)}>{routeZoomPercent}%</button>
+                <button className="canvas-tool-btn" type="button" title={t('ops.zoomIn')} onClick={() => updateRouteZoom(0.1)}><Icon name="add" size={16} /></button>
+              </div>
+              <div className="routing-canvas-viewport">
+                <div className="routing-canvas-surface" style={{ transform: `scale(${routeZoom})` }}>
+                  {routeFlowGroups.length > 0 ? routeFlowGroups.map((group) => (
+                    <div className="flow-group" key={group.entry} style={{ borderLeftColor: group.color }}>
+                      <div className="flow-node flow-entry">
+                        <span className="flow-node-label">{t('ops.entry')}</span>
+                        <strong>{group.entry}</strong>
+                        <small>{lang === 'en' ? `${group.flows.length} route${group.flows.length !== 1 ? 's' : ''}` : `${group.flows.length} 条链路`}</small>
                       </div>
-                    ))}
-                  </div>
+                      <div className="flow-trunk" aria-hidden="true"><span /></div>
+                      <div className="flow-branches">
+                        {group.flows.map(({ rule, upstream, requests, avgLatency, color }, index) => {
+                          const locationText = summarizeLocation(rule.location);
+                          const hostText = summarizeHost(rule.host, t);
+                          const ruleText = rule.name || rule.id || '-';
+                          const upstreamHealthItem = upstreamHealthByName[rule.upstream];
+                          const flowHealth = flowHealthVisual(upstreamHealthItem);
+                          return (
+                            <div
+                              className={`flow-branch ${rule.is_fallback ? 'is-fallback' : ''} ${flowHealth.className}`}
+                              key={rule.id || `${group.entry}-${index}`}
+                              style={{ '--flow-color': flowHealth.color } as CSSProperties}
+                            >
+                              <span className="flow-motion-line" aria-hidden="true"><span /></span>
+                              <span className="flow-branch-rail" style={{ background: color }} />
+                              <div className="flow-priority">
+                                <span title={rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}>
+                                  {rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}
+                                </span>
+                                {rule.is_fallback && <Icon name="shield" size={15} />}
+                              </div>
+                              <Icon name="arrow_forward" size={16} />
+                              <div className="flow-node flow-host">
+                                <span className="flow-node-label">{t('table.host')}</span>
+                                <strong title={hostText}>{hostText}</strong>
+                              </div>
+                              <Icon name="arrow_forward" size={16} />
+                              <div className="flow-node flow-location">
+                                <span className="flow-node-label">{t('table.location')}</span>
+                                <strong title={locationText}>{locationText}</strong>
+                              </div>
+                              <Icon name="arrow_forward" size={16} />
+                              <div className="flow-node flow-rule-name">
+                                <span className="flow-node-label">{t('table.rule')}</span>
+                                <strong title={`${ruleText} · ${rule.id}`}>{ruleText}</strong>
+                              </div>
+                              <Icon name="arrow_forward" size={16} />
+                              <div className="flow-node flow-upstream">
+                                <span className="flow-node-label">{t('table.upstream')}</span>
+                                <strong title={rule.upstream}>{rule.upstream}</strong>
+                                <small title={upstream ? targetSummary(upstream, lang) : 'missing upstream'}>{upstream ? targetSummary(upstream, lang) : 'missing upstream'}</small>
+                              </div>
+                              <div className="flow-metrics">
+                                <span>{formatNumber(requests)} {t('ops.requestsShort')}</span>
+                                <strong>{avgLatency > 0 ? `${t('ops.avgLatencyShort')} ${formatLatency(avgLatency)}` : `${t('ops.avgLatencyShort')} —`}</strong>
+                              </div>
+                              <div className="flow-rule-popover" role="tooltip">
+                                <span>{t('table.rule')} · {rule.is_fallback ? t('rule.fallback') : `${t('ops.priorityShort')}${rule.priority}`}</span>
+                                <strong>{ruleText}</strong>
+                                <small>{rule.is_fallback ? t('rule.fallbackHelp') : summarizeRuleMatch(rule)}</small>
+                                <div className={`popover-health ${flowHealth.className}`}>
+                                  <span>{t('table.healthCheck')}</span>
+                                  <strong>{healthSummaryText(upstreamHealthItem, t, upstream)}</strong>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="flow-empty">
+                      <Icon name="alt_route" size={22} />
+                      <span>{t('ops.noRoutes')}</span>
+                      <strong>{config.proxy_listen || '0.0.0.0:80'} → {config.fallback?.url}</strong>
+                    </div>
+                  )}
                 </div>
-              )) : (
-                <div className="flow-empty">
-                  <Icon name="alt_route" size={22} />
-                  <span>{t('ops.noRoutes')}</span>
-                  <strong>{config.proxy_listen || '0.0.0.0:80'} → {config.fallback?.url}</strong>
-                </div>
-              )}
+              </div>
             </div>
           </div>
           <div className="traffic-card">
@@ -864,7 +1061,7 @@ function OperationsView({ config, token }: { config: AppConfig; token: string })
               <ResourceMetric
                 label={t('inspector.connections')}
                 value={formatNumber(activeConns)}
-                hint="proxy_active_connections"
+                hint="rustproxy_proxy_active_connections"
                 icon="hub"
                 tone="info"
                 progress={clampPercent((activeConns / 100) * 100)}
@@ -899,6 +1096,104 @@ function ResourceMetric({ label, value, hint, icon, tone, progress }: { label: s
   );
 }
 
+/* ===== Monitoring View ===== */
+
+function MonitoringView({ config, token }: { config: AppConfig; token: string }) {
+  const { t } = useI18n();
+  const entries = useMemo(() => uniqueListeners(config), [config]);
+  const routeOptions = useMemo(() => [
+    { value: '', label: t('monitoring.allRoutes') },
+    ...config.rules.map((rule) => ({ value: routeKey(rule), label: `${rule.name || rule.id} -> ${rule.upstream}` })),
+  ], [config.rules, t]);
+  const [entry, setEntry] = useState(entries[0] ?? config.proxy_listen ?? '0.0.0.0:80');
+  const [route, setRoute] = useState('');
+  const [series, setSeries] = useState<Record<string, ChartPoint[]>>({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!entries.includes(entry) && entries[0]) setEntry(entries[0]);
+  }, [entries, entry]);
+
+  useEffect(() => {
+    if (!monitoringEnabled(config)) return;
+    let active = true;
+    async function load() {
+      setLoading(true);
+      setError('');
+      const end = Math.floor(Date.now() / 1000);
+      const start = end - 15 * 60;
+      const step = '15s';
+      const labels = monitoringLabelSelector(entry, config.rules.find((rule) => routeKey(rule) === route));
+      const queries: Record<string, string> = {
+        rps: `sum(rate(rustproxy_proxy_requests_total{${labels}}[1m]))`,
+        errorRate: `sum(rate(rustproxy_proxy_requests_total{${labels},status=~"5.."}[1m])) / clamp_min(sum(rate(rustproxy_proxy_requests_total{${labels}}[1m])), 0.001) * 100`,
+        p50: `histogram_quantile(0.50, sum(rate(rustproxy_proxy_request_duration_seconds_bucket{${labels}}[5m])) by (le)) * 1000`,
+        p95: `histogram_quantile(0.95, sum(rate(rustproxy_proxy_request_duration_seconds_bucket{${labels}}[5m])) by (le)) * 1000`,
+        p99: `histogram_quantile(0.99, sum(rate(rustproxy_proxy_request_duration_seconds_bucket{${labels}}[5m])) by (le)) * 1000`,
+        cpu: `rate(rustproxy_process_cpu_seconds_total[1m]) * 100`,
+        memory: `rustproxy_process_resident_memory_bytes`,
+      };
+      try {
+        const result = await Promise.all(Object.entries(queries).map(async ([key, query]) => {
+          const data = await prometheusRange(token, query, start, end, step);
+          return [key, firstSeries(data)] as const;
+        }));
+        if (active) setSeries(Object.fromEntries(result));
+      } catch (err) {
+        if (active) setError(errorMessage(err));
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    load();
+    const timer = window.setInterval(load, 15000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [config, entry, route, token]);
+
+  if (!monitoringEnabled(config)) {
+    return <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}><ViewHeader title={t('monitoring.title')} subtitle={t('monitoring.sub')} /><div className="monitoring-empty"><Icon name="query_stats" size={24} /><span>{t('monitoring.disabled')}</span></div></div>;
+  }
+
+  const hasData = Object.values(series).some((points) => points.length > 0);
+  const scrapeTarget = `${config.listen || '0.0.0.0:3000'}/metrics`;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <ViewHeader title={t('monitoring.title')} subtitle={t('monitoring.sub')} />
+      <div className="monitoring-toolbar">
+        <Field label={t('monitoring.entry')}><Dropdown value={entry} options={entries.map((value) => ({ value, label: value }))} onChange={setEntry} /></Field>
+        <Field label={t('monitoring.route')}><Dropdown value={route} options={routeOptions} onChange={setRoute} /></Field>
+      </div>
+      {(error || (!loading && !hasData)) && <div className="monitoring-empty"><Icon name="info" size={20} /><span>{error || t('monitoring.noData')}</span><small>{t('monitoring.scrapeHint')}{scrapeTarget}</small></div>}
+      <div className="monitoring-grid">
+        <MetricChart title={t('monitoring.rps')} points={series.rps ?? []} unit="" />
+        <MetricChart title={t('monitoring.errorRate')} points={series.errorRate ?? []} unit="%" />
+        <MetricChart title={t('monitoring.p50')} points={series.p50 ?? []} unit="ms" />
+        <MetricChart title={t('monitoring.p95')} points={series.p95 ?? []} unit="ms" />
+        <MetricChart title={t('monitoring.p99')} points={series.p99 ?? []} unit="ms" />
+        <MetricChart title={t('monitoring.cpu')} points={series.cpu ?? []} unit="%" />
+        <MetricChart title={t('monitoring.memory')} points={series.memory ?? []} formatter={formatBytes} />
+      </div>
+    </div>
+  );
+}
+
+function MetricChart({ title, points, unit, formatter }: { title: string; points: ChartPoint[]; unit?: string; formatter?: (v: number) => string }) {
+  const latest = points.at(-1)?.v ?? 0;
+  const display = formatter ? formatter(latest) : `${Number.isFinite(latest) ? latest.toFixed(latest >= 10 ? 1 : 2) : '0'}${unit ? ` ${unit}` : ''}`;
+  const path = sparklinePath(points, 520, 150);
+  return (
+    <div className="monitor-chart">
+      <div className="monitor-chart-head"><span>{title}</span><strong>{display}</strong></div>
+      <svg viewBox="0 0 520 150" preserveAspectRatio="none" role="img">
+        <path className="monitor-chart-grid" d="M0 120H520 M0 80H520 M0 40H520" />
+        {path ? <path className="monitor-chart-line" d={path} /> : <text x="260" y="82" textAnchor="middle">no data</text>}
+      </svg>
+    </div>
+  );
+}
+
 /* ===== Rules View ===== */
 
 function RulesView({ config, token, setConfig, setNotice }: DataProps) {
@@ -926,6 +1221,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
       priority: draft.is_fallback ? 0 : draft.priority,
       weight: 100,
       listen: draft.listen || defaultListen,
+      request_timeout: draft.is_fallback ? 0 : Number(draft.request_timeout ?? 0),
       tls: draft.is_fallback ? null : draft.tls?.enabled ? { enabled: true, certificate: draft.tls.certificate } : null,
     };
     await api<Rule>(editing ? `/api/rules/${encodeURIComponent(editing)}` : '/api/rules', { method: editing ? 'PUT' : 'POST', token, body });
@@ -1028,6 +1324,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
             {!draft.is_fallback && <section className="form-section">
               <h3 className="form-section-title">{t('form.routing')}</h3>
               <Field label={t('table.priority')}><input type="number" value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: Number(e.target.value) })} /></Field>
+              <Field label={t('rule.requestTimeout')}><input type="number" min="0" placeholder={t('rule.requestTimeoutInherit')} value={draft.request_timeout ?? 0} onChange={(e) => setDraft({ ...draft, request_timeout: Number(e.target.value) })} /></Field>
               <Field label={t('table.pool')}>
                 <Dropdown
                   value={draft.upstream}
@@ -1338,7 +1635,20 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
   const [draft, setDraft] = useState<Upstream>(newUpstream());
   const [editing, setEditing] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
+  const [upstreamHealth, setUpstreamHealth] = useState<UpstreamHealth[]>([]);
   const upstreams = Object.values(config.upstreams ?? {});
+  const upstreamHealthByName = useMemo(() => Object.fromEntries(upstreamHealth.map((item) => [item.upstream, item])), [upstreamHealth]);
+
+  useEffect(() => {
+    let active = true;
+    async function loadHealth() {
+      const health = await api<UpstreamHealth[]>('/api/upstream-health', { token }).catch(() => []);
+      if (active) setUpstreamHealth(health);
+    }
+    loadHealth();
+    const timer = window.setInterval(loadHealth, 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token]);
 
   function openCreate() { setEditing(null); setDraft(newUpstream()); setShowModal(true); }
   function openEdit(u: Upstream) { setEditing(u.name); setDraft({ ...structuredClone(u), health_check: normalizeHealthCheck(u.health_check) }); setShowModal(true); }
@@ -1376,7 +1686,7 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
             <tr key={u.name}>
               <td style={{ fontWeight: 500 }}>{u.name}</td>
               <td className="td-mono">{u.targets.map((tgt) => `${tgt.url} (${tgt.weight})`).join(', ')}</td>
-              <td><HealthCheckSummary upstream={u} /></td>
+              <td><HealthCheckSummary upstream={u} health={upstreamHealthByName[u.name]} /></td>
               <td className="td-actions">
                 <button className="btn btn-ghost btn-sm" onClick={() => openEdit(u)}>{t('action.edit')}</button>
                 <button className="btn btn-danger btn-sm" onClick={() => remove(u.name)}>{t('action.del')}</button>
@@ -1429,15 +1739,17 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
 
 /* ===== Health Check Components ===== */
 
-function HealthCheckSummary({ upstream }: { upstream: Upstream }) {
+function HealthCheckSummary({ upstream, health }: { upstream: Upstream; health?: UpstreamHealth }) {
   const { t } = useI18n();
   const check = normalizeHealthCheck(upstream.health_check);
   if (!check.enabled) return <span style={{ color: 'var(--muted-foreground)' }}>{t('table.off')}</span>;
+  const visual = flowHealthVisual(health);
   return (
-    <div className="health-summary">
+    <div className={`health-summary ${visual.className}`} style={{ '--flow-color': visual.color } as CSSProperties}>
       <span className="td-badge">{check.mode.toUpperCase()}</span>
       <span className="health-summary-text">{check.mode === 'http' ? `${check.path} -> ${check.expected_status}` : t('health.hostPort')}</span>
       <span className="health-summary-muted">{check.interval_seconds}s / {check.timeout_seconds}s</span>
+      <span className="health-result"><span className="health-dot" />{healthSummaryText(health, t, upstream)}</span>
     </div>
   );
 }
@@ -1561,8 +1873,8 @@ function CertificatesView({ config, token, setConfig, setNotice }: DataProps) {
 
 function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
   const { t } = useI18n();
-  const [text, setText] = useState(() => yaml.dump(config, { lineWidth: 110 }));
-  useEffect(() => setText(yaml.dump(config, { lineWidth: 110 })), [config]);
+  const [text, setText] = useState(() => dumpConfigYaml(config));
+  useEffect(() => setText(dumpConfigYaml(config)), [config]);
   const lineCount = text.split('\n').length;
   const parsedConfig = useMemo(() => {
     try { return yaml.load(text) as AppConfig; } catch { return null; }
@@ -1581,17 +1893,38 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
   const isValid = useMemo(() => { try { yaml.load(text); return true; } catch { return false; } }, [text]);
   function updateGlobal(patch: Partial<AppConfig>) {
     const next = { ...(parsedConfig ?? config), ...patch };
-    setText(yaml.dump(next, { lineWidth: 110 }));
+    setText(dumpConfigYaml(next));
   }
 
   function updateFallbackUrl(url: string) {
     const current = parsedConfig ?? config;
-    setText(yaml.dump({ ...current, fallback: { ...(current.fallback ?? { url: '' }), url } }, { lineWidth: 110 }));
+    setText(dumpConfigYaml({ ...current, fallback: { ...(current.fallback ?? { url: '' }), url } }));
   }
 
   function updateAccessLog(patch: NonNullable<AppConfig['access_log']>) {
     const current = parsedConfig ?? config;
-    setText(yaml.dump({ ...current, access_log: { enabled: false, path: null, buffer_size: 8192, ...(current.access_log ?? {}), ...patch } }, { lineWidth: 110 }));
+    setText(dumpConfigYaml({ ...current, access_log: { enabled: false, path: null, buffer_size: 8192, level: 'info', ...(current.access_log ?? {}), ...patch } }));
+  }
+
+  function updateMonitoring(patch: NonNullable<AppConfig['monitoring']>) {
+    const current = parsedConfig ?? config;
+    const currentMonitoring = current.monitoring ?? emptyConfig.monitoring!;
+    setText(dumpConfigYaml({ ...current, monitoring: { ...currentMonitoring, ...patch } }));
+  }
+
+  function updatePrometheus(patch: NonNullable<NonNullable<AppConfig['monitoring']>['prometheus']>) {
+    const current = parsedConfig ?? config;
+    const currentMonitoring = current.monitoring ?? emptyConfig.monitoring!;
+    const prometheus = currentMonitoring.prometheus ?? emptyConfig.monitoring!.prometheus!;
+    setText(dumpConfigYaml({ ...current, monitoring: { ...currentMonitoring, prometheus: { ...prometheus, ...patch } } }));
+  }
+
+  function updatePrometheusAuth(patch: NonNullable<NonNullable<NonNullable<AppConfig['monitoring']>['prometheus']>['auth']>) {
+    const current = parsedConfig ?? config;
+    const currentMonitoring = current.monitoring ?? emptyConfig.monitoring!;
+    const prometheus = currentMonitoring.prometheus ?? emptyConfig.monitoring!.prometheus!;
+    const auth = prometheus.auth ?? { auth_type: 'none' };
+    setText(dumpConfigYaml({ ...current, monitoring: { ...currentMonitoring, prometheus: { ...prometheus, auth: { ...auth, ...patch } } } }));
   }
 
   return (
@@ -1632,16 +1965,43 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <Field label={t('config.accessLogPath')}>
               <input value={globalConfig.access_log?.path ?? ''} placeholder={t('config.accessLogPathHint')} onChange={(e) => updateAccessLog({ path: e.target.value.trim() ? e.target.value : null })} />
             </Field>
+            <Field label={t('config.accessLogLevel')}>
+              <Dropdown value={globalConfig.access_log?.level ?? 'info'} options={ACCESS_LOG_LEVEL_OPTIONS} onChange={(level) => updateAccessLog({ level: level as AccessLogLevel })} />
+            </Field>
             <Field label={t('config.accessLogBuffer')}><input type="number" min="1" value={globalConfig.access_log?.buffer_size ?? 8192} onChange={(e) => updateAccessLog({ buffer_size: Number(e.target.value) })} /></Field>
+          </div>
+          <div className="card global-config-card">
+            <h3 className="card-title-sm">{t('config.monitoring')}</h3>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={Boolean(globalConfig.monitoring?.enabled)} onChange={(e) => updateMonitoring({ enabled: e.target.checked })} />
+              <span>{t('config.monitoringEnabled')}</span>
+            </label>
+            <Field label={t('config.prometheusUrl')}><input value={globalConfig.monitoring?.prometheus?.url ?? ''} placeholder="http://127.0.0.1:9090" onChange={(e) => updatePrometheus({ url: e.target.value })} /></Field>
+            <Field label={t('config.authType')}>
+              <Dropdown
+                value={globalConfig.monitoring?.prometheus?.auth?.auth_type ?? 'none'}
+                options={['none', 'basic', 'bearer', 'header'].map((value) => ({ value, label: value }))}
+                onChange={(auth_type) => updatePrometheusAuth({ auth_type })}
+              />
+            </Field>
+            {globalConfig.monitoring?.prometheus?.auth?.auth_type === 'basic' && <>
+              <Field label={t('config.username')}><input value={globalConfig.monitoring?.prometheus?.auth?.username ?? ''} onChange={(e) => updatePrometheusAuth({ username: e.target.value })} /></Field>
+              <Field label={t('config.password')}><input type="password" value={globalConfig.monitoring?.prometheus?.auth?.password ?? ''} onChange={(e) => updatePrometheusAuth({ password: e.target.value })} /></Field>
+            </>}
+            {globalConfig.monitoring?.prometheus?.auth?.auth_type === 'bearer' && <Field label={t('config.bearerToken')}><input type="password" value={globalConfig.monitoring?.prometheus?.auth?.bearer_token ?? ''} onChange={(e) => updatePrometheusAuth({ bearer_token: e.target.value })} /></Field>}
+            {globalConfig.monitoring?.prometheus?.auth?.auth_type === 'header' && <>
+              <Field label={t('config.headerName')}><input value={globalConfig.monitoring?.prometheus?.auth?.header_name ?? ''} onChange={(e) => updatePrometheusAuth({ header_name: e.target.value })} /></Field>
+              <Field label={t('config.headerValue')}><input type="password" value={globalConfig.monitoring?.prometheus?.auth?.header_value ?? ''} onChange={(e) => updatePrometheusAuth({ header_value: e.target.value })} /></Field>
+            </>}
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.schema')}</h3>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log.level, monitoring.prometheus, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions(header/cookie/jwt)</span></div>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, host, location, priority, tls, match_set, conditions, upstream</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, request_timeout, host, location, priority, tls, match_set, conditions, upstream</span></div>
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.validation')}</h3>
@@ -1744,12 +2104,24 @@ async function api<T>(path: string, options: { method?: string; token?: string; 
   });
   const contentType = response.headers.get('content-type') ?? '';
   const payload = contentType.includes('application/json') ? await response.json() as ApiResponse<T> : null;
+  if (response.status === 401 && options.token) {
+    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+  }
   if (!response.ok || payload?.success === false) throw new Error(payload?.error ?? `HTTP ${response.status}`);
   return payload?.data as T;
 }
 
 async function refreshConfig(token: string, setConfig: (c: AppConfig) => void, setNotice: (n: Notice) => void) {
   try { setConfig(await api<AppConfig>('/api/config', { token })); } catch (error) { setNotice({ type: 'error', message: errorMessage(error) }); }
+}
+
+async function prometheusRange(token: string, query: string, start: number, end: number, step: string): Promise<PrometheusRangeResult> {
+  const params = new URLSearchParams({ query, start: String(start), end: String(end), step });
+  return api<PrometheusRangeResult>(`/api/monitoring/query-range?${params}`, { token });
+}
+
+function firstSeries(result: PrometheusRangeResult): ChartPoint[] {
+  return result.data?.result?.[0]?.values?.map(([t, v]) => ({ t, v: Number(v) })).filter((point) => Number.isFinite(point.v)) ?? [];
 }
 
 function parsePrometheus(text: string): PrometheusMetric[] {
@@ -1769,6 +2141,47 @@ function metricValue(metrics: PrometheusMetric[], name: string): number | null {
   return metrics.find((metric) => metric.name === name)?.value ?? null;
 }
 
+function monitoringEnabled(config: AppConfig): boolean {
+  return Boolean(config.monitoring?.enabled && config.monitoring?.prometheus?.url?.trim());
+}
+
+function uniqueListeners(config: AppConfig): string[] {
+  const listeners = new Set<string>();
+  listeners.add(config.proxy_listen || '0.0.0.0:80');
+  config.rules.forEach((rule) => listeners.add(rule.listen || config.proxy_listen || '0.0.0.0:80'));
+  return [...listeners];
+}
+
+function routeKey(rule: Rule): string {
+  return `${rule.name || rule.id}\u0000${rule.upstream}`;
+}
+
+function monitoringLabelSelector(entry: string, rule?: Rule): string {
+  const parts = [`listen="${escapePromLabel(entry)}"`];
+  if (rule) {
+    parts.push(`rule="${escapePromLabel(rule.name || rule.id)}"`);
+    parts.push(`upstream="${escapePromLabel(rule.upstream)}"`);
+  }
+  return parts.join(',');
+}
+
+function escapePromLabel(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
+function sparklinePath(points: ChartPoint[], width: number, height: number): string {
+  if (points.length === 0) return '';
+  const values = points.map((p) => p.v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  return points.map((point, index) => {
+    const x = points.length === 1 ? width : (index / (points.length - 1)) * width;
+    const y = height - ((point.v - min) / span) * (height - 20) - 10;
+    return `${index === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
+  }).join(' ');
+}
+
 function formatNumber(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
   if (n >= 1_000) return n.toLocaleString();
@@ -1780,6 +2193,26 @@ function formatLatency(ms: number): string {
   if (ms < 1) return `${ms.toFixed(2)} ms`;
   if (ms < 100) return `${ms.toFixed(1)} ms`;
   return `${Math.round(ms)} ms`;
+}
+
+function flowHealthVisual(health?: UpstreamHealth): { className: string; color: string } {
+  if (!health?.enabled || health.total === 0 || health.unhealthy === 0) {
+    return { className: 'flow-health-ok', color: '#0B7A3B' };
+  }
+  if (health.unhealthy >= health.total) {
+    return { className: 'flow-health-down', color: '#B42318' };
+  }
+  return { className: 'flow-health-warn', color: '#C76B00' };
+}
+
+function healthSummaryText(health: UpstreamHealth | undefined, t: (key: string) => string, upstream?: Upstream): string {
+  const checkEnabled = upstream ? normalizeHealthCheck(upstream.health_check).enabled : health?.enabled;
+  if (!checkEnabled) return t('table.off');
+  if (!health) {
+    const total = upstream?.targets.length ?? 0;
+    return `${t('table.healthTotal')} ${total}, ${t('table.healthUnhealthy')} ${t('table.healthUnknown')}`;
+  }
+  return `${t('table.healthTotal')} ${health.total}, ${t('table.healthUnhealthy')} ${health.unhealthy}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -1795,7 +2228,7 @@ function clampPercent(value: number): number {
 }
 
 function newRule(upstream = '', listen = '0.0.0.0:80'): Rule {
-  return { id: '', name: '', priority: 10, host: { type: 'any', value: null }, location: { type: 'prefix', value: '/' }, match_set: null, upstream, weight: 100, is_fallback: false, listen, conditions: createLeafCondition() };
+  return { id: '', name: '', priority: 10, host: { type: 'any', value: null }, location: { type: 'prefix', value: '/' }, match_set: null, upstream, weight: 100, is_fallback: false, listen, request_timeout: 0, conditions: createLeafCondition() };
 }
 
 function newMatchSet(): MatchSet {

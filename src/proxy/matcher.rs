@@ -1,7 +1,7 @@
 use std::{cell::OnceCell, collections::HashMap};
 
 use http::{HeaderMap, Request};
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{DecodingKey, Validation, decode};
 use regex::Regex;
 use serde_json::Value;
 
@@ -599,7 +599,7 @@ fn contains_ignore_ascii_case(actual: &str, expected: &str) -> bool {
 }
 
 fn decode_jwt_payload(token: &str) -> Option<Value> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     let mut parts = token.splitn(3, '.');
     let _header = parts.next()?;
@@ -695,6 +695,7 @@ mod tests {
             weight: 100,
             is_fallback: false,
             listen: None,
+            request_timeout: 0,
             tls: None,
         }
     }
@@ -759,7 +760,7 @@ mod tests {
 
     // Helper to create a test JWT (header.payload.signature with base64url encoding)
     fn create_test_jwt(claims: serde_json::Value) -> String {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use std::collections::HashMap;
 
         let header = HashMap::from([
@@ -1051,9 +1052,11 @@ mod tests {
         assert!(matcher.match_request(&request_with_header, None).is_some());
 
         let request_without_header = create_request_with_headers(&[("Host", "example.com")]);
-        assert!(matcher
-            .match_request(&request_without_header, None)
-            .is_none());
+        assert!(
+            matcher
+                .match_request(&request_without_header, None)
+                .is_none()
+        );
     }
 
     #[test]

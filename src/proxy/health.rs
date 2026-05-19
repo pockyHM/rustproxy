@@ -251,7 +251,7 @@ fn socket_addr_from_target(target_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{health_uri, socket_addr_from_target, HealthRegistry};
+    use super::{HealthRegistry, health_uri, socket_addr_from_target};
 
     #[test]
     fn tcp_health_uses_only_target_authority() {

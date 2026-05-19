@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "rustproxy")]
 #[command(about = "High-performance Rust traffic routing proxy")]
-#[command(version)]
+#[command(version = crate::version::BUILD_VERSION)]
 pub struct Cli {
     /// Path to SQLite database file
     #[arg(
@@ -48,7 +48,7 @@ pub enum Commands {
 pub enum ConfigCommands {
     /// Print current configuration, or one top-level config value
     Get {
-        /// Config key to print (version, listen, proxy_listen, fallback_url, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive)
+        /// Config key to print (listen, proxy_listen, fallback_url, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive)
         key: Option<String>,
     },
 

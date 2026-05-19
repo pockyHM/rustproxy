@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
-use crate::config::yaml::{AccessLogConfig, AppConfig, Certificate, Fallback, TlsListener};
+use crate::config::yaml::{
+    AccessLogConfig, AppConfig, Certificate, Fallback, MonitoringConfig, TlsListener,
+};
 use crate::models::{
     ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType, HostMatcher,
     LocationMatchType, LocationMatcher, MatchSet, Operator, Rule, RuleTls, Target, Upstream,
@@ -304,9 +306,6 @@ fn load_proxy_listen(conn: &Connection) -> Result<String> {
 }
 
 fn load_config(conn: &Connection) -> Result<AppConfig> {
-    let version = get_setting(conn, "version")
-        .unwrap_or(None)
-        .unwrap_or_default();
     let listen = get_setting(conn, "listen")
         .unwrap_or(None)
         .unwrap_or_else(|| "0.0.0.0:3000".to_string());
@@ -343,6 +342,10 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         .unwrap_or(None)
         .and_then(|v| serde_json::from_str::<AccessLogConfig>(&v).ok())
         .unwrap_or_default();
+    let monitoring = get_setting(conn, "monitoring")
+        .unwrap_or(None)
+        .and_then(|v| serde_json::from_str::<MonitoringConfig>(&v).ok())
+        .unwrap_or_default();
     let certificates = get_setting(conn, "certificates")
         .unwrap_or(None)
         .and_then(|v| serde_json::from_str::<Vec<Certificate>>(&v).ok())
@@ -365,7 +368,6 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     }
 
     let mut config = AppConfig {
-        version,
         listen,
         proxy_listen,
         connect_timeout,
@@ -375,6 +377,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         tcp_keepalive,
         certificate_dir,
         access_log,
+        monitoring,
         certificates,
         tls_listeners,
         match_sets,
@@ -388,7 +391,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
 
 fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value FROM rules ORDER BY priority DESC, rowid ASC"
+        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout FROM rules ORDER BY priority DESC, rowid ASC"
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -406,6 +409,7 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
         let host_value: Option<String> = row.get(12)?;
         let location_type: Option<String> = row.get(13)?;
         let location_value: Option<String> = row.get(14)?;
+        let request_timeout: u64 = row.get::<_, i64>(15)? as u64;
         let conditions =
             expr_json.and_then(|json| serde_json::from_str::<ConditionExpr>(&json).ok());
         Ok(Rule {
@@ -426,6 +430,7 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
             weight,
             is_fallback,
             listen,
+            request_timeout,
             tls: tls_certificate.map(|certificate| RuleTls {
                 enabled: tls_enabled,
                 certificate,
@@ -449,8 +454,8 @@ fn insert_rule(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
     let tls_enabled = rule.tls.as_ref().is_some_and(|tls| tls.enabled);
     let tls_certificate = rule.tls.as_ref().map(|tls| tls.certificate.as_str());
     tx.execute(
-        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value],
+        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout],
     )?;
     Ok(())
 }
@@ -536,7 +541,6 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
     let mut config = config.clone();
     config.normalize_rules();
 
-    set_setting_tx(tx, "version", &config.version)?;
     set_setting_tx(tx, "listen", &config.listen)?;
     set_setting_tx(tx, "proxy_listen", &config.proxy_listen)?;
     set_setting_tx(tx, "fallback_url", &config.fallback.url)?;
@@ -558,6 +562,11 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
         tx,
         "access_log",
         &serde_json::to_string(&config.access_log)?,
+    )?;
+    set_setting_tx(
+        tx,
+        "monitoring",
+        &serde_json::to_string(&config.monitoring)?,
     )?;
     set_setting_tx(
         tx,
@@ -647,8 +656,8 @@ fn update_rule_row(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
     let tls_enabled = rule.tls.as_ref().is_some_and(|tls| tls.enabled);
     let tls_certificate = rule.tls.as_ref().map(|tls| tls.certificate.as_str());
     let changes = tx.execute(
-        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14 WHERE id = ?15",
-        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.id],
+        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14, request_timeout = ?15 WHERE id = ?16",
+        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, rule.id],
     )?;
     if changes == 0 {
         anyhow::bail!("rule '{}' not found", rule.id);
@@ -765,6 +774,7 @@ CREATE TABLE IF NOT EXISTS rules (
     host_value      TEXT,
     location_type   TEXT NOT NULL DEFAULT 'prefix',
     location_value  TEXT NOT NULL DEFAULT '/',
+    request_timeout INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -828,6 +838,12 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'prefix'",
     )?;
     add_column_if_missing(conn, "rules", "location_value", "TEXT NOT NULL DEFAULT '/'")?;
+    add_column_if_missing(
+        conn,
+        "rules",
+        "request_timeout",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     add_column_if_missing(conn, "upstreams", "skip_ssl", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "upstreams", "websocket", "INTEGER NOT NULL DEFAULT 0")?;
@@ -963,7 +979,6 @@ mod tests {
     fn make_test_config() -> AppConfig {
         use crate::models::ConditionExpr;
         AppConfig {
-            version: "1.0".to_string(),
             listen: "0.0.0.0:8080".to_string(),
             proxy_listen: "0.0.0.0:80".to_string(),
             match_sets: vec![MatchSet {
@@ -1005,6 +1020,7 @@ mod tests {
                 weight: 100,
                 is_fallback: false,
                 listen: None,
+                request_timeout: 0,
                 tls: None,
             }],
             upstreams: {
@@ -1040,6 +1056,7 @@ mod tests {
             tcp_keepalive: 60,
             certificate_dir: "/etc/rustproxy/cert.d".to_string(),
             access_log: Default::default(),
+            monitoring: Default::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
         }
@@ -1054,7 +1071,6 @@ mod tests {
         db.save_full_config(&config).unwrap();
         let loaded = db.load_config().unwrap();
 
-        assert_eq!(loaded.version, "1.0");
         assert_eq!(loaded.listen, "0.0.0.0:8080");
         assert_eq!(loaded.fallback.url, "http://fallback");
         assert_eq!(loaded.rules.len(), 1);
@@ -1108,12 +1124,14 @@ mod tests {
             weight: 50,
             is_fallback: false,
             listen: None,
+            request_timeout: 7,
             tls: None,
         };
         db.update_rule(&updated_rule).unwrap();
         let rules = db.list_rules().unwrap();
         assert_eq!(rules[0].name, "Updated");
         assert_eq!(rules[0].priority, 20);
+        assert_eq!(rules[0].request_timeout, 7);
         assert!(rules[0].conditions.is_some());
 
         assert!(db.delete_rule("rule-1").unwrap());

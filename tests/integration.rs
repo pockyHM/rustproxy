@@ -23,7 +23,6 @@ fn build_config() -> AppConfig {
     upstreams.insert(canary_upstream.name.clone(), canary_upstream);
 
     AppConfig {
-        version: "1.0".to_string(),
         listen: "127.0.0.1:0".to_string(),
         proxy_listen: "0.0.0.0:80".to_string(),
         rules: vec![Rule {
@@ -44,6 +43,7 @@ fn build_config() -> AppConfig {
             weight: 100,
             is_fallback: false,
             listen: None,
+            request_timeout: 0,
             tls: None,
         }],
         upstreams,
@@ -57,6 +57,7 @@ fn build_config() -> AppConfig {
         tcp_keepalive: 60,
         certificate_dir: "/etc/rustproxy/cert.d".to_string(),
         access_log: Default::default(),
+        monitoring: Default::default(),
         certificates: Vec::new(),
         tls_listeners: Vec::new(),
         match_sets: Vec::new(),

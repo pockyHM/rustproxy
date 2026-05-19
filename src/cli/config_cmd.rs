@@ -2,15 +2,14 @@ use anyhow::{Context, Result};
 use std::fs;
 
 use crate::cli::{RuleCommands, UpstreamCommands};
-use crate::config::yaml::{AppConfig, Fallback};
-use crate::db::{migration, Database};
+use crate::config::yaml::{AccessLogLevel, AppConfig, Fallback};
+use crate::db::{Database, migration};
 use crate::models::{
     ConditionExpr, ConditionType, HostMatchType, HostMatcher, LocationMatchType, LocationMatcher,
     Operator, Rule, Target, Upstream,
 };
 
 const CONFIG_KEYS: &[&str] = &[
-    "version",
     "listen",
     "proxy_listen",
     "fallback_url",
@@ -22,6 +21,7 @@ const CONFIG_KEYS: &[&str] = &[
     "access_log_enabled",
     "access_log_path",
     "access_log_buffer_size",
+    "access_log_level",
 ];
 
 pub fn run_get(db_path: &str, key: Option<&str>) -> Result<()> {
@@ -169,6 +169,7 @@ pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
                 weight,
                 is_fallback: false,
                 listen,
+                request_timeout: 0,
                 tls: None,
             });
             config
@@ -258,9 +259,6 @@ pub fn run_edit(db_path: &str) -> Result<()> {
 }
 
 fn ensure_minimum_config(config: &mut AppConfig) {
-    if config.version.is_empty() {
-        config.version = "1.0".to_string();
-    }
     if config.listen.is_empty() {
         config.listen = "0.0.0.0:3000".to_string();
     }
@@ -277,7 +275,6 @@ fn ensure_minimum_config(config: &mut AppConfig) {
 
 fn get_config_value(config: &AppConfig, key: &str) -> Result<String> {
     match key {
-        "version" => Ok(config.version.clone()),
         "listen" => Ok(config.listen.clone()),
         "proxy_listen" => Ok(config.proxy_listen.clone()),
         "fallback_url" => Ok(config.fallback.url.clone()),
@@ -289,13 +286,13 @@ fn get_config_value(config: &AppConfig, key: &str) -> Result<String> {
         "access_log_enabled" => Ok(config.access_log.enabled.to_string()),
         "access_log_path" => Ok(config.access_log.path.clone().unwrap_or_default()),
         "access_log_buffer_size" => Ok(config.access_log.buffer_size.unwrap_or(8192).to_string()),
+        "access_log_level" => Ok(config.access_log.level.as_str().to_string()),
         _ => unknown_key(key),
     }
 }
 
 fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> Result<()> {
     match key {
-        "version" => config.version = value.to_string(),
         "listen" => {
             validate_listen_addr(value)?;
             config.listen = value.to_string();
@@ -322,9 +319,20 @@ fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> Result<()
             };
         }
         "access_log_buffer_size" => config.access_log.buffer_size = Some(parse_usize(key, value)?),
+        "access_log_level" => config.access_log.level = parse_access_log_level(value)?,
         _ => unknown_key(key)?,
     }
     Ok(())
+}
+
+fn parse_access_log_level(value: &str) -> Result<AccessLogLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "debug" => Ok(AccessLogLevel::Debug),
+        "info" => Ok(AccessLogLevel::Info),
+        "warn" | "warning" => Ok(AccessLogLevel::Warn),
+        "error" => Ok(AccessLogLevel::Error),
+        _ => anyhow::bail!("access_log_level must be one of debug, info, warn, error"),
+    }
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool> {
@@ -497,7 +505,6 @@ mod tests {
 
     fn config() -> AppConfig {
         AppConfig {
-            version: "1.0".to_string(),
             listen: "0.0.0.0:3000".to_string(),
             proxy_listen: "0.0.0.0:80".to_string(),
             connect_timeout: 10,
@@ -507,6 +514,7 @@ mod tests {
             tcp_keepalive: 60,
             certificate_dir: "/etc/rustproxy/cert.d".to_string(),
             access_log: Default::default(),
+            monitoring: Default::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
             match_sets: Vec::new(),
@@ -533,6 +541,7 @@ mod tests {
         set_config_value(&mut config, "access_log_enabled", "true").unwrap();
         set_config_value(&mut config, "access_log_path", "/tmp/rustproxy-access.log").unwrap();
         set_config_value(&mut config, "access_log_buffer_size", "2048").unwrap();
+        set_config_value(&mut config, "access_log_level", "warn").unwrap();
 
         assert_eq!(config.listen, "127.0.0.1:4000");
         assert_eq!(config.proxy_listen, "0.0.0.0:8080");
@@ -548,6 +557,7 @@ mod tests {
             Some("/tmp/rustproxy-access.log")
         );
         assert_eq!(config.access_log.buffer_size, Some(2048));
+        assert_eq!(config.access_log.level, AccessLogLevel::Warn);
     }
 
     #[test]
@@ -557,6 +567,7 @@ mod tests {
         assert!(set_config_value(&mut config, "listen", "127.0.0.1").is_err());
         assert!(set_config_value(&mut config, "fallback_url", "ftp://fallback.local").is_err());
         assert!(set_config_value(&mut config, "connect_timeout", "-1").is_err());
+        assert!(set_config_value(&mut config, "access_log_level", "verbose").is_err());
         assert!(set_config_value(&mut config, "missing", "value").is_err());
     }
 }

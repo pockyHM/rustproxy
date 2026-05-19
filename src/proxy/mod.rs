@@ -6,7 +6,7 @@ pub mod upstream;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::body::Body;
-use http::{header, HeaderMap, Request, Response, StatusCode, Uri};
+use http::{HeaderMap, Request, Response, StatusCode, Uri, header};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls_native_certs::load_native_certs;
@@ -87,13 +87,15 @@ pub struct ProxyClients {
 
 #[derive(Clone, Debug)]
 pub struct ProxyMetricLabels {
+    pub listen: String,
     pub rule: String,
     pub upstream: String,
 }
 
 impl ProxyMetricLabels {
-    pub fn fallback() -> Self {
+    pub fn fallback(listen: impl Into<String>) -> Self {
         Self {
+            listen: listen.into(),
             rule: "fallback".to_string(),
             upstream: "fallback".to_string(),
         }
@@ -103,6 +105,13 @@ impl ProxyMetricLabels {
 #[derive(Clone, Debug)]
 pub struct ProxyAccessLogContext {
     pub source: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyRequestContext {
+    pub access: ProxyAccessLogContext,
+    pub metric_labels: ProxyMetricLabels,
+    pub request_timeout_override: u64,
 }
 
 impl ProxyClients {
@@ -200,8 +209,7 @@ pub async fn handle_proxy_with_target(
     target_base: String,
     metrics: Option<Arc<ProxyMetrics>>,
     access_logger: Option<Arc<AccessLogger>>,
-    access_context: ProxyAccessLogContext,
-    metric_labels: ProxyMetricLabels,
+    proxy_context: ProxyRequestContext,
 ) -> Result<Response<Body>, Infallible> {
     let start = std::time::Instant::now();
     let original_method = request.method().to_string();
@@ -231,8 +239,8 @@ pub async fn handle_proxy_with_target(
             not_found_page(),
             metrics.as_deref(),
             access_logger.as_deref(),
-            &access_context,
-            &metric_labels,
+            &proxy_context.access,
+            &proxy_context.metric_labels,
             start,
             &original_method,
             &original_host,
@@ -250,8 +258,8 @@ pub async fn handle_proxy_with_target(
                 bad_gateway(),
                 metrics.as_deref(),
                 access_logger.as_deref(),
-                &access_context,
-                &metric_labels,
+                &proxy_context.access,
+                &proxy_context.metric_labels,
                 start,
                 &original_method,
                 &original_host,
@@ -264,7 +272,7 @@ pub async fn handle_proxy_with_target(
 
     tracing::debug!(target_uri = %target_uri, "proxy target resolved");
 
-    let upstream_config = config.upstreams.get(&metric_labels.upstream);
+    let upstream_config = config.upstreams.get(&proxy_context.metric_labels.upstream);
     let upstream_websocket = upstream_config.is_some_and(|upstream| upstream.websocket);
     let upstream_skip_ssl = upstream_config.is_some_and(|upstream| upstream.skip_ssl);
 
@@ -275,8 +283,8 @@ pub async fn handle_proxy_with_target(
             websocket_disabled(),
             metrics.as_deref(),
             access_logger.as_deref(),
-            &access_context,
-            &metric_labels,
+            &proxy_context.access,
+            &proxy_context.metric_labels,
             start,
             &original_method,
             &original_host,
@@ -307,8 +315,13 @@ pub async fn handle_proxy_with_target(
 
     tracing::trace!(%is_https, "proxy scheme determined");
 
-    let request_timeout = if config.request_timeout > 0 {
-        Some(Duration::from_secs(config.request_timeout))
+    let effective_request_timeout = if proxy_context.request_timeout_override > 0 {
+        proxy_context.request_timeout_override
+    } else {
+        config.request_timeout
+    };
+    let request_timeout = if effective_request_timeout > 0 {
+        Some(Duration::from_secs(effective_request_timeout))
     } else {
         None
     };
@@ -349,8 +362,8 @@ pub async fn handle_proxy_with_target(
                 resp.map(Body::new),
                 metrics.as_deref(),
                 access_logger.as_deref(),
-                &access_context,
-                &metric_labels,
+                &proxy_context.access,
+                &proxy_context.metric_labels,
                 start,
                 &original_method,
                 &original_host,
@@ -365,8 +378,8 @@ pub async fn handle_proxy_with_target(
                 bad_gateway(),
                 metrics.as_deref(),
                 access_logger.as_deref(),
-                &access_context,
-                &metric_labels,
+                &proxy_context.access,
+                &proxy_context.metric_labels,
                 start,
                 &original_method,
                 &original_host,
@@ -381,8 +394,8 @@ pub async fn handle_proxy_with_target(
                 gateway_timeout(),
                 metrics.as_deref(),
                 access_logger.as_deref(),
-                &access_context,
-                &metric_labels,
+                &proxy_context.access,
+                &proxy_context.metric_labels,
                 start,
                 &original_method,
                 &original_host,
@@ -416,6 +429,7 @@ fn record_proxy_metrics(
         metrics
             .requests_total
             .with_label_values(&[
+                labels.listen.as_str(),
                 labels.rule.as_str(),
                 labels.upstream.as_str(),
                 status.as_str(),
@@ -423,7 +437,11 @@ fn record_proxy_metrics(
             .inc();
         metrics
             .request_duration
-            .with_label_values(&[labels.rule.as_str(), labels.upstream.as_str()])
+            .with_label_values(&[
+                labels.listen.as_str(),
+                labels.rule.as_str(),
+                labels.upstream.as_str(),
+            ])
             .observe(start.elapsed().as_secs_f64());
     }
 
@@ -473,6 +491,7 @@ fn record_proxy_metrics_with_elapsed(
         metrics
             .requests_total
             .with_label_values(&[
+                labels.listen.as_str(),
                 labels.rule.as_str(),
                 labels.upstream.as_str(),
                 status.as_str(),
@@ -480,7 +499,11 @@ fn record_proxy_metrics_with_elapsed(
             .inc();
         metrics
             .request_duration
-            .with_label_values(&[labels.rule.as_str(), labels.upstream.as_str()])
+            .with_label_values(&[
+                labels.listen.as_str(),
+                labels.rule.as_str(),
+                labels.upstream.as_str(),
+            ])
             .observe(elapsed.as_secs_f64());
     }
 
@@ -586,8 +609,8 @@ fn websocket_disabled() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_target_uri, is_websocket_upgrade, not_found_page, record_proxy_metrics,
-        ProxyMetricLabels,
+        ProxyMetricLabels, build_target_uri, is_websocket_upgrade, not_found_page,
+        record_proxy_metrics,
     };
     use crate::observability::metrics::ProxyMetrics;
     use axum::body::Body;
@@ -646,6 +669,7 @@ mod tests {
     fn records_proxy_metrics_with_rule_labels() {
         let metrics = ProxyMetrics::new().unwrap();
         let labels = ProxyMetricLabels {
+            listen: "0.0.0.0:80".to_string(),
             rule: "canary-header".to_string(),
             upstream: "canary".to_string(),
         };
@@ -658,10 +682,11 @@ mod tests {
         let output = metrics.gather().unwrap();
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert!(output.contains("proxy_requests_total"));
+        assert!(output.contains("rustproxy_proxy_requests_total"));
         assert!(output.contains("rule=\"canary-header\""));
+        assert!(output.contains("listen=\"0.0.0.0:80\""));
         assert!(output.contains("upstream=\"canary\""));
         assert!(output.contains("status=\"202\""));
-        assert!(output.contains("proxy_request_duration_seconds"));
+        assert!(output.contains("rustproxy_proxy_request_duration_seconds"));
     }
 }

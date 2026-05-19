@@ -90,7 +90,6 @@ RUSTPROXY_DB=/path/to/rustproxy.db ./target/release/rustproxy serve config.yaml
 ### 配置示例
 
 ```yaml
-version: "1.0"
 listen: "0.0.0.0:3000"
 proxy_listen: "0.0.0.0:80"
 connect_timeout: 10

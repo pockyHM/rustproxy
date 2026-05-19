@@ -1,16 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use rustproxy::cli::{Cli, Commands, ConfigCommands, UserCommands};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     rustproxy::install_rustls_crypto_provider();
-
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
 
     let cli = Cli::parse();
 

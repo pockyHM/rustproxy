@@ -115,6 +115,7 @@ mod tests {
             weight: 100,
             is_fallback: false,
             listen: None,
+            request_timeout: 0,
             tls: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
@@ -194,6 +195,7 @@ mod tests {
             weight: 100,
             is_fallback: false,
             listen: None,
+            request_timeout: 0,
             tls: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
@@ -218,10 +220,55 @@ mod tests {
             weight: 100,
             is_fallback: false,
             listen: None,
+            request_timeout: 0,
             tls: None,
         };
         let rule2 = rule1.clone();
         assert_eq!(rule1, rule2);
+    }
+
+    #[test]
+    fn test_rule_omits_inherited_request_timeout() {
+        let rule = Rule {
+            id: "rule-1".to_string(),
+            name: "Test".to_string(),
+            priority: 1,
+            host: HostMatcher::default(),
+            location: LocationMatcher::default(),
+            match_set: None,
+            conditions: None,
+            upstream: "up".to_string(),
+            weight: 100,
+            is_fallback: false,
+            listen: None,
+            request_timeout: 0,
+            tls: None,
+        };
+
+        let yaml = crate::config::yaml::AppConfig {
+            listen: "0.0.0.0:3000".to_string(),
+            proxy_listen: "0.0.0.0:80".to_string(),
+            connect_timeout: 10,
+            request_timeout: 60,
+            pool_max_idle_per_host: 32,
+            pool_idle_timeout: 90,
+            tcp_keepalive: 60,
+            certificate_dir: "/etc/rustproxy/cert.d".to_string(),
+            access_log: Default::default(),
+            monitoring: Default::default(),
+            certificates: Vec::new(),
+            tls_listeners: Vec::new(),
+            match_sets: Vec::new(),
+            rules: vec![rule],
+            upstreams: std::collections::HashMap::new(),
+            fallback: crate::config::yaml::Fallback {
+                url: "404".to_string(),
+            },
+        }
+        .to_compact_yaml()
+        .unwrap();
+
+        assert!(!yaml.contains("    request_timeout: 0"));
     }
 
     #[test]
@@ -284,6 +331,8 @@ pub struct Rule {
     /// If set, the proxy binds a separate listener and routes all traffic
     /// on that port through this rule's upstream. If None, uses the default port.
     pub listen: Option<String>,
+    /// Request timeout override in seconds. 0 inherits the global request_timeout.
+    pub request_timeout: u64,
     pub tls: Option<RuleTls>,
 }
 
@@ -401,6 +450,7 @@ impl Serialize for Rule {
         state.serialize_field("weight", &self.weight)?;
         state.serialize_field("is_fallback", &self.is_fallback)?;
         state.serialize_field("listen", &self.listen)?;
+        state.serialize_field("request_timeout", &self.request_timeout)?;
         state.serialize_field("tls", &self.tls)?;
         state.end()
     }
@@ -432,6 +482,8 @@ impl<'de> Deserialize<'de> for Rule {
             #[serde(default)]
             listen: Option<String>,
             #[serde(default)]
+            request_timeout: u64,
+            #[serde(default)]
             tls: Option<RuleTls>,
         }
         let helper = RuleHelper::deserialize(deserializer)?;
@@ -447,6 +499,7 @@ impl<'de> Deserialize<'de> for Rule {
             weight: helper.weight,
             is_fallback: helper.is_fallback,
             listen: helper.listen,
+            request_timeout: helper.request_timeout,
             tls: helper.tls,
         })
     }

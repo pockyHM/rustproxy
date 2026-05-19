@@ -30,6 +30,83 @@ pub struct AccessLogConfig {
     pub path: Option<String>,
     #[serde(default = "default_access_log_buffer_size")]
     pub buffer_size: Option<usize>,
+    #[serde(default)]
+    pub level: AccessLogLevel,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLogLevel {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl AccessLogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessLogLevel::Debug => "debug",
+            AccessLogLevel::Info => "info",
+            AccessLogLevel::Warn => "warn",
+            AccessLogLevel::Error => "error",
+        }
+    }
+
+    pub fn severity(self) -> u8 {
+        match self {
+            AccessLogLevel::Debug => 0,
+            AccessLogLevel::Info => 1,
+            AccessLogLevel::Warn => 2,
+            AccessLogLevel::Error => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub prometheus: PrometheusConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PrometheusConfig {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub auth: PrometheusAuthConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrometheusAuthConfig {
+    #[serde(default = "default_prometheus_auth_type")]
+    pub auth_type: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub header_name: Option<String>,
+    #[serde(default)]
+    pub header_value: Option<String>,
+}
+
+impl Default for PrometheusAuthConfig {
+    fn default() -> Self {
+        Self {
+            auth_type: default_prometheus_auth_type(),
+            username: None,
+            password: None,
+            bearer_token: None,
+            header_name: None,
+            header_value: None,
+        }
+    }
 }
 
 impl Default for AccessLogConfig {
@@ -38,13 +115,13 @@ impl Default for AccessLogConfig {
             enabled: false,
             path: None,
             buffer_size: default_access_log_buffer_size(),
+            level: AccessLogLevel::Info,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub version: String,
     #[serde(default = "default_listen")]
     pub listen: String,
     #[serde(default = "default_proxy_listen")]
@@ -64,12 +141,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub access_log: AccessLogConfig,
     #[serde(default)]
+    pub monitoring: MonitoringConfig,
+    #[serde(default)]
     pub certificates: Vec<Certificate>,
     #[serde(default)]
     pub tls_listeners: Vec<TlsListener>,
     #[serde(default)]
     pub match_sets: Vec<MatchSet>,
+    #[serde(default)]
     pub rules: Vec<Rule>,
+    #[serde(default)]
     pub upstreams: HashMap<String, Upstream>,
     pub fallback: Fallback,
 }
@@ -114,12 +195,22 @@ fn default_access_log_buffer_size() -> Option<usize> {
     Some(8192)
 }
 
+fn default_prometheus_auth_type() -> String {
+    "none".to_string()
+}
+
 impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: AppConfig = serde_yaml::from_str(&content)?;
         config.normalize_rules();
         Ok(config)
+    }
+
+    pub fn to_compact_yaml(&self) -> anyhow::Result<String> {
+        let mut value = serde_yaml::to_value(self)?;
+        compact_yaml_value(&mut value);
+        Ok(serde_yaml::to_string(&value)?)
     }
 
     pub fn normalize_rules(&mut self) {
@@ -154,14 +245,79 @@ impl AppConfig {
             rule.conditions = None;
             rule.match_set = None;
             rule.weight = 100;
+            rule.request_timeout = 0;
             rule.tls = None;
         }
     }
 }
 
+fn compact_yaml_value(value: &mut serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Null => true,
+        serde_yaml::Value::Sequence(items) => {
+            items.retain_mut(|item| !compact_yaml_value(item));
+            items.is_empty()
+        }
+        serde_yaml::Value::Mapping(mapping) => {
+            compact_known_disabled_sections(mapping);
+            mapping.retain(|_, item| !compact_yaml_value(item));
+            mapping.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn compact_known_disabled_sections(mapping: &mut serde_yaml::Mapping) {
+    if bool_field(mapping, "enabled") == Some(false) {
+        if mapping.contains_key(&key("prometheus")) {
+            retain_only(mapping, &["enabled"]);
+        } else if mapping.contains_key(&key("mode"))
+            && mapping.contains_key(&key("expected_status"))
+            && mapping.contains_key(&key("interval_seconds"))
+        {
+            retain_only(mapping, &["enabled"]);
+        } else if mapping.contains_key(&key("buffer_size")) || mapping.contains_key(&key("level")) {
+            retain_only(mapping, &["enabled"]);
+        }
+    }
+
+    if numeric_field(mapping, "request_timeout") == Some(0)
+        && mapping.contains_key(&key("upstream"))
+        && mapping.contains_key(&key("priority"))
+    {
+        mapping.remove(&key("request_timeout"));
+    }
+}
+
+fn bool_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<bool> {
+    match mapping.get(&key(field)) {
+        Some(serde_yaml::Value::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn numeric_field(mapping: &serde_yaml::Mapping, field: &str) -> Option<i64> {
+    match mapping.get(&key(field)) {
+        Some(serde_yaml::Value::Number(value)) => value.as_i64(),
+        _ => None,
+    }
+}
+
+fn retain_only(mapping: &mut serde_yaml::Mapping, fields: &[&str]) {
+    mapping.retain(|key, _| {
+        key.as_str()
+            .is_some_and(|field| fields.iter().any(|allowed| field == *allowed))
+    });
+}
+
+fn key(field: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(field.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Target;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -175,7 +331,6 @@ mod tests {
     #[test]
     fn test_app_config_load() {
         let yaml_content = r#"
-version: "1.0"
 listen: "0.0.0.0:8080"
 rules:
   - id: "rule-1"
@@ -200,7 +355,6 @@ fallback:
         let file = create_test_config_file(yaml_content);
         let config = AppConfig::load(file.path().to_str().unwrap()).unwrap();
 
-        assert_eq!(config.version, "1.0");
         assert_eq!(config.listen, "0.0.0.0:8080");
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].id, "rule-1");
@@ -212,7 +366,6 @@ fallback:
     #[test]
     fn test_app_config_load_empty_rules() {
         let yaml_content = r#"
-version: "1.0"
 listen: "0.0.0.0:8080"
 rules: []
 upstreams: {}
@@ -222,7 +375,6 @@ fallback:
         let file = create_test_config_file(yaml_content);
         let config = AppConfig::load(file.path().to_str().unwrap()).unwrap();
 
-        assert_eq!(config.version, "1.0");
         assert!(config.rules.is_empty());
         assert!(config.upstreams.is_empty());
     }
@@ -230,7 +382,6 @@ fallback:
     #[test]
     fn test_app_config_load_multiple_rules_and_upstreams() {
         let yaml_content = r#"
-version: "2.0"
 listen: "0.0.0.0:9090"
 rules:
   - id: "rule-1"
@@ -271,7 +422,6 @@ fallback:
         let file = create_test_config_file(yaml_content);
         let config = AppConfig::load(file.path().to_str().unwrap()).unwrap();
 
-        assert_eq!(config.version, "2.0");
         assert_eq!(config.listen, "0.0.0.0:9090");
         assert_eq!(config.rules.len(), 2);
         assert_eq!(config.rules[0].id, "rule-1");
@@ -280,6 +430,88 @@ fallback:
         assert!(config.upstreams.contains_key("api-backend"));
         assert!(config.upstreams.contains_key("admin-backend"));
         assert_eq!(config.upstreams["api-backend"].targets.len(), 2);
+    }
+
+    #[test]
+    fn test_compact_yaml_hides_disabled_and_empty_display_fields() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "backend".to_string(),
+            Upstream {
+                name: "backend".to_string(),
+                skip_ssl: false,
+                websocket: false,
+                targets: vec![Target {
+                    url: "http://localhost:8080".to_string(),
+                    weight: 100,
+                }],
+                health_check: Default::default(),
+            },
+        );
+        let config = AppConfig {
+            listen: "0.0.0.0:3000".to_string(),
+            proxy_listen: "0.0.0.0:80".to_string(),
+            connect_timeout: 10,
+            request_timeout: 60,
+            pool_max_idle_per_host: 32,
+            pool_idle_timeout: 90,
+            tcp_keepalive: 60,
+            certificate_dir: "/etc/rustproxy/cert.d".to_string(),
+            access_log: AccessLogConfig {
+                enabled: false,
+                path: Some("/tmp/access.log".to_string()),
+                buffer_size: Some(8192),
+                level: AccessLogLevel::Debug,
+            },
+            monitoring: MonitoringConfig {
+                enabled: false,
+                prometheus: PrometheusConfig {
+                    url: "http://prometheus:9090".to_string(),
+                    auth: PrometheusAuthConfig {
+                        auth_type: "basic".to_string(),
+                        username: Some("admin".to_string()),
+                        password: Some("secret".to_string()),
+                        bearer_token: None,
+                        header_name: None,
+                        header_value: None,
+                    },
+                },
+            },
+            certificates: Vec::new(),
+            tls_listeners: Vec::new(),
+            match_sets: Vec::new(),
+            rules: vec![Rule {
+                id: "rule-1".to_string(),
+                name: "Rule 1".to_string(),
+                priority: 10,
+                host: Default::default(),
+                location: Default::default(),
+                match_set: None,
+                conditions: None,
+                upstream: "backend".to_string(),
+                weight: 100,
+                is_fallback: false,
+                listen: None,
+                request_timeout: 0,
+                tls: None,
+            }],
+            upstreams,
+            fallback: Fallback {
+                url: "404".to_string(),
+            },
+        };
+
+        let full_monitoring_json = serde_json::to_string(&config.monitoring).unwrap();
+        let yaml = config.to_compact_yaml().unwrap();
+
+        assert!(full_monitoring_json.contains("prometheus"));
+        assert!(yaml.contains("monitoring:"));
+        assert!(!yaml.contains("prometheus:"));
+        assert!(yaml.contains("health_check:"));
+        assert!(!yaml.contains("expected_status:"));
+        assert!(!yaml.contains("request_timeout: 0"));
+        assert!(!yaml.contains("certificates: []"));
+        assert!(!yaml.contains("path: /tmp/access.log"));
     }
 
     #[test]

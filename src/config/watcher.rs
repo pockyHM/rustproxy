@@ -40,14 +40,13 @@ where
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::NamedTempFile;
 
     #[test]
     fn test_watch_config_creates_watcher() {
         let yaml_content = r#"
-version: "1.0"
 listen: "0.0.0.0:8080"
 rules: []
 upstreams: {}
