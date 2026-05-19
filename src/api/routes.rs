@@ -901,6 +901,7 @@ async fn proxy_handler(
         rule_request_timeout,
         metric_labels,
         header_policy,
+        path_actions,
         target_lease,
     ) = {
         let runtime = state.proxy_runtime.load();
@@ -934,6 +935,7 @@ async fn proxy_handler(
                                 rule.upstream.clone(),
                                 rule.request_timeout,
                                 rule.header_policy.clone(),
+                                rule.path_actions.clone(),
                                 target.url,
                                 target.active_connection,
                             )
@@ -944,8 +946,8 @@ async fn proxy_handler(
         let listen_label = listen_addr
             .clone()
             .unwrap_or_else(|| config.proxy_listen.clone());
-        let (target_base, rule_request_timeout, metric_labels, header_policy, target_lease) = match selected {
-            Some((rule, upstream, request_timeout, header_policy, target, target_lease)) => (
+        let (target_base, rule_request_timeout, metric_labels, header_policy, path_actions, target_lease) = match selected {
+            Some((rule, upstream, request_timeout, header_policy, path_actions, target, target_lease)) => (
                 target,
                 request_timeout,
                 ProxyMetricLabels {
@@ -954,6 +956,7 @@ async fn proxy_handler(
                     upstream,
                 },
                 header_policy,
+                path_actions,
                 Some(target_lease),
             ),
             None => (
@@ -961,6 +964,7 @@ async fn proxy_handler(
                 0,
                 ProxyMetricLabels::fallback(listen_label),
                 Default::default(),
+                Vec::new(),
                 None,
             ),
         };
@@ -972,6 +976,7 @@ async fn proxy_handler(
             rule_request_timeout,
             metric_labels,
             header_policy,
+            path_actions,
             target_lease,
         )
     };
@@ -988,6 +993,7 @@ async fn proxy_handler(
             metric_labels,
             request_timeout_override: rule_request_timeout,
             header_policy,
+            path_actions,
             target_lease,
         },
     )

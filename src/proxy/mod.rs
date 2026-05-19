@@ -2,6 +2,7 @@ pub mod balancer;
 pub mod headers;
 pub mod health;
 pub mod matcher;
+pub mod path;
 pub mod upstream;
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
@@ -14,7 +15,7 @@ use rustls_native_certs::load_native_certs;
 
 use crate::{
     config::yaml::AppConfig,
-    models::HeaderPolicy,
+    models::{HeaderPolicy, PathAction},
     observability::{
         access_log::{AccessLogEntry, AccessLogger},
         metrics::ProxyMetrics,
@@ -116,6 +117,7 @@ pub struct ProxyRequestContext {
     pub metric_labels: ProxyMetricLabels,
     pub request_timeout_override: u64,
     pub header_policy: HeaderPolicy,
+    pub path_actions: Vec<PathAction>,
     pub target_lease: Option<TargetLease>,
 }
 
@@ -255,7 +257,47 @@ pub async fn handle_proxy_with_target(
         ));
     }
 
-    let target_uri = match build_target_uri(&target_base, request.uri()) {
+    let forward_uri = match path::apply_path_actions(request.uri(), &proxy_context.path_actions) {
+        Ok(path::PathDecision::Forward(uri)) => uri,
+        Ok(path::PathDecision::Redirect { status, location }) => {
+            let response = Response::builder()
+                .status(status)
+                .header(header::LOCATION, location.clone())
+                .body(Body::empty())
+                .expect("redirect response is valid");
+            return Ok(record_proxy_outcome(
+                response,
+                metrics.as_deref(),
+                access_logger.as_deref(),
+                &proxy_context.access,
+                &proxy_context.metric_labels,
+                start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &location,
+                None,
+            ));
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to apply path policy");
+            return Ok(record_proxy_outcome(
+                bad_gateway(),
+                metrics.as_deref(),
+                access_logger.as_deref(),
+                &proxy_context.access,
+                &proxy_context.metric_labels,
+                start,
+                &original_method,
+                &original_host,
+                &original_uri,
+                &target_base,
+                Some(format!("failed to apply path policy: {e}")),
+            ));
+        }
+    };
+
+    let target_uri = match build_target_uri(&target_base, &forward_uri) {
         Ok(uri) => uri,
         Err(e) => {
             tracing::error!(target_base = %target_base, error = %e, "failed to build target URI");
