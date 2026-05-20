@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     future::Future,
     hash::{Hash, Hasher},
+    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -98,6 +99,7 @@ pub struct AppState {
     proxy_runtime: Arc<ArcSwap<ProxyRuntime>>,
     runtime_state: RuntimeState,
     listener_manager: Arc<ListenerManager>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -158,6 +160,9 @@ impl AppState {
     }
 
     pub(crate) async fn sync_proxy_listeners(&self, config: &AppConfig) -> anyhow::Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.listener_manager
             .sync(self.clone(), config)
             .await
@@ -165,6 +170,7 @@ impl AppState {
     }
 
     pub(crate) async fn shutdown_proxy_listeners(&self) {
+        self.shutting_down.store(true, Ordering::Release);
         self.listener_manager.shutdown_all().await;
     }
 }
@@ -843,18 +849,6 @@ async fn stop_listener(mut handle: ListenerHandle) {
     }
 }
 
-async fn drain_proxy_request(
-    Extension(drain): Extension<DrainController>,
-    request: Request<Body>,
-    next: middleware::Next,
-) -> Result<Response<Body>, std::convert::Infallible> {
-    let Some(_lease) = drain.try_acquire() else {
-        return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
-
-    Ok(next.run(request).await)
-}
-
 fn proxy_router(
     state: AppState,
     listen_addr: Option<String>,
@@ -869,9 +863,7 @@ fn proxy_router(
         router
     };
     let router = if let Some(drain) = drain {
-        router
-            .layer(middleware::from_fn(drain_proxy_request))
-            .layer(Extension(drain))
+        router.layer(Extension(drain))
     } else {
         router
     };
@@ -964,10 +956,18 @@ fn normalize_host_key(host: &str) -> String {
 async fn proxy_handler(
     State(state): State<AppState>,
     listen_addr: Option<Extension<String>>,
+    drain: Option<Extension<DrainController>>,
     remote_addr: Option<Extension<std::net::SocketAddr>>,
     connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     request: Request<Body>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
+    let drain_lease = match drain {
+        Some(Extension(drain)) => match drain.try_acquire() {
+            Some(lease) => Some(lease),
+            None => return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        },
+        None => None,
+    };
     let source = remote_addr
         .map(|Extension(addr)| client_ip_string(addr))
         .or_else(|| connect_info.map(|ConnectInfo(addr)| client_ip_string(addr)))
@@ -1158,6 +1158,7 @@ async fn proxy_handler(
             balance_client_ip,
             balance_path,
             target_lease,
+            drain_lease,
         },
     )
     .await
@@ -1243,6 +1244,7 @@ where
         proxy_runtime,
         runtime_state,
         listener_manager: Arc::new(ListenerManager::default()),
+        shutting_down: Arc::new(AtomicBool::new(false)),
     };
 
     let initial_config = state.config.read().await.clone();
@@ -1251,6 +1253,15 @@ where
     // Background task to reload config from DB every 5 seconds
     spawn_config_reloader(state.clone());
     spawn_health_checker(state.clone());
+    let (api_shutdown_tx, api_shutdown_rx) = oneshot::channel();
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            shutdown.await;
+            state.shutdown_proxy_listeners().await;
+            let _ = api_shutdown_tx.send(());
+        }
+    });
 
     // API listener (main, blocking — keeps process alive)
     let app = api_router(state.clone());
@@ -1260,7 +1271,9 @@ where
 
     tracing::info!(%api_listen, "API server listening");
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async {
+            let _ = api_shutdown_rx.await;
+        })
         .await
         .context("API server failed");
 
@@ -1275,6 +1288,9 @@ fn spawn_config_reloader(state: AppState) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
+            if state.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
             match state.db.load_config() {
                 Ok(new_config) => {
                     let old_config = {
@@ -1329,6 +1345,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -1425,6 +1442,7 @@ mod tests {
             proxy_runtime,
             runtime_state,
             listener_manager: Arc::new(Default::default()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         };
 
         let selected = state
@@ -1471,5 +1489,50 @@ mod tests {
                 .active_connections,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn sync_proxy_listeners_skips_new_listeners_after_shutdown_starts() {
+        crate::install_rustls_crypto_provider();
+        let config = app_config_with_upstream(least_connections_upstream());
+        let health = HealthRegistry::new();
+        let health_config = ConfigSnapshot::new();
+        health_config.update(&config.upstreams);
+        let jwt_secret = "test-secret".to_string();
+        let runtime_state = RuntimeState::default();
+        let proxy_runtime = Arc::new(ArcSwap::from_pointee(ProxyRuntime {
+            matcher: Arc::new(Matcher::new_verified_with_match_sets(
+                config.rules.clone(),
+                config.match_sets.clone(),
+                jwt_secret.clone(),
+            )),
+            balancer: Arc::new(Balancer::new_with_runtime(
+                config.upstreams.clone(),
+                Some(health.clone()),
+                runtime_state.clone(),
+            )),
+            config: Arc::new(config.clone()),
+            clients: Arc::new(ProxyClients::new(None, 32, None, None)),
+            access_logger: None,
+            limits: Arc::new(LimitState::default()),
+        }));
+        let state = AppState {
+            config: Arc::new(RwLock::new(config.clone())),
+            db: Arc::new(Database::open_in_memory().unwrap()),
+            jwt_secret: Arc::new(jwt_secret),
+            metrics: Arc::new(ProxyMetrics::new().unwrap()),
+            health,
+            health_config,
+            proxy_runtime,
+            runtime_state,
+            listener_manager: Arc::new(Default::default()),
+            shutting_down: Arc::new(AtomicBool::new(true)),
+        };
+        let mut desired = config.clone();
+        desired.proxy_listen = "127.0.0.1:0".to_string();
+
+        state.sync_proxy_listeners(&desired).await.unwrap();
+
+        assert!(state.listener_manager.handles.read().await.is_empty());
     }
 }

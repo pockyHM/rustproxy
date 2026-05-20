@@ -49,16 +49,13 @@ impl DrainController {
     }
 
     pub async fn wait_empty(&self, timeout: Duration) -> bool {
-        if self.active() == 0 {
-            return true;
-        }
-
         tokio::time::timeout(timeout, async {
             loop {
-                self.inner.notify_empty.notified().await;
+                let notified = self.inner.notify_empty.notified();
                 if self.active() == 0 {
-                    break;
+                    return;
                 }
+                notified.await;
             }
         })
         .await
@@ -127,5 +124,23 @@ mod tests {
 
         assert!(!drain.wait_empty(Duration::from_millis(10)).await);
         assert_eq!(drain.active(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_wait_empty_handles_concurrent_final_lease_drop() {
+        for _ in 0..1_000 {
+            let drain = DrainController::default();
+            let lease = drain.try_acquire().expect("lease allowed");
+            drain.start_draining();
+
+            let waiter = tokio::spawn({
+                let drain = drain.clone();
+                async move { drain.wait_empty(Duration::from_millis(50)).await }
+            });
+            tokio::task::yield_now().await;
+            drop(lease);
+
+            assert!(waiter.await.unwrap());
+        }
     }
 }

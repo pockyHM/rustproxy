@@ -35,6 +35,7 @@ use crate::{
         limits::{LimitContext, LimitPermit, LimitState},
         retry::{should_retry, AttemptOutcome},
     },
+    runtime::drain::DrainLease,
 };
 
 // ── TLS verification bypass ──
@@ -139,6 +140,7 @@ pub struct ProxyRequestContext {
     pub balance_client_ip: String,
     pub balance_path: String,
     pub target_lease: Option<TargetLease>,
+    pub drain_lease: Option<DrainLease>,
 }
 
 struct GuardedResponseBody {
@@ -146,6 +148,7 @@ struct GuardedResponseBody {
     _active_connection: Option<ActiveConnectionGuard>,
     _limit_permit: Option<LimitPermit>,
     _target_lease: Option<TargetLease>,
+    _drain_lease: Option<DrainLease>,
 }
 
 #[derive(Debug)]
@@ -525,10 +528,12 @@ pub async fn handle_proxy_with_target(
                         let active_connection = active_connection.take();
                         let limit_permit = limit_permit.take();
                         let target_lease = proxy_context.target_lease.take();
+                        let drain_lease = proxy_context.drain_lease.take();
                         tokio::spawn(async move {
                             let _active_connection = active_connection;
                             let _limit_permit = limit_permit;
                             let _target_lease = target_lease;
+                            let _drain_lease = drain_lease;
                             if let Err(e) = tunnel_upgraded(client_upgrade, upstream_upgrade).await
                             {
                                 tracing::warn!(%e, "websocket tunnel closed with error");
@@ -554,6 +559,7 @@ pub async fn handle_proxy_with_target(
                     active_connection.take(),
                     limit_permit.take(),
                     proxy_context.target_lease.take(),
+                    proxy_context.drain_lease.take(),
                 );
                 Ok(record_proxy_outcome(
                     response,
@@ -721,6 +727,7 @@ pub async fn handle_proxy_with_target(
                         active_connection.take(),
                         limit_permit.take(),
                         current_lease.take(),
+                        proxy_context.drain_lease.take(),
                     );
                     return Ok(record_proxy_outcome(
                         response,
@@ -902,6 +909,7 @@ pub async fn handle_proxy_with_target(
                 active_connection.take(),
                 limit_permit.take(),
                 proxy_context.target_lease.take(),
+                proxy_context.drain_lease.take(),
             );
             Ok(record_proxy_outcome(
                 response,
@@ -969,6 +977,7 @@ fn guard_response(
     active_connection: Option<ActiveConnectionGuard>,
     limit_permit: Option<LimitPermit>,
     target_lease: Option<TargetLease>,
+    drain_lease: Option<DrainLease>,
 ) -> Response<Body> {
     response.map(|body| {
         Body::new(GuardedResponseBody {
@@ -976,6 +985,7 @@ fn guard_response(
             _active_connection: active_connection,
             _limit_permit: limit_permit,
             _target_lease: target_lease,
+            _drain_lease: drain_lease,
         })
     })
 }
@@ -1304,12 +1314,13 @@ fn websocket_disabled() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_target_uri, collect_request_body, is_websocket_upgrade, not_found_page,
-        record_proxy_metrics, retry_policy_requires_buffering, sanitize_retry_request,
-        ProxyMetricLabels, RequestBodyReadError,
+        build_target_uri, collect_request_body, guard_response, is_websocket_upgrade,
+        not_found_page, record_proxy_metrics, retry_policy_requires_buffering,
+        sanitize_retry_request, ProxyMetricLabels, RequestBodyReadError,
     };
     use crate::models::RetryPolicy;
     use crate::observability::metrics::ProxyMetrics;
+    use crate::runtime::drain::DrainController;
     use axum::body::Body;
     use http::{HeaderMap, Response, StatusCode, Uri};
     use std::time::Instant;
@@ -1334,6 +1345,24 @@ mod tests {
     fn builtin_404_target_returns_not_found_page() {
         let response = not_found_page();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn guarded_response_body_holds_drain_lease_until_body_drops() {
+        let drain = DrainController::default();
+        let lease = drain.try_acquire().expect("lease allowed");
+
+        let response = guard_response(
+            Response::new(Body::from("ok")),
+            None,
+            None,
+            None,
+            Some(lease),
+        );
+
+        assert_eq!(drain.active(), 1);
+        drop(response);
+        assert_eq!(drain.active(), 0);
     }
 
     #[test]
