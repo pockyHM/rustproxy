@@ -6,7 +6,8 @@ use rusqlite::{params, Connection};
 use serde::de::DeserializeOwned;
 
 use crate::config::yaml::{
-    AccessLogConfig, AppConfig, Certificate, Fallback, MonitoringConfig, TlsListener,
+    AccessLogConfig, AppConfig, Certificate, Fallback, MonitoringConfig, TcpListenerConfig,
+    TlsListener,
 };
 use crate::models::{
     BalanceAlgorithm, ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType,
@@ -380,6 +381,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         .unwrap_or(None)
         .and_then(|v| serde_json::from_str::<Vec<TlsListener>>(&v).ok())
         .unwrap_or_default();
+    let tcp_listeners = load_json_setting::<Vec<TcpListenerConfig>>(conn, "tcp_listeners")?;
 
     let match_sets = get_setting(conn, "match_sets")
         .unwrap_or(None)
@@ -408,6 +410,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         monitoring,
         certificates,
         tls_listeners,
+        tcp_listeners,
         match_sets,
         rules,
         upstreams: upstream_map,
@@ -415,6 +418,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     };
     config.normalize_timeout_aliases();
     config.normalize_rules();
+    config.validate_tcp_listeners()?;
     Ok(config)
 }
 
@@ -655,6 +659,11 @@ fn load_targets(conn: &Connection, upstream_name: &str) -> Result<Vec<Target>> {
 }
 
 fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()> {
+    let mut config = config.clone();
+    config.normalize_timeout_aliases();
+    config.normalize_rules();
+    config.validate_tcp_listeners()?;
+
     // Clear existing data
     tx.execute("DELETE FROM rules", [])?;
     tx.execute("DELETE FROM targets", [])?;
@@ -662,10 +671,6 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
     tx.execute("DELETE FROM settings", [])?;
 
     // Settings
-    let mut config = config.clone();
-    config.normalize_timeout_aliases();
-    config.normalize_rules();
-
     set_setting_tx(tx, "listen", &config.listen)?;
     set_setting_tx(tx, "proxy_listen", &config.proxy_listen)?;
     set_setting_tx(tx, "fallback_url", &config.fallback.url)?;
@@ -704,6 +709,11 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
         tx,
         "tls_listeners",
         &serde_json::to_string(&config.tls_listeners)?,
+    )?;
+    set_setting_tx(
+        tx,
+        "tcp_listeners",
+        &serde_json::to_string(&config.tcp_listeners)?,
     )?;
     set_setting_tx(
         tx,
@@ -1161,6 +1171,7 @@ fn build_expr_from_conditions(conn: &Connection, rule_id: &str) -> Result<Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::yaml::TcpListenerMode;
     use crate::models::{
         BalanceAlgorithm, ConditionType, HeaderMutation, HeaderMutationOp, Operator, PathAction,
         RateLimitKey,
@@ -1260,6 +1271,7 @@ mod tests {
             monitoring: Default::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
+            tcp_listeners: Vec::new(),
         }
     }
 
@@ -1378,6 +1390,68 @@ mod tests {
             loaded_upstream.targets[0].timeouts.server_timeout_seconds,
             Some(5)
         );
+    }
+
+    #[test]
+    fn tcp_listener_config_round_trips() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = make_test_config();
+        config.tcp_listeners = vec![
+            TcpListenerConfig {
+                name: "redis".to_string(),
+                listen: "0.0.0.0:6379".to_string(),
+                mode: TcpListenerMode::Tcp,
+                upstream: Some("redis".to_string()),
+                sni_routes: HashMap::new(),
+                maxconn: Some(256),
+            },
+            TcpListenerConfig {
+                name: "tls-app".to_string(),
+                listen: "0.0.0.0:443".to_string(),
+                mode: TcpListenerMode::TlsPassthrough,
+                upstream: None,
+                sni_routes: {
+                    let mut routes = HashMap::new();
+                    routes.insert("app.example.com".to_string(), "app_tls".to_string());
+                    routes.insert("admin.example.com".to_string(), "admin_tls".to_string());
+                    routes
+                },
+                maxconn: None,
+            },
+        ];
+
+        db.save_full_config(&config).unwrap();
+        let loaded = db.load_config().unwrap();
+
+        assert_eq!(loaded.tcp_listeners.len(), 2);
+        assert_eq!(loaded.tcp_listeners[0].name, "redis");
+        assert_eq!(loaded.tcp_listeners[0].upstream.as_deref(), Some("redis"));
+        assert_eq!(
+            loaded.tcp_listeners[1].sni_routes["app.example.com"],
+            "app_tls"
+        );
+        assert_eq!(
+            loaded.tcp_listeners[1].sni_routes["admin.example.com"],
+            "admin_tls"
+        );
+    }
+
+    #[test]
+    fn save_rejects_invalid_tcp_listener_config() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = make_test_config();
+        config.tcp_listeners = vec![TcpListenerConfig {
+            name: "redis".to_string(),
+            listen: "0.0.0.0:6379".to_string(),
+            mode: TcpListenerMode::Tcp,
+            upstream: None,
+            sni_routes: HashMap::new(),
+            maxconn: None,
+        }];
+
+        let err = db.save_full_config(&config).unwrap_err();
+
+        assert!(err.to_string().contains("requires upstream"));
     }
 
     #[test]

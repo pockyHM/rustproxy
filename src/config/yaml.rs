@@ -23,6 +23,26 @@ pub struct TlsListener {
     pub certificate: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpListenerMode {
+    Tcp,
+    TlsPassthrough,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TcpListenerConfig {
+    pub name: String,
+    pub listen: String,
+    pub mode: TcpListenerMode,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub sni_routes: HashMap<String, String>,
+    #[serde(default)]
+    pub maxconn: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessLogConfig {
     #[serde(default)]
@@ -152,6 +172,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub tls_listeners: Vec<TlsListener>,
     #[serde(default)]
+    pub tcp_listeners: Vec<TcpListenerConfig>,
+    #[serde(default)]
     pub match_sets: Vec<MatchSet>,
     #[serde(default)]
     pub rules: Vec<Rule>,
@@ -177,6 +199,7 @@ impl Default for AppConfig {
             monitoring: MonitoringConfig::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
+            tcp_listeners: Vec::new(),
             match_sets: Vec::new(),
             rules: Vec::new(),
             upstreams: HashMap::new(),
@@ -237,6 +260,7 @@ impl AppConfig {
         let mut config: AppConfig = serde_yaml::from_str(&content)?;
         config.normalize_timeout_aliases();
         config.normalize_rules();
+        config.validate_tcp_listeners()?;
         Ok(config)
     }
 
@@ -326,6 +350,42 @@ impl AppConfig {
             rule.request_timeout = 0;
             rule.tls = None;
         }
+    }
+
+    pub fn validate_tcp_listeners(&self) -> anyhow::Result<()> {
+        for listener in &self.tcp_listeners {
+            match listener.mode {
+                TcpListenerMode::Tcp => {
+                    if listener
+                        .upstream
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim()
+                        .is_empty()
+                    {
+                        anyhow::bail!(
+                            "tcp listener {} in tcp mode requires upstream",
+                            listener.name
+                        );
+                    }
+                }
+                TcpListenerMode::TlsPassthrough => {
+                    let has_default_upstream = !listener
+                        .upstream
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim()
+                        .is_empty();
+                    if !has_default_upstream && listener.sni_routes.is_empty() {
+                        anyhow::bail!(
+                            "tcp listener {} in tls_passthrough mode requires upstream or sni_routes",
+                            listener.name
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -589,6 +649,71 @@ fallback:
     }
 
     #[test]
+    fn tcp_listener_config_round_trips() {
+        let yaml_content = r#"
+tcp_listeners:
+  - name: redis
+    listen: 0.0.0.0:6379
+    upstream: redis
+    mode: tcp
+  - name: tls-app
+    listen: 0.0.0.0:443
+    mode: tls_passthrough
+    sni_routes:
+      app.example.com: app_tls
+      admin.example.com: admin_tls
+fallback:
+  url: "404"
+"#;
+        let file = create_test_config_file(yaml_content);
+        let config = AppConfig::load(file.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(config.tcp_listeners.len(), 2);
+        assert_eq!(config.tcp_listeners[0].name, "redis");
+        assert_eq!(config.tcp_listeners[0].upstream.as_deref(), Some("redis"));
+        assert_eq!(
+            config.tcp_listeners[1].sni_routes["app.example.com"],
+            "app_tls"
+        );
+        assert_eq!(
+            config.tcp_listeners[1].sni_routes["admin.example.com"],
+            "admin_tls"
+        );
+    }
+
+    #[test]
+    fn tcp_listener_mode_requires_upstream() {
+        let yaml_content = r#"
+tcp_listeners:
+  - name: redis
+    listen: 0.0.0.0:6379
+    mode: tcp
+fallback:
+  url: "404"
+"#;
+        let file = create_test_config_file(yaml_content);
+        let err = AppConfig::load(file.path().to_str().unwrap()).unwrap_err();
+
+        assert!(err.to_string().contains("requires upstream"));
+    }
+
+    #[test]
+    fn tls_passthrough_listener_requires_route_or_default_upstream() {
+        let yaml_content = r#"
+tcp_listeners:
+  - name: tls-app
+    listen: 0.0.0.0:443
+    mode: tls_passthrough
+fallback:
+  url: "404"
+"#;
+        let file = create_test_config_file(yaml_content);
+        let err = AppConfig::load(file.path().to_str().unwrap()).unwrap_err();
+
+        assert!(err.to_string().contains("requires upstream or sni_routes"));
+    }
+
+    #[test]
     fn test_app_config_load_multiple_rules_and_upstreams() {
         let yaml_content = r#"
 listen: "0.0.0.0:9090"
@@ -694,6 +819,7 @@ fallback:
             },
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
+            tcp_listeners: Vec::new(),
             match_sets: Vec::new(),
             rules: vec![Rule {
                 id: "rule-1".to_string(),

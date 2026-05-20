@@ -1469,6 +1469,7 @@ mod tests {
             monitoring: Default::default(),
             certificates: Vec::new(),
             tls_listeners: Vec::new(),
+            tcp_listeners: Vec::new(),
             match_sets: Vec::new(),
             rules: Vec::new(),
             upstreams,
