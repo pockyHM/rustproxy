@@ -7,6 +7,11 @@ use prometheus::{
 use std::sync::Mutex;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+const REQUEST_DURATION_BUCKETS_SECONDS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+    300.0, 600.0, 900.0, 1800.0,
+];
+
 pub struct ProxyMetrics {
     pub registry: Registry,
     pub requests_total: CounterVec,
@@ -32,7 +37,8 @@ impl ProxyMetrics {
             HistogramOpts::new(
                 "rustproxy_proxy_request_duration_seconds",
                 "Proxy request duration in seconds.",
-            ),
+            )
+            .buckets(REQUEST_DURATION_BUCKETS_SECONDS.to_vec()),
             &["listen", "rule", "upstream"],
         )?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -206,6 +212,7 @@ mod tests {
 
         assert!(output.contains("rustproxy_proxy_requests_total"));
         assert!(output.contains("rustproxy_proxy_request_duration_seconds"));
+        assert!(output.contains("le=\"1800\""));
         assert!(output.contains("rustproxy_proxy_active_connections"));
         assert!(output.contains("rustproxy_proxy_config_reloads_total"));
         assert!(output.contains("rustproxy_process_cpu_seconds_total"));

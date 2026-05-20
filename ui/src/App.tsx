@@ -1,4 +1,4 @@
-import { type CSSProperties, FormEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { type CSSProperties, FormEvent, type PointerEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
 
 /* ===== Types ===== */
@@ -9,6 +9,7 @@ type AccessLogLevel = 'debug' | 'info' | 'warn' | 'error';
 type ApiResponse<T> = { success: boolean; data: T; error?: string };
 type Target = { url: string; weight: number };
 type HealthCheckMode = 'tcp' | 'http';
+type BalanceAlgorithm = 'weighted_round_robin' | 'least_connections' | 'ip_hash' | 'consistent_hash' | 'url_hash';
 type HealthCheck = {
   enabled: boolean;
   mode: HealthCheckMode;
@@ -19,16 +20,39 @@ type HealthCheck = {
   healthy_threshold: number;
   unhealthy_threshold: number;
 };
+type RetryPolicy = {
+  attempts: number;
+  retry_on_status: number[];
+  retry_on_timeout: boolean;
+  retry_on_connect_error: boolean;
+};
 type Upstream = {
   name: string;
   skip_ssl?: boolean;
   websocket?: boolean;
+  balance?: BalanceAlgorithm;
+  retry?: RetryPolicy;
   targets: Target[];
   health_check?: Partial<HealthCheck>;
 };
 type Certificate = { name: string; cert: string; key: string };
 type TlsListener = { enabled: boolean; listen: string; certificate: string };
 type RuleTls = { enabled: boolean; certificate: string };
+type HeaderMutationOp = 'set' | 'add' | 'remove';
+type HeaderMutation = { op: HeaderMutationOp; name: string; value?: string | null };
+type HeaderPolicy = { request: HeaderMutation[]; response: HeaderMutation[] };
+type PathAction =
+  | { strip_prefix: { prefix: string } }
+  | { rewrite: { pattern: string; replacement: string } }
+  | { redirect: { status: number; location: string } };
+type RateLimitKey = 'ip' | 'host' | 'route';
+type LimitPolicy = {
+  rate_per_second?: number | null;
+  rate_key: RateLimitKey;
+  max_connections?: number | null;
+  max_body_bytes?: number | null;
+  queue_timeout_ms?: number | null;
+};
 type HostMatchType = 'any' | 'exact' | 'wildcard';
 type LocationMatchType = 'exact' | 'prefix' | 'regex';
 type HostMatcher = { type: HostMatchType; value?: string | null };
@@ -54,6 +78,9 @@ type Rule = {
   listen?: string | null;
   request_timeout?: number;
   tls?: RuleTls | null;
+  header_policy?: HeaderPolicy;
+  path_actions?: PathAction[];
+  limit_policy?: LimitPolicy;
 };
 type AppConfig = {
   listen: string;
@@ -146,12 +173,12 @@ const T: Record<string, [string, string]> = {
   'ops.title': ['Operations Overview', '运维概览'],
   'ops.sub': ['Live proxy health, weighted routing, reload status, and request pressure across listeners.', '代理健康状态、加权路由、重载状态和请求压力概览。'],
   'rules.title': ['Routing Rules', '路由规则'],
-  'rules.sub': ['Manage request matching rules with priority-based routing to upstream pools.', '管理请求匹配规则，按优先级路由到上游池。'],
+  'rules.sub': ['Manage routing rules with header mutations, path actions, and per-route limits.', '管理路由规则的头部改写、路径动作和按规则限流。'],
   'matchSets.title': ['Match Sets', '匹配集'],
   'matchSets.sub': ['Create reusable request match trees and attach them to routing rules.', '创建可复用的请求匹配树，并在路由规则中引用。'],
   'matchSets.empty': ['No match sets configured', '暂无匹配集'],
   'upstreams.title': ['Upstreams', '上游服务'],
-  'upstreams.sub': ['Manage upstream target pools with weighted load balancing and health checks.', '管理上游目标池，支持加权负载均衡和健康检查。'],
+  'upstreams.sub': ['Manage upstream target pools with load balancing, retry policy, and health checks.', '管理上游目标池，支持负载均衡、重试策略和健康检查。'],
   'config.title': ['Config File', '配置文件'],
   'config.sub': ['Edit the active YAML config and global runtime options. Changes are applied via hot-reload.', '编辑当前 YAML 配置和全局运行选项，更改通过热重载生效。'],
   'config.global': ['Global Config', '全局配置'],
@@ -330,6 +357,37 @@ const T: Record<string, [string, string]> = {
   'form.operator': ['Operator', '操作符'],
   'form.value': ['Value', '值'],
   'form.targets': ['Targets', '目标'],
+  'form.balance': ['Load balancing', '负载均衡'],
+  'form.algorithm': ['Algorithm', '算法'],
+  'form.retry': ['Retry policy', '重试策略'],
+  'form.retryAttempts': ['Max retries', '最大重试次数'],
+  'form.retryStatus': ['Retry status codes', '重试状态码'],
+  'form.retryStatusHint': ['Comma separated, for example 502,503,504', '逗号分隔，例如 502,503,504'],
+  'form.retryTimeout': ['Retry on timeout', '超时重试'],
+  'form.retryConnect': ['Retry on connect error', '连接错误重试'],
+  'form.headers': ['Header policy', 'Header 策略'],
+  'form.requestHeaders': ['Request headers', '请求头'],
+  'form.responseHeaders': ['Response headers', '响应头'],
+  'form.addHeader': ['Add header rule', '添加 Header 规则'],
+  'form.pathActions': ['Path actions', '路径动作'],
+  'form.addPathAction': ['Add path action', '添加路径动作'],
+  'form.limitPolicy': ['Limits', '限流与连接控制'],
+  'form.ratePerSecond': ['Rate per second', '每秒请求数'],
+  'form.rateKey': ['Rate key', '限流维度'],
+  'form.maxConnections': ['Max connections', '最大并发连接'],
+  'form.maxBodyBytes': ['Max body bytes', '请求体上限字节'],
+  'form.queueTimeoutMs': ['Queue timeout (ms)', '排队超时 (毫秒)'],
+  'form.optionalZero': ['0 or empty means disabled', '0 或留空表示关闭'],
+  'form.noneConfigured': ['No policy entries configured', '暂无策略条目'],
+  'form.operation': ['Operation', '操作'],
+  'form.headerName': ['Header name', 'Header 名称'],
+  'form.headerValue': ['Header value', 'Header 值'],
+  'form.actionType': ['Action type', '动作类型'],
+  'form.prefix': ['Prefix', '前缀'],
+  'form.pattern': ['Pattern', '模式'],
+  'form.replacement': ['Replacement', '替换值'],
+  'form.status': ['Status', '状态码'],
+  'form.locationTarget': ['Location', '跳转地址'],
   'health.title': ['Health Check', '健康检查'],
   'health.desc': ['Probe targets in the background and skip endpoints after repeated failures.', '后台探测目标并在反复失败后跳过端点。'],
   'health.enabled': ['Enabled', '已启用'],
@@ -405,6 +463,25 @@ const defaultHealthCheck: HealthCheck = {
   enabled: false, mode: 'tcp', path: '/health', expected_status: 200,
   interval_seconds: 10, timeout_seconds: 2, healthy_threshold: 2, unhealthy_threshold: 2,
 };
+const defaultRetryPolicy: RetryPolicy = {
+  attempts: 0,
+  retry_on_status: [],
+  retry_on_timeout: false,
+  retry_on_connect_error: false,
+};
+const defaultHeaderPolicy: HeaderPolicy = { request: [], response: [] };
+const defaultLimitPolicy: LimitPolicy = {
+  rate_per_second: null,
+  rate_key: 'ip',
+  max_connections: null,
+  max_body_bytes: null,
+  queue_timeout_ms: null,
+};
+const BALANCE_ALGORITHMS: BalanceAlgorithm[] = ['weighted_round_robin', 'least_connections', 'ip_hash', 'consistent_hash', 'url_hash'];
+const RATE_LIMIT_KEYS: RateLimitKey[] = ['ip', 'host', 'route'];
+const HEADER_MUTATION_OPS: HeaderMutationOp[] = ['set', 'add', 'remove'];
+const PATH_ACTION_TYPES = ['strip_prefix', 'rewrite', 'redirect'] as const;
+type PathActionType = typeof PATH_ACTION_TYPES[number];
 
 const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
   { id: 'operations', labelKey: 'nav.operations', icon: 'monitoring' },
@@ -456,11 +533,52 @@ function compactConfigForYaml(value: unknown): unknown {
   }
 
   const compacted = Object.entries(source).reduce<Record<string, unknown>>((next, [key, item]) => {
+    if (key === 'balance' && item === 'weighted_round_robin') return next;
+    if (key === 'retry') {
+      const compactRetry = compactRetryPolicy(item);
+      if (compactRetry !== undefined) next[key] = compactRetry;
+      return next;
+    }
+    if (key === 'limit_policy') {
+      const compactLimit = compactLimitPolicy(item);
+      if (compactLimit !== undefined) next[key] = compactLimit;
+      return next;
+    }
     if (key === 'request_timeout' && item === 0 && 'upstream' in source && 'priority' in source) return next;
     const compactItem = compactConfigForYaml(item);
     if (compactItem !== undefined) next[key] = compactItem;
     return next;
   }, {});
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function compactRetryPolicy(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const source = value as Record<string, unknown>;
+  const attempts = Number(source.attempts ?? 0);
+  const retryOnStatus = Array.isArray(source.retry_on_status) ? source.retry_on_status : [];
+  const retryOnTimeout = Boolean(source.retry_on_timeout);
+  const retryOnConnectError = Boolean(source.retry_on_connect_error);
+  if (attempts === 0 && retryOnStatus.length === 0 && !retryOnTimeout && !retryOnConnectError) {
+    return undefined;
+  }
+  const compacted: Record<string, unknown> = {};
+  if (attempts > 0) compacted.attempts = attempts;
+  if (retryOnStatus.length > 0) compacted.retry_on_status = retryOnStatus;
+  if (retryOnTimeout) compacted.retry_on_timeout = true;
+  if (retryOnConnectError) compacted.retry_on_connect_error = true;
+  return compacted;
+}
+
+function compactLimitPolicy(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const source = value as Record<string, unknown>;
+  const compacted: Record<string, unknown> = {};
+  if (source.rate_per_second != null) compacted.rate_per_second = source.rate_per_second;
+  if (source.rate_key && source.rate_key !== 'ip') compacted.rate_key = source.rate_key;
+  if (source.max_connections != null) compacted.max_connections = source.max_connections;
+  if (source.max_body_bytes != null) compacted.max_body_bytes = source.max_body_bytes;
+  if (source.queue_timeout_ms != null) compacted.queue_timeout_ms = source.queue_timeout_ms;
   return Object.keys(compacted).length > 0 ? compacted : undefined;
 }
 
@@ -1101,12 +1219,11 @@ function ResourceMetric({ label, value, hint, icon, tone, progress }: { label: s
 function MonitoringView({ config, token }: { config: AppConfig; token: string }) {
   const { t } = useI18n();
   const entries = useMemo(() => uniqueListeners(config), [config]);
-  const routeOptions = useMemo(() => [
-    { value: '', label: t('monitoring.allRoutes') },
-    ...config.rules.map((rule) => ({ value: routeKey(rule), label: `${rule.name || rule.id} -> ${rule.upstream}` })),
-  ], [config.rules, t]);
+  const routeOptions = useMemo(() => (
+    config.rules.map((rule) => ({ value: routeKey(rule), label: `${rule.name || rule.id} -> ${rule.upstream}` }))
+  ), [config.rules]);
   const [entry, setEntry] = useState(entries[0] ?? config.proxy_listen ?? '0.0.0.0:80');
-  const [route, setRoute] = useState('');
+  const [route, setRoute] = useState(routeOptions[0]?.value ?? '');
   const [series, setSeries] = useState<Record<string, ChartPoint[]>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -1114,6 +1231,10 @@ function MonitoringView({ config, token }: { config: AppConfig; token: string })
   useEffect(() => {
     if (!entries.includes(entry) && entries[0]) setEntry(entries[0]);
   }, [entries, entry]);
+
+  useEffect(() => {
+    if (!routeOptions.some((option) => option.value === route)) setRoute(routeOptions[0]?.value ?? '');
+  }, [routeOptions, route]);
 
   useEffect(() => {
     if (!monitoringEnabled(config)) return;
@@ -1180,16 +1301,69 @@ function MonitoringView({ config, token }: { config: AppConfig; token: string })
 }
 
 function MetricChart({ title, points, unit, formatter }: { title: string; points: ChartPoint[]; unit?: string; formatter?: (v: number) => string }) {
+  const { lang } = useI18n();
+  const chartRef = useRef<SVGSVGElement | null>(null);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const latest = points.at(-1)?.v ?? 0;
-  const display = formatter ? formatter(latest) : `${Number.isFinite(latest) ? latest.toFixed(latest >= 10 ? 1 : 2) : '0'}${unit ? ` ${unit}` : ''}`;
-  const path = sparklinePath(points, 520, 150);
+  const formatValue = useCallback((value: number) => (
+    formatter ? formatter(value) : `${Number.isFinite(value) ? value.toFixed(value >= 10 ? 1 : 2) : '0'}${unit ? ` ${unit}` : ''}`
+  ), [formatter, unit]);
+  const display = formatValue(latest);
+  const chart = useMemo(() => sparklineChart(points, 520, 150), [points]);
+  const hoverPoint = hoverIndex == null ? null : chart.points[hoverIndex];
+  const hoverValue = hoverIndex == null ? null : points[hoverIndex];
+  const hoverTime = hoverValue
+    ? new Intl.DateTimeFormat(lang === 'zh' ? 'zh-CN' : 'en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(hoverValue.t * 1000))
+    : '';
+
+  function handlePointerMove(event: PointerEvent<SVGSVGElement>) {
+    if (chart.points.length === 0) return;
+    const rect = chartRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const x = ((event.clientX - rect.left) / rect.width) * 520;
+    let nearest = 0;
+    let nearestDistance = Math.abs(chart.points[0].x - x);
+    chart.points.forEach((point, index) => {
+      const distance = Math.abs(point.x - x);
+      if (distance < nearestDistance) {
+        nearest = index;
+        nearestDistance = distance;
+      }
+    });
+    setHoverIndex(nearest);
+  }
+
   return (
     <div className="monitor-chart">
       <div className="monitor-chart-head"><span>{title}</span><strong>{display}</strong></div>
-      <svg viewBox="0 0 520 150" preserveAspectRatio="none" role="img">
-        <path className="monitor-chart-grid" d="M0 120H520 M0 80H520 M0 40H520" />
-        {path ? <path className="monitor-chart-line" d={path} /> : <text x="260" y="82" textAnchor="middle">no data</text>}
-      </svg>
+      <div className="monitor-chart-plot">
+        <svg
+          ref={chartRef}
+          viewBox="0 0 520 150"
+          preserveAspectRatio="none"
+          role="img"
+          onPointerMove={handlePointerMove}
+          onPointerLeave={() => setHoverIndex(null)}
+        >
+          <path className="monitor-chart-grid" d="M0 120H520 M0 80H520 M0 40H520" />
+          {chart.path ? <path className="monitor-chart-line" d={chart.path} /> : <text x="260" y="82" textAnchor="middle">no data</text>}
+          {hoverPoint && (
+            <>
+              <path className="monitor-chart-hover-line" d={`M${hoverPoint.x.toFixed(1)} 0V150`} />
+              <circle className="monitor-chart-hover-dot" cx={hoverPoint.x} cy={hoverPoint.y} r="4.5" />
+            </>
+          )}
+        </svg>
+        {hoverPoint && hoverValue && (
+          <div
+            className={`monitor-chart-tooltip ${hoverPoint.x < 80 ? 'align-left' : hoverPoint.x > 440 ? 'align-right' : ''}`}
+            style={{ left: `${(hoverPoint.x / 520) * 100}%`, top: `${(hoverPoint.y / 150) * 100}%` }}
+          >
+            <span>{hoverTime}</span>
+            <strong>{formatValue(hoverValue.v)}</strong>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1208,7 +1382,12 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
   const protocolConflict = listenerProtocolConflict(config, draft, editing);
 
   function openCreate() { setEditing(null); setDraft(newRule(upstreamNames[0], defaultListen)); setShowModal(true); }
-  function openEdit(rule: Rule) { setEditing(rule.id); setDraft({ ...rule, host: normalizeHostMatcher(rule.host), location: normalizeLocationMatcher(rule.location), listen: rule.listen || defaultListen, conditions: rule.match_set ? null : normalizeCondition(rule.conditions) }); setShowModal(true); }
+  function openEdit(rule: Rule) {
+    const normalized = normalizeRule(rule);
+    setEditing(rule.id);
+    setDraft({ ...normalized, listen: normalized.listen || defaultListen });
+    setShowModal(true);
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -1223,6 +1402,9 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
       listen: draft.listen || defaultListen,
       request_timeout: draft.is_fallback ? 0 : Number(draft.request_timeout ?? 0),
       tls: draft.is_fallback ? null : draft.tls?.enabled ? { enabled: true, certificate: draft.tls.certificate } : null,
+      header_policy: normalizeHeaderPolicy(draft.header_policy),
+      path_actions: normalizePathActions(draft.path_actions),
+      limit_policy: normalizeLimitPolicy(draft.limit_policy),
     };
     await api<Rule>(editing ? `/api/rules/${encodeURIComponent(editing)}` : '/api/rules', { method: editing ? 'PUT' : 'POST', token, body });
     await refreshConfig(token, setConfig, setNotice);
@@ -1238,7 +1420,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
 
   async function handleReload() { await refreshConfig(token, setConfig, setNotice); setNotice({ type: 'success', message: t('notice.configReloaded') }); }
 
-  const sorted = [...config.rules].sort((a, b) => Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority);
+  const sorted = [...config.rules].map(normalizeRule).sort((a, b) => Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 16 }}>
@@ -1400,6 +1582,9 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               </Field>
               {!draft.match_set && <ConditionEditor draft={draft} setDraft={setDraft} />}
             </section>}
+            <HeaderPolicyEditor draft={draft} setDraft={setDraft} />
+            <PathActionsEditor draft={draft} setDraft={setDraft} />
+            <LimitPolicyEditor draft={draft} setDraft={setDraft} />
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
               <button type="submit" className="btn btn-primary" disabled={protocolConflict}>{editing ? t('action.save') : t('action.create')}</button>
@@ -1628,6 +1813,179 @@ function ConditionLeafEditor({ expr, onChange }: {
   );
 }
 
+/* ===== Rule Policy Editors ===== */
+
+function HeaderPolicyEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+  const { t } = useI18n();
+  const policy = normalizeHeaderPolicy(draft.header_policy);
+  function update(kind: keyof HeaderPolicy, items: HeaderMutation[]) {
+    setDraft({ ...draft, header_policy: { ...policy, [kind]: items.map(normalizeHeaderMutation) } });
+  }
+  return (
+    <section className="form-section">
+      <h3 className="form-section-title">{t('form.headers')}</h3>
+      <HeaderMutationList
+        title={t('form.requestHeaders')}
+        items={policy.request}
+        onChange={(items) => update('request', items)}
+      />
+      <HeaderMutationList
+        title={t('form.responseHeaders')}
+        items={policy.response}
+        onChange={(items) => update('response', items)}
+      />
+    </section>
+  );
+}
+
+function HeaderMutationList({ title, items, onChange }: {
+  title: string;
+  items: HeaderMutation[];
+  onChange: (items: HeaderMutation[]) => void;
+}) {
+  const { t } = useI18n();
+  function replace(index: number, item: HeaderMutation) {
+    onChange(items.map((current, i) => i === index ? normalizeHeaderMutation(item) : current));
+  }
+  return (
+    <div className="policy-subsection">
+      <div className="policy-subsection-head">
+        <span className="field-label">{title}</span>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={() => onChange([...items, createHeaderMutation()])}>
+          <Icon name="add" size={16} />{t('form.addHeader')}
+        </button>
+      </div>
+      {items.length === 0 ? <p className="card-desc">{t('form.noneConfigured')}</p> : (
+        <div className="policy-list">
+          {items.map((mutation, index) => (
+            <div className="policy-row header-policy-row" key={index}>
+              <Field label={t('form.operation')}>
+                <Dropdown
+                  value={mutation.op}
+                  options={enumOptions(HEADER_MUTATION_OPS)}
+                  onChange={(op) => replace(index, { ...mutation, op: op as HeaderMutationOp })}
+                />
+              </Field>
+              <Field label={t('form.headerName')}>
+                <input value={mutation.name} placeholder="x-forwarded-for" onChange={(e) => replace(index, { ...mutation, name: e.target.value })} />
+              </Field>
+              <Field label={t('form.headerValue')}>
+                <input
+                  value={mutation.value ?? ''}
+                  disabled={mutation.op === 'remove'}
+                  placeholder={mutation.op === 'remove' ? '' : '$remote_addr'}
+                  onChange={(e) => replace(index, { ...mutation, value: e.target.value })}
+                />
+              </Field>
+              <button type="button" className="btn btn-ghost btn-sm policy-remove" onClick={() => onChange(items.filter((_, i) => i !== index))}>
+                <Icon name="close" size={16} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PathActionsEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+  const { t } = useI18n();
+  const actions = normalizePathActions(draft.path_actions);
+  function replace(index: number, action: PathAction) {
+    setDraft({ ...draft, path_actions: actions.map((current, i) => i === index ? action : current) });
+  }
+  return (
+    <section className="form-section">
+      <div className="policy-subsection-head">
+        <h3 className="form-section-title">{t('form.pathActions')}</h3>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setDraft({ ...draft, path_actions: [...actions, createPathAction()] })}>
+          <Icon name="add" size={16} />{t('form.addPathAction')}
+        </button>
+      </div>
+      {actions.length === 0 ? <p className="card-desc">{t('form.noneConfigured')}</p> : (
+        <div className="policy-list">
+          {actions.map((action, index) => {
+            const type = pathActionType(action);
+            return (
+              <div className="policy-row path-policy-row" key={index}>
+                <Field label={t('form.actionType')}>
+                  <Dropdown
+                    value={type}
+                    options={enumOptions(PATH_ACTION_TYPES)}
+                    onChange={(nextType) => replace(index, createPathAction(nextType as PathActionType, action))}
+                  />
+                </Field>
+                {type === 'strip_prefix' && 'strip_prefix' in action && (
+                  <Field label={t('form.prefix')}>
+                    <input value={action.strip_prefix.prefix} placeholder="/api" onChange={(e) => replace(index, { strip_prefix: { prefix: e.target.value } })} />
+                  </Field>
+                )}
+                {type === 'rewrite' && 'rewrite' in action && (
+                  <>
+                    <Field label={t('form.pattern')}>
+                      <input value={action.rewrite.pattern} placeholder="^/v1/(.*)" onChange={(e) => replace(index, { rewrite: { ...action.rewrite, pattern: e.target.value } })} />
+                    </Field>
+                    <Field label={t('form.replacement')}>
+                      <input value={action.rewrite.replacement} placeholder="/api/$1" onChange={(e) => replace(index, { rewrite: { ...action.rewrite, replacement: e.target.value } })} />
+                    </Field>
+                  </>
+                )}
+                {type === 'redirect' && 'redirect' in action && (
+                  <>
+                    <Field label={t('form.status')}>
+                      <Dropdown
+                        value={String(action.redirect.status)}
+                        options={[301, 302].map((status) => ({ value: String(status), label: String(status) }))}
+                        onChange={(status) => replace(index, { redirect: { ...action.redirect, status: Number(status) } })}
+                      />
+                    </Field>
+                    <Field label={t('form.locationTarget')}>
+                      <input value={action.redirect.location} placeholder="https://example.com" onChange={(e) => replace(index, { redirect: { ...action.redirect, location: e.target.value } })} />
+                    </Field>
+                  </>
+                )}
+                <button type="button" className="btn btn-ghost btn-sm policy-remove" onClick={() => setDraft({ ...draft, path_actions: actions.filter((_, i) => i !== index) })}>
+                  <Icon name="close" size={16} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function LimitPolicyEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+  const { t } = useI18n();
+  const policy = normalizeLimitPolicy(draft.limit_policy);
+  function update(patch: Partial<LimitPolicy>) {
+    setDraft({ ...draft, limit_policy: normalizeLimitPolicy({ ...policy, ...patch }) });
+  }
+  return (
+    <section className="form-section">
+      <h3 className="form-section-title">{t('form.limitPolicy')}</h3>
+      <div className="form-grid-3">
+        <Field label={t('form.ratePerSecond')}>
+          <input type="number" min="0" placeholder={t('form.optionalZero')} value={policy.rate_per_second ?? ''} onChange={(e) => update({ rate_per_second: parseOptionalPositive(e.target.value) })} />
+        </Field>
+        <Field label={t('form.rateKey')}>
+          <Dropdown value={policy.rate_key} options={enumOptions(RATE_LIMIT_KEYS)} onChange={(rate_key) => update({ rate_key: rate_key as RateLimitKey })} />
+        </Field>
+        <Field label={t('form.maxConnections')}>
+          <input type="number" min="0" placeholder={t('form.optionalZero')} value={policy.max_connections ?? ''} onChange={(e) => update({ max_connections: parseOptionalPositive(e.target.value) })} />
+        </Field>
+        <Field label={t('form.maxBodyBytes')}>
+          <input type="number" min="0" placeholder={t('form.optionalZero')} value={policy.max_body_bytes ?? ''} onChange={(e) => update({ max_body_bytes: parseOptionalPositive(e.target.value) })} />
+        </Field>
+        <Field label={t('form.queueTimeoutMs')}>
+          <input type="number" min="0" placeholder={t('form.optionalZero')} value={policy.queue_timeout_ms ?? ''} onChange={(e) => update({ queue_timeout_ms: parseOptionalPositive(e.target.value) })} />
+        </Field>
+      </div>
+    </section>
+  );
+}
+
 /* ===== Upstreams View ===== */
 
 function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
@@ -1651,11 +2009,16 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
   }, [token]);
 
   function openCreate() { setEditing(null); setDraft(newUpstream()); setShowModal(true); }
-  function openEdit(u: Upstream) { setEditing(u.name); setDraft({ ...structuredClone(u), health_check: normalizeHealthCheck(u.health_check) }); setShowModal(true); }
+  function openEdit(u: Upstream) { setEditing(u.name); setDraft(normalizeUpstream(structuredClone(u))); setShowModal(true); }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    const body = { ...draft, health_check: normalizeHealthCheck(draft.health_check) };
+    const body = {
+      ...draft,
+      balance: draft.balance ?? 'weighted_round_robin',
+      retry: normalizeRetryPolicy(draft.retry),
+      health_check: normalizeHealthCheck(draft.health_check),
+    };
     await api<Upstream>(editing ? `/api/upstreams/${encodeURIComponent(editing)}` : '/api/upstreams', { method: editing ? 'PUT' : 'POST', token, body });
     await refreshConfig(token, setConfig, setNotice);
     setNotice({ type: 'success', message: editing ? t('notice.upstreamUpdated') : t('notice.upstreamCreated') });
@@ -1711,6 +2074,47 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
                 <input type="checkbox" checked={Boolean(draft.websocket)} onChange={(e) => setDraft({ ...draft, websocket: e.target.checked })} />
                 <span>{t('config.websocket')}</span>
               </label>
+            </section>
+            <section className="form-section">
+              <h3 className="form-section-title">{t('form.balance')}</h3>
+              <div className="form-grid">
+                <Field label={t('form.algorithm')}>
+                  <Dropdown
+                    value={draft.balance ?? 'weighted_round_robin'}
+                    options={enumOptions(BALANCE_ALGORITHMS)}
+                    onChange={(balance) => setDraft({ ...draft, balance: balance as BalanceAlgorithm })}
+                  />
+                </Field>
+                <Field label={t('form.retryAttempts')}>
+                  <input type="number" min="0" value={draft.retry?.attempts ?? 0} onChange={(e) => setDraft({ ...draft, retry: normalizeRetryPolicy({ ...(draft.retry ?? defaultRetryPolicy), attempts: clampInt(e.target.value, 0, 100, 0) }) })} />
+                </Field>
+              </div>
+              <Field label={t('form.retryStatus')}>
+                <input
+                  value={(draft.retry?.retry_on_status ?? []).join(', ')}
+                  placeholder="502,503,504"
+                  onChange={(e) => setDraft({ ...draft, retry: normalizeRetryPolicy({ ...(draft.retry ?? defaultRetryPolicy), retry_on_status: parseStatusList(e.target.value) }) })}
+                />
+              </Field>
+              <p className="card-desc">{t('form.retryStatusHint')}</p>
+              <div className="form-grid">
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(draft.retry?.retry_on_timeout)}
+                    onChange={(e) => setDraft({ ...draft, retry: normalizeRetryPolicy({ ...(draft.retry ?? defaultRetryPolicy), retry_on_timeout: e.target.checked }) })}
+                  />
+                  <span>{t('form.retryTimeout')}</span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(draft.retry?.retry_on_connect_error)}
+                    onChange={(e) => setDraft({ ...draft, retry: normalizeRetryPolicy({ ...(draft.retry ?? defaultRetryPolicy), retry_on_connect_error: e.target.checked }) })}
+                  />
+                  <span>{t('form.retryConnect')}</span>
+                </label>
+              </div>
             </section>
             <section className="form-section">
               <h3 className="form-section-title">{t('form.targets')}</h3>
@@ -1822,7 +2226,7 @@ function CertificatesView({ config, token, setConfig, setNotice }: DataProps) {
       const latest = await api<AppConfig>('/api/config', { token });
       const next = { ...latest, certificates: (latest.certificates ?? []).filter((certificate) => uploadedNames.has(certificate.name)) };
       await api<AppConfig>('/api/config', { method: 'PUT', token, body: next });
-      setConfig(next);
+      setConfig(normalizeConfig(next));
       setCertificates(structuredClone(next.certificates ?? []));
       setNotice({ type: 'success', message: t('cert.saved') });
     } catch (e) { setNotice({ type: 'error', message: errorMessage(e) }); }
@@ -1885,7 +2289,7 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
     try {
       const parsed = yaml.load(text) as AppConfig;
       await api<AppConfig>('/api/config', { method: 'PUT', token, body: parsed });
-      setConfig(parsed);
+      setConfig(normalizeConfig(parsed));
       setNotice({ type: 'success', message: t('notice.configSaved') });
     } catch (e) { setNotice({ type: 'error', message: errorMessage(e) }); }
   }
@@ -1998,10 +2402,10 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <h3 className="card-title-sm">{t('config.schema')}</h3>
             <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log.level, monitoring.prometheus, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">balance, retry, skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions(header/cookie/jwt)</span></div>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, request_timeout, host, location, priority, tls, match_set, conditions, upstream</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, request_timeout, header_policy, path_actions, limit_policy, host, location, priority, tls, match_set, conditions, upstream</span></div>
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.validation')}</h3>
@@ -2112,7 +2516,7 @@ async function api<T>(path: string, options: { method?: string; token?: string; 
 }
 
 async function refreshConfig(token: string, setConfig: (c: AppConfig) => void, setNotice: (n: Notice) => void) {
-  try { setConfig(await api<AppConfig>('/api/config', { token })); } catch (error) { setNotice({ type: 'error', message: errorMessage(error) }); }
+  try { setConfig(normalizeConfig(await api<AppConfig>('/api/config', { token }))); } catch (error) { setNotice({ type: 'error', message: errorMessage(error) }); }
 }
 
 async function prometheusRange(token: string, query: string, start: number, end: number, step: string): Promise<PrometheusRangeResult> {
@@ -2169,17 +2573,21 @@ function escapePromLabel(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 }
 
-function sparklinePath(points: ChartPoint[], width: number, height: number): string {
-  if (points.length === 0) return '';
+function sparklineChart(points: ChartPoint[], width: number, height: number): { path: string; points: { x: number; y: number }[] } {
+  if (points.length === 0) return { path: '', points: [] };
   const values = points.map((p) => p.v);
   const min = Math.min(...values);
   const max = Math.max(...values);
   const span = max - min || 1;
-  return points.map((point, index) => {
+  const coordinates = points.map((point, index) => {
     const x = points.length === 1 ? width : (index / (points.length - 1)) * width;
     const y = height - ((point.v - min) / span) * (height - 20) - 10;
-    return `${index === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
-  }).join(' ');
+    return { x, y };
+  });
+  return {
+    path: coordinates.map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(' '),
+    points: coordinates,
+  };
 }
 
 function formatNumber(n: number): string {
@@ -2228,7 +2636,23 @@ function clampPercent(value: number): number {
 }
 
 function newRule(upstream = '', listen = '0.0.0.0:80'): Rule {
-  return { id: '', name: '', priority: 10, host: { type: 'any', value: null }, location: { type: 'prefix', value: '/' }, match_set: null, upstream, weight: 100, is_fallback: false, listen, request_timeout: 0, conditions: createLeafCondition() };
+  return {
+    id: '',
+    name: '',
+    priority: 10,
+    host: { type: 'any', value: null },
+    location: { type: 'prefix', value: '/' },
+    match_set: null,
+    upstream,
+    weight: 100,
+    is_fallback: false,
+    listen,
+    request_timeout: 0,
+    conditions: createLeafCondition(),
+    header_policy: { ...defaultHeaderPolicy, request: [], response: [] },
+    path_actions: [],
+    limit_policy: { ...defaultLimitPolicy },
+  };
 }
 
 function newMatchSet(): MatchSet {
@@ -2285,7 +2709,139 @@ function extractPort(listen?: string | null): string | null {
 }
 
 function newUpstream(): Upstream {
-  return { name: '', skip_ssl: false, websocket: false, targets: [{ url: 'http://127.0.0.1:8080', weight: 100 }], health_check: { ...defaultHealthCheck } };
+  return {
+    name: '',
+    skip_ssl: false,
+    websocket: false,
+    balance: 'weighted_round_robin',
+    retry: { ...defaultRetryPolicy, retry_on_status: [] },
+    targets: [{ url: 'http://127.0.0.1:8080', weight: 100 }],
+    health_check: { ...defaultHealthCheck },
+  };
+}
+
+function normalizeConfig(config: AppConfig): AppConfig {
+  return {
+    ...config,
+    rules: (config.rules ?? []).map(normalizeRule),
+    upstreams: Object.fromEntries(
+      Object.entries(config.upstreams ?? {}).map(([name, upstream]) => [name, normalizeUpstream(upstream)])
+    ),
+  };
+}
+
+function normalizeRule(rule: Rule): Rule {
+  return {
+    ...rule,
+    host: normalizeHostMatcher(rule.host),
+    location: normalizeLocationMatcher(rule.location),
+    conditions: rule.match_set ? null : normalizeCondition(rule.conditions),
+    request_timeout: Number(rule.request_timeout ?? 0),
+    header_policy: normalizeHeaderPolicy(rule.header_policy),
+    path_actions: normalizePathActions(rule.path_actions),
+    limit_policy: normalizeLimitPolicy(rule.limit_policy),
+  };
+}
+
+function normalizeUpstream(upstream: Upstream): Upstream {
+  return {
+    ...upstream,
+    balance: BALANCE_ALGORITHMS.includes(upstream.balance as BalanceAlgorithm) ? upstream.balance : 'weighted_round_robin',
+    retry: normalizeRetryPolicy(upstream.retry),
+    health_check: normalizeHealthCheck(upstream.health_check),
+    targets: (upstream.targets ?? []).map((target) => ({ url: target.url, weight: Number(target.weight ?? 0) })),
+  };
+}
+
+function normalizeHeaderPolicy(policy?: HeaderPolicy): HeaderPolicy {
+  return {
+    request: (policy?.request ?? []).map(normalizeHeaderMutation),
+    response: (policy?.response ?? []).map(normalizeHeaderMutation),
+  };
+}
+
+function normalizeHeaderMutation(mutation: HeaderMutation): HeaderMutation {
+  const op = HEADER_MUTATION_OPS.includes(mutation.op) ? mutation.op : 'set';
+  return {
+    op,
+    name: mutation.name ?? '',
+    value: op === 'remove' ? null : mutation.value ?? '',
+  };
+}
+
+function normalizePathActions(actions?: PathAction[]): PathAction[] {
+  return (actions ?? []).map((action) => createPathAction(pathActionType(action), action));
+}
+
+function normalizeLimitPolicy(policy?: LimitPolicy): LimitPolicy {
+  return {
+    rate_per_second: nullablePositiveNumber(policy?.rate_per_second),
+    rate_key: RATE_LIMIT_KEYS.includes(policy?.rate_key as RateLimitKey) ? policy!.rate_key : 'ip',
+    max_connections: nullablePositiveNumber(policy?.max_connections),
+    max_body_bytes: nullablePositiveNumber(policy?.max_body_bytes),
+    queue_timeout_ms: nullablePositiveNumber(policy?.queue_timeout_ms),
+  };
+}
+
+function normalizeRetryPolicy(policy?: RetryPolicy): RetryPolicy {
+  return {
+    attempts: Math.max(0, Number(policy?.attempts ?? 0)),
+    retry_on_status: (policy?.retry_on_status ?? [])
+      .map((status) => Number(status))
+      .filter((status) => Number.isInteger(status) && status >= 100 && status <= 599),
+    retry_on_timeout: Boolean(policy?.retry_on_timeout),
+    retry_on_connect_error: Boolean(policy?.retry_on_connect_error),
+  };
+}
+
+function nullablePositiveNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseOptionalPositive(value: string): number | null {
+  return nullablePositiveNumber(value.trim() === '' ? null : Number(value));
+}
+
+function parseStatusList(value: string): number[] {
+  return value
+    .split(',')
+    .map((item) => Number(item.trim()))
+    .filter((status) => Number.isInteger(status) && status >= 100 && status <= 599);
+}
+
+function createHeaderMutation(): HeaderMutation {
+  return { op: 'set', name: '', value: '' };
+}
+
+function createPathAction(type: PathActionType = 'strip_prefix', previous?: PathAction): PathAction {
+  if (type === 'rewrite') {
+    const rewrite = 'rewrite' in (previous ?? {}) ? (previous as Extract<PathAction, { rewrite: unknown }>).rewrite : undefined;
+    return { rewrite: { pattern: rewrite?.pattern ?? '^/old', replacement: rewrite?.replacement ?? '/new' } };
+  }
+  if (type === 'redirect') {
+    const redirect = 'redirect' in (previous ?? {}) ? (previous as Extract<PathAction, { redirect: unknown }>).redirect : undefined;
+    return { redirect: { status: Number(redirect?.status ?? 301), location: redirect?.location ?? 'https://example.com' } };
+  }
+  const strip = 'strip_prefix' in (previous ?? {}) ? (previous as Extract<PathAction, { strip_prefix: unknown }>).strip_prefix : undefined;
+  return { strip_prefix: { prefix: strip?.prefix ?? '/api' } };
+}
+
+function pathActionType(action: PathAction): PathActionType {
+  if ('rewrite' in action) return 'rewrite';
+  if ('redirect' in action) return 'redirect';
+  return 'strip_prefix';
+}
+
+function humanizeSnake(value: string): string {
+  return value
+    .split('_')
+    .map((part) => part.length <= 3 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function enumOptions<T extends string>(values: readonly T[]): DropdownOption[] {
+  return values.map((value) => ({ value, label: humanizeSnake(value) }));
 }
 
 function targetSummary(upstream: Upstream, lang: Lang): string {

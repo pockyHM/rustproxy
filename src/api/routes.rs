@@ -857,6 +857,21 @@ async fn api_not_found(
     Ok(StatusCode::NOT_FOUND.into_response())
 }
 
+fn client_ip_string(addr: std::net::SocketAddr) -> String {
+    addr.ip().to_string()
+}
+
+fn normalize_host_key(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    if let Some(stripped) = host.strip_suffix(":80") {
+        stripped.to_string()
+    } else if let Some(stripped) = host.strip_suffix(":443") {
+        stripped.to_string()
+    } else {
+        host
+    }
+}
+
 /// Proxy-only router (no API routes).
 fn proxy_router(state: AppState, listen_addr: Option<String>) -> Router {
     let router = Router::new()
@@ -878,8 +893,8 @@ async fn proxy_handler(
     request: Request<Body>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     let source = remote_addr
-        .map(|Extension(addr)| addr.to_string())
-        .or_else(|| connect_info.map(|ConnectInfo(addr)| addr.to_string()))
+        .map(|Extension(addr)| client_ip_string(addr))
+        .or_else(|| connect_info.map(|ConnectInfo(addr)| client_ip_string(addr)))
         .unwrap_or_else(|| "-".to_string());
     let listen_addr = listen_addr.map(|Extension(addr)| addr).or_else(|| {
         request
@@ -921,12 +936,13 @@ async fn proxy_handler(
         let limit_state = runtime.limits.clone();
         let balancer = runtime.balancer.clone();
         let match_request = request_for_matching(&request);
-        let request_host = request
-            .headers()
-            .get("host")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
+        let request_host = normalize_host_key(
+            request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-"),
+        );
 
         let selected = listen_addr.as_deref().and_then(|addr| {
             runtime
@@ -1201,4 +1217,24 @@ fn spawn_health_checker(state: AppState) {
     tokio::spawn(async move {
         run_health_checks(state.health.clone(), state.health_config.clone(), clients).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_ip_string, normalize_host_key};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn client_ip_string_drops_ephemeral_port() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 54321);
+
+        assert_eq!(client_ip_string(addr), "203.0.113.7");
+    }
+
+    #[test]
+    fn normalize_host_key_lowercases_and_strips_default_ports() {
+        assert_eq!(normalize_host_key("Example.COM:80"), "example.com");
+        assert_eq!(normalize_host_key("Example.COM:443"), "example.com");
+        assert_eq!(normalize_host_key("Example.COM:8443"), "example.com:8443");
+    }
 }

@@ -6,7 +6,10 @@ use crate::models::PathAction;
 
 pub enum PathDecision {
     Forward(Uri),
-    Redirect { status: StatusCode, location: String },
+    Redirect {
+        status: StatusCode,
+        location: String,
+    },
 }
 
 pub fn apply_path_actions(original: &Uri, actions: &[PathAction]) -> Result<PathDecision> {
@@ -16,7 +19,12 @@ pub fn apply_path_actions(original: &Uri, actions: &[PathAction]) -> Result<Path
     for action in actions {
         match action {
             PathAction::StripPrefix { prefix } => {
-                if let Some(stripped) = path.strip_prefix(prefix) {
+                let matches_segment = path == *prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|stripped| stripped.starts_with('/'));
+                if matches_segment {
+                    let stripped = path.strip_prefix(prefix).unwrap_or_default();
                     path = if stripped.is_empty() {
                         "/".to_string()
                     } else if stripped.starts_with('/') {
@@ -30,8 +38,8 @@ pub fn apply_path_actions(original: &Uri, actions: &[PathAction]) -> Result<Path
                 pattern,
                 replacement,
             } => {
-                let regex =
-                    Regex::new(pattern).with_context(|| format!("invalid path regex '{pattern}'"))?;
+                let regex = Regex::new(pattern)
+                    .with_context(|| format!("invalid path regex '{pattern}'"))?;
                 let rewritten = regex.replace(&path, replacement.as_str()).to_string();
                 if let Some((rewritten_path, rewritten_query)) = rewritten.split_once('?') {
                     path = normalize_path(rewritten_path);
@@ -54,7 +62,10 @@ pub fn apply_path_actions(original: &Uri, actions: &[PathAction]) -> Result<Path
         }
     }
 
-    Ok(PathDecision::Forward(build_relative_uri(&path, query.as_deref())?))
+    Ok(PathDecision::Forward(build_relative_uri(
+        &path,
+        query.as_deref(),
+    )?))
 }
 
 fn normalize_path(path: &str) -> String {
@@ -95,6 +106,23 @@ mod tests {
 
         match decision {
             PathDecision::Forward(uri) => assert_eq!(uri.to_string(), "/v1/users?active=true"),
+            PathDecision::Redirect { .. } => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn strip_prefix_requires_path_segment_boundary() {
+        let uri: Uri = "/apix/v1/users".parse().unwrap();
+        let decision = apply_path_actions(
+            &uri,
+            &[PathAction::StripPrefix {
+                prefix: "/api".to_string(),
+            }],
+        )
+        .unwrap();
+
+        match decision {
+            PathDecision::Forward(uri) => assert_eq!(uri.to_string(), "/apix/v1/users"),
             PathDecision::Redirect { .. } => panic!("expected forward"),
         }
     }
