@@ -38,6 +38,7 @@ use crate::{
     proxy::{
         handle_proxy_with_target, ProxyAccessLogContext, ProxyMetricLabels, ProxyRequestContext,
     },
+    runtime::state::RuntimeState,
 };
 
 use super::handlers;
@@ -89,6 +90,7 @@ pub struct AppState {
     health_config: ConfigSnapshot,
     /// Hot-path proxy runtime — lock-free reads via ArcSwap, atomically swapped on config change.
     proxy_runtime: Arc<ArcSwap<ProxyRuntime>>,
+    runtime_state: RuntimeState,
     listener_manager: Arc<ListenerManager>,
 }
 
@@ -134,9 +136,10 @@ impl AppState {
                 new.match_sets.clone(),
                 self.jwt_secret.to_string(),
             )),
-            balancer: Arc::new(Balancer::new_with_health(
+            balancer: Arc::new(Balancer::new_with_runtime(
                 new.upstreams.clone(),
                 Some(self.health.clone()),
+                self.runtime_state.clone(),
             )),
             config: Arc::new(new.clone()),
             clients,
@@ -1110,6 +1113,7 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
     let health = HealthRegistry::new();
     let health_config = ConfigSnapshot::new();
     health_config.update(&config.upstreams);
+    let runtime_state = RuntimeState::default();
 
     let proxy_runtime = Arc::new(ArcSwap::from_pointee(ProxyRuntime {
         matcher: Arc::new(Matcher::new_verified_with_match_sets(
@@ -1117,9 +1121,10 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
             config.match_sets.clone(),
             jwt_secret.clone(),
         )),
-        balancer: Arc::new(Balancer::new_with_health(
+        balancer: Arc::new(Balancer::new_with_runtime(
             config.upstreams.clone(),
             Some(health.clone()),
+            runtime_state.clone(),
         )),
         config: Arc::new(config.clone()),
         clients: Arc::new(ProxyClients::new(
@@ -1152,6 +1157,7 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
         health,
         health_config,
         proxy_runtime,
+        runtime_state,
         listener_manager: Arc::new(ListenerManager::default()),
     };
 
@@ -1221,8 +1227,66 @@ fn spawn_health_checker(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_ip_string, normalize_host_key};
+    use super::{
+        client_ip_string, normalize_host_key, AppState, ConfigSnapshot, LimitState, Matcher,
+        ProxyClients, ProxyRuntime,
+    };
+    use crate::config::yaml::{AppConfig, Fallback};
+    use crate::db::Database;
+    use crate::models::{BalanceAlgorithm, Target, Upstream};
+    use crate::observability::metrics::ProxyMetrics;
+    use crate::proxy::balancer::{BalanceContext, Balancer};
+    use crate::proxy::health::HealthRegistry;
+    use crate::runtime::state::{RuntimeState, TargetKey};
+    use arc_swap::ArcSwap;
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn target(url: &str, weight: u32) -> Target {
+        Target {
+            url: url.to_string(),
+            weight,
+        }
+    }
+
+    fn app_config_with_upstream(upstream: Upstream) -> AppConfig {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(upstream.name.clone(), upstream);
+        AppConfig {
+            listen: "127.0.0.1:3000".to_string(),
+            proxy_listen: "127.0.0.1:8080".to_string(),
+            connect_timeout: 10,
+            request_timeout: 60,
+            pool_max_idle_per_host: 32,
+            pool_idle_timeout: 90,
+            tcp_keepalive: 60,
+            certificate_dir: "/tmp".to_string(),
+            access_log: Default::default(),
+            monitoring: Default::default(),
+            certificates: Vec::new(),
+            tls_listeners: Vec::new(),
+            match_sets: Vec::new(),
+            rules: Vec::new(),
+            upstreams,
+            fallback: Fallback {
+                url: "http://127.0.0.1:9000".to_string(),
+            },
+        }
+    }
+
+    fn least_connections_upstream() -> Upstream {
+        Upstream {
+            name: "backend".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![target("http://a", 1), target("http://b", 1)],
+            health_check: Default::default(),
+            balance: BalanceAlgorithm::LeastConnections,
+            retry: Default::default(),
+        }
+    }
 
     #[test]
     fn client_ip_string_drops_ephemeral_port() {
@@ -1236,5 +1300,88 @@ mod tests {
         assert_eq!(normalize_host_key("Example.COM:80"), "example.com");
         assert_eq!(normalize_host_key("Example.COM:443"), "example.com");
         assert_eq!(normalize_host_key("Example.COM:8443"), "example.com:8443");
+    }
+
+    #[test]
+    fn rebuild_proxy_runtime_preserves_balancer_runtime_state() {
+        crate::install_rustls_crypto_provider();
+        let config = app_config_with_upstream(least_connections_upstream());
+        let health = HealthRegistry::new();
+        let health_config = ConfigSnapshot::new();
+        health_config.update(&config.upstreams);
+        let jwt_secret = "test-secret".to_string();
+        let runtime_state = RuntimeState::default();
+        let proxy_runtime = Arc::new(ArcSwap::from_pointee(ProxyRuntime {
+            matcher: Arc::new(Matcher::new_verified_with_match_sets(
+                config.rules.clone(),
+                config.match_sets.clone(),
+                jwt_secret.clone(),
+            )),
+            balancer: Arc::new(Balancer::new_with_runtime(
+                config.upstreams.clone(),
+                Some(health.clone()),
+                runtime_state.clone(),
+            )),
+            config: Arc::new(config.clone()),
+            clients: Arc::new(ProxyClients::new(None, 32, None, None)),
+            access_logger: None,
+            limits: Arc::new(LimitState::default()),
+        }));
+        let state = AppState {
+            config: Arc::new(RwLock::new(config.clone())),
+            db: Arc::new(Database::open_in_memory().unwrap()),
+            jwt_secret: Arc::new(jwt_secret),
+            metrics: Arc::new(ProxyMetrics::new().unwrap()),
+            health,
+            health_config,
+            proxy_runtime,
+            runtime_state,
+            listener_manager: Arc::new(Default::default()),
+        };
+
+        let selected = state
+            .proxy_runtime
+            .load()
+            .balancer
+            .select(
+                "backend",
+                BalanceContext {
+                    client_ip: None,
+                    path: "/",
+                },
+            )
+            .unwrap();
+        assert_eq!(selected.url, "http://a");
+
+        state.rebuild_proxy_runtime(&config, &config);
+
+        let next = state
+            .proxy_runtime
+            .load()
+            .balancer
+            .select(
+                "backend",
+                BalanceContext {
+                    client_ip: None,
+                    path: "/",
+                },
+            )
+            .unwrap();
+
+        assert_eq!(next.url, "http://b");
+        drop(selected);
+        drop(next);
+        let key = TargetKey::new("backend", "http://a");
+        assert_eq!(
+            state
+                .proxy_runtime
+                .load()
+                .balancer
+                .runtime_state_for_test()
+                .snapshot()
+                .targets[&key]
+                .active_connections,
+            0
+        );
     }
 }

@@ -1,14 +1,15 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 use crate::models::{BalanceAlgorithm, Upstream};
 use crate::proxy::health::HealthRegistry;
+use crate::runtime::state::{RuntimeState, TargetKey};
 
 pub struct Balancer {
     upstreams: HashMap<String, WeightedUpstream>,
     health: Option<HealthRegistry>,
+    runtime_state: RuntimeState,
 }
 
 pub struct BalanceContext<'a> {
@@ -25,13 +26,7 @@ pub struct SelectedTarget {
 
 #[derive(Debug)]
 pub struct TargetLease {
-    active_connections: Arc<AtomicU32>,
-}
-
-impl Drop for TargetLease {
-    fn drop(&mut self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
+    _runtime_lease: crate::runtime::state::TargetLease,
 }
 
 struct WeightedUpstream {
@@ -45,9 +40,19 @@ struct WeightedUpstream {
 
 struct WeightedTarget {
     url: String,
+    key: TargetKey,
+    weight: u32,
     health_key: Option<String>,
-    cumulative_weight: u32,
-    active_connections: Arc<AtomicU32>,
+}
+
+struct TargetSelection<'a> {
+    target: &'a WeightedTarget,
+    _runtime_lease: crate::runtime::state::TargetLease,
+}
+
+struct CandidateSet<'a> {
+    enabled: Vec<&'a WeightedTarget>,
+    fallback: Vec<&'a WeightedTarget>,
 }
 
 impl Balancer {
@@ -59,12 +64,24 @@ impl Balancer {
         upstreams: HashMap<String, Upstream>,
         health: Option<HealthRegistry>,
     ) -> Self {
+        Self::new_with_runtime(upstreams, health, RuntimeState::default())
+    }
+
+    pub fn new_with_runtime(
+        upstreams: HashMap<String, Upstream>,
+        health: Option<HealthRegistry>,
+        runtime_state: RuntimeState,
+    ) -> Self {
         let upstreams = upstreams
             .into_iter()
-            .map(|(name, upstream)| (name, WeightedUpstream::new(upstream)))
+            .map(|(name, upstream)| (name, WeightedUpstream::new(upstream, &runtime_state)))
             .collect();
 
-        Self { upstreams, health }
+        Self {
+            upstreams,
+            health,
+            runtime_state,
+        }
     }
 
     pub fn select(&self, upstream_name: &str, ctx: BalanceContext<'_>) -> Option<SelectedTarget> {
@@ -82,109 +99,245 @@ impl Balancer {
             return None;
         }
 
-        let target = match upstream.balance {
+        let candidates = match upstream.balance {
             BalanceAlgorithm::WeightedRoundRobin => {
-                self.select_weighted_round_robin(upstream, excluded_url)
+                self.weighted_round_robin_candidates(upstream, excluded_url)
             }
             BalanceAlgorithm::LeastConnections => {
-                self.select_least_connections(upstream, excluded_url)
+                self.least_connections_candidates(upstream, excluded_url)
             }
             BalanceAlgorithm::IpHash => {
                 let key = ctx.client_ip.unwrap_or(ctx.path);
-                self.select_modulo_hash(upstream, key, excluded_url)
+                self.modulo_hash_candidates(upstream, key, excluded_url)
             }
-            BalanceAlgorithm::UrlHash => self.select_modulo_hash(upstream, ctx.path, excluded_url),
+            BalanceAlgorithm::UrlHash => {
+                self.modulo_hash_candidates(upstream, ctx.path, excluded_url)
+            }
             BalanceAlgorithm::ConsistentHash => {
-                self.select_consistent_hash(upstream, ctx.path, excluded_url)
+                self.consistent_hash_candidates(upstream, ctx.path, excluded_url)
             }
-        }?;
+        };
+        let selection = self.acquire_selected_target(candidates.enabled, candidates.fallback)?;
+        let target = selection.target;
 
-        target.active_connections.fetch_add(1, Ordering::Relaxed);
         Some(SelectedTarget {
             url: target.url.clone(),
             upstream: upstream.name.clone(),
             active_connection: TargetLease {
-                active_connections: Arc::clone(&target.active_connections),
+                _runtime_lease: selection._runtime_lease,
             },
         })
     }
 
-    fn select_weighted_round_robin<'a>(
+    fn weighted_round_robin_candidates<'a>(
         &'a self,
         upstream: &'a WeightedUpstream,
         excluded_url: Option<&str>,
-    ) -> Option<&'a WeightedTarget> {
-        let slot = upstream.counter.fetch_add(1, Ordering::Relaxed) % upstream.total_weight;
-        let idx = upstream
-            .targets
-            .partition_point(|target| target.cumulative_weight <= slot);
+    ) -> CandidateSet<'a> {
+        let enabled = self.weighted_round_robin_candidate_order(upstream, excluded_url, true);
+        let fallback = if enabled.is_empty() {
+            self.weighted_round_robin_candidate_order(upstream, excluded_url, false)
+        } else {
+            upstream
+                .targets
+                .iter()
+                .filter(|target| self.target_is_selectable(target, excluded_url, true))
+                .collect()
+        };
 
-        for offset in 0..upstream.targets.len() {
-            let idx = (idx + offset) % upstream.targets.len();
-            let target = &upstream.targets[idx];
-            if self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url {
-                return Some(target);
-            }
-        }
-
-        None
+        CandidateSet { enabled, fallback }
     }
 
-    fn select_least_connections<'a>(
+    fn least_connections_candidates<'a>(
         &'a self,
         upstream: &'a WeightedUpstream,
         excluded_url: Option<&str>,
-    ) -> Option<&'a WeightedTarget> {
-        upstream
+    ) -> CandidateSet<'a> {
+        let mut enabled: Vec<_> = upstream
             .targets
             .iter()
-            .filter(|target| {
-                self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url
-            })
-            .min_by_key(|target| target.active_connections.load(Ordering::Relaxed))
-    }
-
-    fn select_modulo_hash<'a>(
-        &'a self,
-        upstream: &'a WeightedUpstream,
-        key: &str,
-        excluded_url: Option<&str>,
-    ) -> Option<&'a WeightedTarget> {
-        let healthy: Vec<&WeightedTarget> = upstream
-            .targets
-            .iter()
-            .filter(|target| {
-                self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url
-            })
+            .filter(|target| self.target_is_selectable(target, excluded_url, false))
             .collect();
-        if healthy.is_empty() {
-            return None;
-        }
-        let idx = (stable_hash(&key) as usize) % healthy.len();
-        Some(healthy[idx])
+        enabled.sort_by_key(|target| self.runtime_state.target_active_connections(&target.key));
+
+        let mut fallback: Vec<_> = upstream
+            .targets
+            .iter()
+            .filter(|target| self.target_is_selectable(target, excluded_url, true))
+            .collect();
+        fallback.sort_by_key(|target| self.runtime_state.target_active_connections(&target.key));
+
+        CandidateSet { enabled, fallback }
     }
 
-    fn select_consistent_hash<'a>(
+    fn modulo_hash_candidates<'a>(
         &'a self,
         upstream: &'a WeightedUpstream,
         key: &str,
         excluded_url: Option<&str>,
-    ) -> Option<&'a WeightedTarget> {
+    ) -> CandidateSet<'a> {
+        let enabled = rotate_candidates(
+            upstream
+                .targets
+                .iter()
+                .filter(|target| self.target_is_selectable(target, excluded_url, false))
+                .collect(),
+            stable_hash(&key),
+        );
+        let fallback = rotate_candidates(
+            upstream
+                .targets
+                .iter()
+                .filter(|target| self.target_is_selectable(target, excluded_url, true))
+                .collect(),
+            stable_hash(&key),
+        );
+
+        CandidateSet { enabled, fallback }
+    }
+
+    fn consistent_hash_candidates<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+        key: &str,
+        excluded_url: Option<&str>,
+    ) -> CandidateSet<'a> {
         if upstream.hash_ring.is_empty() {
-            return self.select_modulo_hash(upstream, key, excluded_url);
+            return self.modulo_hash_candidates(upstream, key, excluded_url);
         }
         let key_hash = stable_hash(&key);
         let start = upstream
             .hash_ring
             .partition_point(|(hash, _)| *hash < key_hash);
+
+        CandidateSet {
+            enabled: self.consistent_hash_candidate_order(upstream, excluded_url, start, true),
+            fallback: self.consistent_hash_candidate_order(upstream, excluded_url, start, false),
+        }
+    }
+
+    fn weighted_round_robin_candidate_order<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+        excluded_url: Option<&str>,
+        require_available: bool,
+    ) -> Vec<&'a WeightedTarget> {
+        let mut candidates = Vec::new();
+        let mut total_weight = 0u32;
+        for target in upstream
+            .targets
+            .iter()
+            .filter(|target| self.target_is_selectable(target, excluded_url, !require_available))
+        {
+            let Some(next_weight) = total_weight.checked_add(target.weight) else {
+                break;
+            };
+            total_weight = next_weight;
+            candidates.push((total_weight, target));
+        }
+        if total_weight == 0 {
+            return Vec::new();
+        }
+
+        let slot = upstream.counter.fetch_add(1, Ordering::Relaxed) % total_weight;
+        let start = candidates
+            .iter()
+            .position(|(cumulative_weight, _)| *cumulative_weight > slot)
+            .unwrap_or(0);
+        rotate_candidates(
+            candidates.into_iter().map(|(_, target)| target).collect(),
+            start as u64,
+        )
+    }
+
+    fn consistent_hash_candidate_order<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+        excluded_url: Option<&str>,
+        start: usize,
+        require_available: bool,
+    ) -> Vec<&'a WeightedTarget> {
+        let mut candidates = Vec::new();
         for offset in 0..upstream.hash_ring.len() {
             let idx = (start + offset) % upstream.hash_ring.len();
             let target = &upstream.targets[upstream.hash_ring[idx].1];
-            if self.target_is_healthy(target) && Some(target.url.as_str()) != excluded_url {
-                return Some(target);
+            if self.target_is_selectable(target, excluded_url, !require_available)
+                && !candidates
+                    .iter()
+                    .any(|existing: &&WeightedTarget| existing.key == target.key)
+            {
+                candidates.push(target);
             }
         }
+        candidates
+    }
+
+    fn acquire_selected_target<'a>(
+        &'a self,
+        enabled: Vec<&'a WeightedTarget>,
+        fallback: Vec<&'a WeightedTarget>,
+    ) -> Option<TargetSelection<'a>> {
+        self.acquire_selected_target_with(enabled, fallback, |key| {
+            self.runtime_state.acquire_available_target(key)
+        })
+    }
+
+    fn acquire_selected_target_with<'a>(
+        &'a self,
+        enabled: Vec<&'a WeightedTarget>,
+        fallback: Vec<&'a WeightedTarget>,
+        mut acquire_available: impl FnMut(&TargetKey) -> Option<crate::runtime::state::TargetLease>,
+    ) -> Option<TargetSelection<'a>> {
+        let enabled_keys: Vec<TargetKey> =
+            enabled.iter().map(|target| target.key.clone()).collect();
+        for target in enabled {
+            if let Some(runtime_lease) = acquire_available(&target.key) {
+                return Some(TargetSelection {
+                    target,
+                    _runtime_lease: runtime_lease,
+                });
+            }
+        }
+
+        for target in fallback {
+            if let Some(runtime_lease) = self
+                .runtime_state
+                .acquire_unavailable_target_if_no_enabled(&target.key, &enabled_keys)
+            {
+                return Some(TargetSelection {
+                    target,
+                    _runtime_lease: runtime_lease,
+                });
+            }
+        }
+
         None
+    }
+
+    #[cfg(test)]
+    fn acquire_selected_target_for_test<'a>(
+        &'a self,
+        enabled: Vec<&'a WeightedTarget>,
+        fallback: Vec<&'a WeightedTarget>,
+        acquire_available: impl FnMut(&TargetKey) -> Option<crate::runtime::state::TargetLease>,
+    ) -> Option<TargetSelection<'a>> {
+        self.acquire_selected_target_with(enabled, fallback, acquire_available)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_state_for_test(&self) -> RuntimeState {
+        self.runtime_state.clone()
+    }
+
+    fn target_is_selectable(
+        &self,
+        target: &WeightedTarget,
+        excluded_url: Option<&str>,
+        allow_unavailable: bool,
+    ) -> bool {
+        self.target_is_healthy(target)
+            && Some(target.url.as_str()) != excluded_url
+            && (allow_unavailable || self.runtime_state.target_available(&target.key))
     }
 
     fn target_is_healthy(&self, target: &WeightedTarget) -> bool {
@@ -197,20 +350,31 @@ impl Balancer {
     }
 }
 
+fn rotate_candidates<T>(candidates: Vec<T>, start: u64) -> Vec<T> {
+    let mut candidates = candidates;
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let idx = (start as usize) % candidates.len();
+    candidates.rotate_left(idx);
+    candidates
+}
+
 impl WeightedUpstream {
-    fn new(upstream: Upstream) -> Self {
+    fn new(upstream: Upstream, runtime_state: &RuntimeState) -> Self {
         let mut total_weight = 0u32;
         let mut targets = Vec::new();
         let upstream_name = upstream.name;
         let balance = upstream.balance;
         let health_enabled = upstream.health_check.enabled;
 
-        for target in upstream
-            .targets
-            .into_iter()
-            .filter(|target| target.weight > 0)
-        {
-            let Some(next_weight) = total_weight.checked_add(target.weight) else {
+        for target in upstream.targets.into_iter() {
+            let key = TargetKey::new(&upstream_name, &target.url);
+            let effective_weight = runtime_state.target_effective_weight(&key, target.weight);
+            if effective_weight == 0 {
+                continue;
+            }
+            let Some(next_weight) = total_weight.checked_add(effective_weight) else {
                 break;
             };
             total_weight = next_weight;
@@ -218,9 +382,9 @@ impl WeightedUpstream {
                 health_enabled.then(|| HealthRegistry::target_key(&upstream_name, &target.url));
             targets.push(WeightedTarget {
                 url: target.url,
+                key,
+                weight: effective_weight,
                 health_key,
-                cumulative_weight: total_weight,
-                active_connections: Arc::new(AtomicU32::new(0)),
             });
         }
 
@@ -256,6 +420,7 @@ mod tests {
     use super::{BalanceContext, Balancer};
     use crate::models::{BalanceAlgorithm, HealthCheck, Target, Upstream};
     use crate::proxy::health::HealthRegistry;
+    use crate::runtime::state::{RuntimeState, TargetKey, TargetMode};
     use std::collections::HashMap;
 
     fn target(url: &str, weight: u32) -> Target {
@@ -296,6 +461,12 @@ mod tests {
         let mut upstreams = HashMap::new();
         upstreams.insert(upstream.name.clone(), upstream);
         Balancer::new(upstreams)
+    }
+
+    fn balancer_with_runtime(upstream: Upstream, runtime_state: RuntimeState) -> Balancer {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(upstream.name.clone(), upstream);
+        Balancer::new_with_runtime(upstreams, None, runtime_state)
     }
 
     #[test]
@@ -377,6 +548,194 @@ mod tests {
                 "http://b".to_string()
             );
         }
+    }
+
+    #[test]
+    fn shared_runtime_state_preserves_active_connections_across_balancers() {
+        let runtime = RuntimeState::default();
+        let upstream = upstream_with_algorithm(
+            "backend",
+            vec![target("http://a", 1), target("http://b", 1)],
+            BalanceAlgorithm::LeastConnections,
+        );
+        let first = balancer_with_runtime(upstream.clone(), runtime.clone());
+        let selected = first.select("backend", ctx(None, "/")).unwrap();
+
+        let second = balancer_with_runtime(upstream, runtime.clone());
+        let next = second.select("backend", ctx(None, "/")).unwrap();
+
+        assert_eq!(selected.url, "http://a");
+        assert_eq!(next.url, "http://b");
+        assert_eq!(
+            runtime.snapshot().targets[&TargetKey::new("backend", "http://a")].active_connections,
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_drain_targets_are_skipped_when_enabled_targets_exist() {
+        let runtime = RuntimeState::default();
+        runtime.set_target_mode(&TargetKey::new("backend", "http://a"), TargetMode::Drain);
+        let balancer = balancer_with_runtime(
+            upstream(
+                "backend",
+                vec![target("http://a", 1), target("http://b", 1)],
+            ),
+            runtime,
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                balancer.select("backend", ctx(None, "/")).unwrap().url,
+                "http://b"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_round_robin_rebalances_across_enabled_targets_when_one_target_is_drained() {
+        let runtime = RuntimeState::default();
+        runtime.set_target_mode(&TargetKey::new("backend", "http://a"), TargetMode::Drain);
+        let balancer = balancer_with_runtime(
+            upstream(
+                "backend",
+                vec![
+                    target("http://a", 1),
+                    target("http://b", 1),
+                    target("http://c", 1),
+                ],
+            ),
+            runtime,
+        );
+
+        let selections: Vec<String> = (0..6)
+            .map(|_| balancer.select("backend", ctx(None, "/")).unwrap().url)
+            .collect();
+
+        assert_eq!(
+            selections,
+            vec![
+                "http://b".to_string(),
+                "http://c".to_string(),
+                "http://b".to_string(),
+                "http://c".to_string(),
+                "http://b".to_string(),
+                "http://c".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_disabled_targets_are_skipped_when_enabled_targets_exist() {
+        let runtime = RuntimeState::default();
+        runtime.set_target_mode(&TargetKey::new("backend", "http://a"), TargetMode::Disabled);
+        let balancer = balancer_with_runtime(
+            upstream(
+                "backend",
+                vec![target("http://a", 1), target("http://b", 1)],
+            ),
+            runtime,
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                balancer.select("backend", ctx(None, "/")).unwrap().url,
+                "http://b"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_falls_back_to_unavailable_targets_when_none_are_enabled() {
+        let runtime = RuntimeState::default();
+        runtime.set_target_mode(&TargetKey::new("backend", "http://a"), TargetMode::Drain);
+        runtime.set_target_mode(&TargetKey::new("backend", "http://b"), TargetMode::Disabled);
+        let balancer = balancer_with_runtime(
+            upstream(
+                "backend",
+                vec![target("http://a", 1), target("http://b", 1)],
+            ),
+            runtime,
+        );
+
+        let selected = balancer.select("backend", ctx(None, "/")).unwrap();
+        assert!(matches!(selected.url.as_str(), "http://a" | "http://b"));
+        let key = TargetKey::new("backend", selected.url.clone());
+        assert_eq!(
+            balancer.runtime_state.snapshot().targets[&key].active_connections,
+            1
+        );
+        drop(selected);
+        assert_eq!(
+            balancer.runtime_state.snapshot().targets[&key].active_connections,
+            0
+        );
+    }
+
+    #[test]
+    fn acquisition_continues_to_next_enabled_candidate_after_first_candidate_fails() {
+        let runtime = RuntimeState::default();
+        let balancer = balancer_with_runtime(
+            upstream(
+                "backend",
+                vec![target("http://a", 1), target("http://b", 1)],
+            ),
+            runtime.clone(),
+        );
+        let upstream = balancer.upstreams.get("backend").unwrap();
+        let candidates: Vec<_> = upstream.targets.iter().collect();
+        let mut attempts = 0;
+
+        let acquired = balancer
+            .acquire_selected_target_for_test(candidates, Vec::new(), |key| {
+                attempts += 1;
+                if attempts == 1 {
+                    None
+                } else {
+                    runtime.acquire_available_target(key)
+                }
+            })
+            .unwrap();
+
+        assert_eq!(acquired.target.url, "http://b");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn acquisition_does_not_fallback_to_unavailable_target_while_enabled_candidate_remains() {
+        let runtime = RuntimeState::default();
+        let balancer = balancer_with_runtime(
+            upstream(
+                "backend",
+                vec![target("http://a", 1), target("http://b", 1)],
+            ),
+            runtime.clone(),
+        );
+        let upstream = balancer.upstreams.get("backend").unwrap();
+        let first = &upstream.targets[0];
+        let second = &upstream.targets[1];
+        let mut attempts = 0;
+
+        let acquired =
+            balancer.acquire_selected_target_for_test(vec![first, second], vec![first], |key| {
+                attempts += 1;
+                if key.url == "http://a" {
+                    runtime.set_target_mode(key, TargetMode::Disabled);
+                }
+                None
+            });
+
+        assert!(acquired.is_none());
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            runtime
+                .snapshot()
+                .targets
+                .get(&TargetKey::new("backend", "http://a"))
+                .map_or(0, |target| target.active_connections),
+            0
+        );
+        assert!(runtime.target_available(&TargetKey::new("backend", "http://b")));
     }
 
     #[test]
