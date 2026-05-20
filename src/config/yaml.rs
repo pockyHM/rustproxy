@@ -784,6 +784,7 @@ fallback:
                 balance: Default::default(),
                 retry: Default::default(),
                 timeouts: Default::default(),
+                sticky: Default::default(),
             },
         );
         let config = AppConfig {

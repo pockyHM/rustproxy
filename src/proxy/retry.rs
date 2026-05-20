@@ -110,6 +110,7 @@ mod tests {
             balance: Default::default(),
             retry: policy.clone(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         let mut upstreams = HashMap::new();
         upstreams.insert("backend".to_string(), upstream);

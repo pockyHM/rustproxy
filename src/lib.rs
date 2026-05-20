@@ -7,6 +7,7 @@ pub mod models;
 pub mod observability;
 pub mod proxy;
 pub mod runtime;
+pub mod stick;
 pub mod tcp;
 pub mod version;
 

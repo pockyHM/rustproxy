@@ -548,7 +548,7 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
         let targets = load_targets(conn, &name)?;
         let (skip_ssl, websocket) = load_upstream_options(conn, &name)?;
         let health_check = load_health_check(conn, &name)?;
-        let (balance, retry, timeouts) = load_upstream_policy(conn, &name)?;
+        let (balance, retry, timeouts, sticky) = load_upstream_policy(conn, &name)?;
         upstreams.push(Upstream {
             name,
             skip_ssl,
@@ -558,6 +558,7 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
             balance,
             retry,
             timeouts,
+            sticky,
         });
     }
     Ok(upstreams)
@@ -608,21 +609,36 @@ fn load_health_check(conn: &Connection, upstream_name: &str) -> Result<HealthChe
 fn load_upstream_policy(
     conn: &Connection,
     upstream_name: &str,
-) -> Result<(BalanceAlgorithm, RetryPolicy, UpstreamTimeoutPolicy)> {
-    let (balance, retry_json, timeout_json): (String, Option<String>, Option<String>) = conn
+) -> Result<(
+    BalanceAlgorithm,
+    RetryPolicy,
+    UpstreamTimeoutPolicy,
+    crate::stick::StickyPolicy,
+)> {
+    let (balance, retry_json, timeout_json, sticky_json): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT balance, retry_policy, timeout_policy FROM upstreams WHERE name = ?1",
+            "SELECT balance, retry_policy, timeout_policy, sticky_policy FROM upstreams WHERE name = ?1",
             params![upstream_name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
     let timeouts =
         json_column_or_default::<UpstreamTimeoutPolicy>(timeout_json.as_deref(), || {
             format!("failed to parse upstreams.timeout_policy for upstream '{upstream_name}'")
         })?;
+    let sticky =
+        json_column_or_default::<crate::stick::StickyPolicy>(sticky_json.as_deref(), || {
+            format!("failed to parse upstreams.sticky_policy for upstream '{upstream_name}'")
+        })?;
     Ok((
         parse_balance_algorithm(&balance),
         json_or_default(retry_json.as_deref()),
         timeouts,
+        sticky,
     ))
 }
 
@@ -744,8 +760,9 @@ fn set_setting_tx(tx: &rusqlite::Transaction, key: &str, value: &str) -> Result<
 
 fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
     let retry_policy = serde_json::to_string(&upstream.retry)?;
+    let sticky_policy = serde_json::to_string(&upstream.sticky)?;
     tx.execute(
-        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy, timeout_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy, timeout_policy, sticky_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             upstream.name,
             upstream.skip_ssl,
@@ -761,6 +778,7 @@ fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()
             balance_algorithm_str(upstream.balance),
             retry_policy,
             serde_json::to_string(&upstream.timeouts)?,
+            sticky_policy,
         ],
     )?;
     insert_targets(tx, &upstream.name, &upstream.targets)?;
@@ -879,8 +897,9 @@ fn delete_upstream_targets(tx: &rusqlite::Transaction, upstream_name: &str) -> R
 fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
     let retry_policy = serde_json::to_string(&upstream.retry)?;
     let timeout_policy = serde_json::to_string(&upstream.timeouts)?;
+    let sticky_policy = serde_json::to_string(&upstream.sticky)?;
     let changes = tx.execute(
-        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, timeout_policy = ?13, updated_at = datetime('now') WHERE name = ?14",
+        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, timeout_policy = ?13, sticky_policy = ?14, updated_at = datetime('now') WHERE name = ?15",
         params![
             upstream.skip_ssl,
             upstream.websocket,
@@ -895,6 +914,7 @@ fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Resul
             balance_algorithm_str(upstream.balance),
             retry_policy,
             timeout_policy,
+            sticky_policy,
             upstream.name,
         ],
     )?;
@@ -925,6 +945,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
     balance                          TEXT NOT NULL DEFAULT 'weighted_round_robin',
     retry_policy                     TEXT,
     timeout_policy                   TEXT,
+    sticky_policy                    TEXT,
     created_at                       TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at                       TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -1091,6 +1112,7 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     )?;
     add_column_if_missing(conn, "upstreams", "retry_policy", "TEXT")?;
     add_column_if_missing(conn, "upstreams", "timeout_policy", "TEXT")?;
+    add_column_if_missing(conn, "upstreams", "sticky_policy", "TEXT")?;
     add_column_if_missing(conn, "targets", "timeout_policy", "TEXT")?;
 
     Ok(())
@@ -1254,6 +1276,7 @@ mod tests {
                         balance: Default::default(),
                         retry: Default::default(),
                         timeouts: Default::default(),
+                        sticky: Default::default(),
                     },
                 );
                 m
@@ -1389,6 +1412,35 @@ mod tests {
         assert_eq!(
             loaded_upstream.targets[0].timeouts.server_timeout_seconds,
             Some(5)
+        );
+    }
+
+    #[test]
+    fn round_trips_sticky_policy() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = make_test_config();
+        let upstream = config.upstreams.get_mut("backend-1").unwrap();
+        upstream.sticky = crate::stick::StickyPolicy {
+            enabled: true,
+            source: crate::stick::StickyKeySource::Cookie {
+                name: "rp_stick".to_string(),
+            },
+            ttl_seconds: 300,
+            cookie: Some(crate::stick::StickyCookiePolicy {
+                name: "rp_stick".to_string(),
+                path: Some("/".to_string()),
+                secure: true,
+                http_only: true,
+                same_site: Some("Lax".to_string()),
+            }),
+        };
+
+        db.save_full_config(&config).unwrap();
+        let loaded = db.load_config().unwrap();
+
+        assert_eq!(
+            loaded.upstreams["backend-1"].sticky,
+            config.upstreams["backend-1"].sticky
         );
     }
 
@@ -1608,6 +1660,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         db.create_upstream(&new_upstream).unwrap();
         assert_eq!(db.list_upstreams().unwrap().len(), 2);

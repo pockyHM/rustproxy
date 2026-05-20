@@ -36,6 +36,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
 
         let targets = selectable_targets(&upstream);

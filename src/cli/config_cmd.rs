@@ -88,6 +88,7 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
                     balance: Default::default(),
                     retry: Default::default(),
                     timeouts: Default::default(),
+                    sticky: Default::default(),
                 },
             );
             db.save_full_config(&config)?;

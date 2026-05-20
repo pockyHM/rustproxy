@@ -250,6 +250,7 @@ mod tests {
             balance: BalanceAlgorithm::WeightedRoundRobin,
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         let mut upstreams = HashMap::new();
         upstreams.insert(upstream.name.clone(), upstream);

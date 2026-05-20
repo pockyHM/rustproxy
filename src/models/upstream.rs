@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::stick::StickyPolicy;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +52,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         let json = serde_json::to_string(&upstream).unwrap();
         let parsed: Upstream = serde_json::from_str(&json).unwrap();
@@ -76,6 +79,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         assert_eq!(upstream.targets.len(), 1);
         assert_eq!(upstream.targets[0].url, "http://localhost:9090");
@@ -103,6 +107,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         let cloned = upstream.clone();
         assert_eq!(upstream, cloned);
@@ -133,6 +138,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         let debug_str = format!("{:?}", upstream);
         assert!(debug_str.contains("debug-upstream"));
@@ -185,7 +191,39 @@ targets:
         assert_eq!(upstream.balance, BalanceAlgorithm::WeightedRoundRobin);
         assert_eq!(upstream.retry.attempts, 0);
         assert_eq!(upstream.timeouts, UpstreamTimeoutPolicy::default());
+        assert_eq!(upstream.sticky, StickyPolicy::default());
         assert_eq!(upstream.targets[0].timeouts, TargetTimeoutPolicy::default());
+    }
+
+    #[test]
+    fn test_upstream_sticky_policy_serde() {
+        let yaml = r#"
+name: api
+sticky:
+  enabled: true
+  source:
+    type: header
+    name: x-session
+  ttl_seconds: 120
+targets:
+  - url: http://127.0.0.1:8080
+    weight: 100
+"#;
+
+        let upstream: Upstream = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(upstream.sticky.enabled);
+        assert_eq!(upstream.sticky.ttl_seconds, 120);
+        assert_eq!(
+            upstream.sticky.source,
+            crate::stick::StickyKeySource::Header {
+                name: "x-session".to_string()
+            }
+        );
+
+        let serialized = serde_json::to_string(&upstream).unwrap();
+        assert!(serialized.contains("\"sticky\""));
+        assert!(serialized.contains("\"ttl_seconds\":120"));
     }
 
     #[test]
@@ -326,6 +364,8 @@ pub struct Upstream {
     pub retry: RetryPolicy,
     #[serde(default)]
     pub timeouts: UpstreamTimeoutPolicy,
+    #[serde(default)]
+    pub sticky: StickyPolicy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

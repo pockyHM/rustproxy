@@ -35,6 +35,7 @@ fn build_config() -> AppConfig {
         balance: Default::default(),
         retry: Default::default(),
         timeouts: Default::default(),
+        sticky: Default::default(),
     };
 
     let mut upstreams = HashMap::new();
@@ -157,6 +158,7 @@ fn tcp_runtime_snapshot_named(
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         },
     );
     TcpRuntimeSnapshot {

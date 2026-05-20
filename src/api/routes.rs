@@ -1673,6 +1673,7 @@ mod tests {
             balance: BalanceAlgorithm::LeastConnections,
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         }
     }
 

@@ -441,6 +441,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         }
     }
 
@@ -878,6 +879,7 @@ mod tests {
             balance: Default::default(),
             retry: Default::default(),
             timeouts: Default::default(),
+            sticky: Default::default(),
         };
         health.record_probe_result(
             &HealthRegistry::target_key("backend", "http://a"),
