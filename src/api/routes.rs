@@ -43,6 +43,7 @@ use crate::{
     proxy::{
         handle_proxy_with_target, ProxyAccessLogContext, ProxyMetricLabels, ProxyRequestContext,
     },
+    runtime::api as runtime_api,
     runtime::drain::DrainController,
     runtime::state::RuntimeState,
     runtime::timeouts::ResolvedTimeoutPolicy,
@@ -124,6 +125,58 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn runtime_state(&self) -> RuntimeState {
+        self.runtime_state.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) const TEST_JWT_SECRET: &'static str = "test-secret";
+
+    #[cfg(test)]
+    pub(crate) fn runtime_state_for_test(&self) -> RuntimeState {
+        self.runtime_state.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(config: AppConfig) -> Self {
+        crate::install_rustls_crypto_provider();
+        let health = HealthRegistry::new();
+        let health_config = ConfigSnapshot::new();
+        health_config.update(&config.upstreams);
+        let runtime_state = RuntimeState::default();
+        let jwt_secret = Self::TEST_JWT_SECRET.to_string();
+        let proxy_runtime = Arc::new(ArcSwap::from_pointee(ProxyRuntime {
+            matcher: Arc::new(Matcher::new_verified_with_match_sets(
+                config.rules.clone(),
+                config.match_sets.clone(),
+                jwt_secret.clone(),
+            )),
+            balancer: Arc::new(Balancer::new_with_runtime(
+                config.upstreams.clone(),
+                Some(health.clone()),
+                runtime_state.clone(),
+            )),
+            config: Arc::new(config.clone()),
+            clients: Arc::new(ProxyClients::new(None, 32, None, None)),
+            access_logger: None,
+            limits: Arc::new(LimitState::default()),
+        }));
+
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            db: Arc::new(Database::open_in_memory().unwrap()),
+            jwt_secret: Arc::new(jwt_secret),
+            metrics: Arc::new(ProxyMetrics::new().unwrap()),
+            health,
+            health_config,
+            proxy_runtime,
+            runtime_state,
+            listener_manager: Arc::new(ListenerManager::default()),
+            listener_lifecycle: Arc::new(Mutex::new(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub(crate) fn rebuild_proxy_runtime(&self, old: &AppConfig, new: &AppConfig) {
         let clients_changed = old.connect_timeout != new.connect_timeout
             || old.pool_max_idle_per_host != new.pool_max_idle_per_host
@@ -1067,6 +1120,23 @@ fn api_router(state: AppState) -> Router {
             get(handlers::list_upstreams).post(handlers::create_upstream),
         )
         .route("/api/upstream-health", get(handlers::upstream_health))
+        .route("/api/runtime/upstreams", get(runtime_api::list_upstreams))
+        .route(
+            "/api/runtime/upstreams/:upstream/targets/enable",
+            post(runtime_api::enable_target),
+        )
+        .route(
+            "/api/runtime/upstreams/:upstream/targets/disable",
+            post(runtime_api::disable_target),
+        )
+        .route(
+            "/api/runtime/upstreams/:upstream/targets/drain",
+            post(runtime_api::drain_target),
+        )
+        .route(
+            "/api/runtime/upstreams/:upstream/targets/weight",
+            post(runtime_api::set_target_weight),
+        )
         .route(
             "/api/monitoring/query-range",
             get(handlers::prometheus_query_range),
