@@ -265,6 +265,13 @@ impl AppConfig {
         }
     }
 
+    pub fn sync_timeouts_from_legacy_aliases(&mut self) {
+        self.timeouts.connect_timeout_seconds = self.connect_timeout;
+        self.timeouts.server_timeout_seconds = self.request_timeout;
+        self.timeouts.http_request_timeout_seconds = self.request_timeout;
+        self.timeouts.http_keepalive_timeout_seconds = self.pool_idle_timeout;
+    }
+
     pub fn normalize_rules(&mut self) {
         if self.proxy_listen.trim().is_empty() {
             self.proxy_listen = default_proxy_listen();
@@ -445,6 +452,31 @@ fallback: { url: "404" }
         assert_eq!(config.connect_timeout, 3);
         assert_eq!(config.request_timeout, 7);
         assert_eq!(config.pool_idle_timeout, 11);
+    }
+
+    #[test]
+    fn explicit_legacy_timeout_update_syncs_policy_fields() {
+        let mut config: AppConfig = serde_yaml::from_str(
+            r#"
+timeouts:
+  connect_timeout_seconds: 3
+  server_timeout_seconds: 7
+  http_request_timeout_seconds: 7
+  http_keepalive_timeout_seconds: 11
+fallback: { url: "404" }
+"#,
+        )
+        .unwrap();
+
+        config.connect_timeout = 13;
+        config.request_timeout = 17;
+        config.pool_idle_timeout = 19;
+        config.sync_timeouts_from_legacy_aliases();
+
+        assert_eq!(config.timeouts.connect_timeout_seconds, 13);
+        assert_eq!(config.timeouts.server_timeout_seconds, 17);
+        assert_eq!(config.timeouts.http_request_timeout_seconds, 17);
+        assert_eq!(config.timeouts.http_keepalive_timeout_seconds, 19);
     }
 
     #[test]
