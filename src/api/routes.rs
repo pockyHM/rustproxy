@@ -46,7 +46,7 @@ use crate::{
     runtime::drain::DrainController,
     runtime::state::RuntimeState,
     runtime::timeouts::ResolvedTimeoutPolicy,
-    tcp::run_tcp_listener,
+    tcp::{run_tcp_listener, TcpRuntime, TcpRuntimeSnapshot},
 };
 
 use super::handlers;
@@ -63,6 +63,20 @@ struct ProxyRuntime {
     clients: Arc<ProxyClients>,
     access_logger: Option<Arc<AccessLogger>>,
     limits: Arc<LimitState>,
+}
+
+struct SharedTcpRuntime {
+    proxy_runtime: Arc<ArcSwap<ProxyRuntime>>,
+}
+
+impl TcpRuntime for SharedTcpRuntime {
+    fn snapshot(&self) -> TcpRuntimeSnapshot {
+        let runtime = self.proxy_runtime.load_full();
+        TcpRuntimeSnapshot {
+            config: runtime.config.clone(),
+            balancer: runtime.balancer.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -937,17 +951,16 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
                 .tcp_listener
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("TCP listener missing config"))?;
-            let runtime = state.proxy_runtime.load_full();
-            let balancer = runtime.balancer.clone();
-            let config = runtime.config.clone();
+            let runtime: Arc<dyn TcpRuntime> = Arc::new(SharedTcpRuntime {
+                proxy_runtime: state.proxy_runtime.clone(),
+            });
             let metrics = state.metrics.clone();
             let listener_drain = drain.clone();
             tokio::spawn(async move {
                 if let Err(error) = run_tcp_listener(
                     listener,
                     listener_config,
-                    balancer,
-                    config,
+                    runtime,
                     metrics,
                     listener_drain,
                     shutdown_rx,

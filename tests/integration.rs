@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use http::Request;
 use rustproxy::{
@@ -10,7 +13,7 @@ use rustproxy::{
         matcher::Matcher,
     },
     runtime::drain::DrainController,
-    tcp::run_tcp_listener,
+    tcp::{run_tcp_listener, TcpRuntime, TcpRuntimeSnapshot},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -83,6 +86,78 @@ fn build_config() -> AppConfig {
         tls_listeners: Vec::new(),
         tcp_listeners: Vec::new(),
         match_sets: Vec::new(),
+    }
+}
+
+struct StaticTcpRuntime {
+    snapshot: TcpRuntimeSnapshot,
+}
+
+impl TcpRuntime for StaticTcpRuntime {
+    fn snapshot(&self) -> TcpRuntimeSnapshot {
+        self.snapshot.clone()
+    }
+}
+
+struct SwitchingTcpRuntime {
+    snapshot: RwLock<TcpRuntimeSnapshot>,
+}
+
+impl SwitchingTcpRuntime {
+    fn replace(&self, snapshot: TcpRuntimeSnapshot) {
+        *self.snapshot.write().unwrap() = snapshot;
+    }
+}
+
+impl TcpRuntime for SwitchingTcpRuntime {
+    fn snapshot(&self) -> TcpRuntimeSnapshot {
+        self.snapshot.read().unwrap().clone()
+    }
+}
+
+async fn spawn_one_shot_tcp_server(
+    response: [u8; 4],
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0_u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(&response).await.unwrap();
+    });
+    (addr, task)
+}
+
+fn tcp_runtime_snapshot(
+    upstream_addr: std::net::SocketAddr,
+    listener_config: TcpListenerConfig,
+) -> TcpRuntimeSnapshot {
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "echo".to_string(),
+        Upstream {
+            name: "echo".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![Target {
+                url: format!("tcp://{upstream_addr}"),
+                weight: 100,
+                timeouts: Default::default(),
+            }],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+        },
+    );
+    TcpRuntimeSnapshot {
+        balancer: Arc::new(Balancer::new(upstreams.clone())),
+        config: Arc::new(AppConfig {
+            upstreams,
+            tcp_listeners: vec![listener_config],
+            ..build_config()
+        }),
     }
 }
 
@@ -171,14 +246,7 @@ fn proxy_metrics_export_target_limit_and_retry_metrics() {
 
 #[tokio::test]
 async fn test_tcp_listener_forwards_bytes() {
-    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = upstream_listener.local_addr().unwrap();
-    let upstream_task = tokio::spawn(async move {
-        let (mut stream, _) = upstream_listener.accept().await.unwrap();
-        let mut buf = [0_u8; 4];
-        stream.read_exact(&mut buf).await.unwrap();
-        stream.write_all(&buf).await.unwrap();
-    });
+    let (upstream_addr, upstream_task) = spawn_one_shot_tcp_server(*b"ping").await;
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -190,35 +258,14 @@ async fn test_tcp_listener_forwards_bytes() {
         sni_routes: HashMap::new(),
         maxconn: None,
     };
-    let mut upstreams = HashMap::new();
-    upstreams.insert(
-        "echo".to_string(),
-        Upstream {
-            name: "echo".to_string(),
-            skip_ssl: false,
-            websocket: false,
-            targets: vec![Target {
-                url: format!("tcp://{upstream_addr}"),
-                weight: 100,
-                timeouts: Default::default(),
-            }],
-            health_check: Default::default(),
-            balance: Default::default(),
-            retry: Default::default(),
-            timeouts: Default::default(),
-        },
-    );
-    let app_config = AppConfig {
-        upstreams: upstreams.clone(),
-        tcp_listeners: vec![listener_config.clone()],
-        ..build_config()
-    };
+    let runtime_snapshot = tcp_runtime_snapshot(upstream_addr, listener_config.clone());
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let proxy_task = tokio::spawn(run_tcp_listener(
         proxy_listener,
         listener_config,
-        Arc::new(Balancer::new(upstreams)),
-        Arc::new(app_config),
+        Arc::new(StaticTcpRuntime {
+            snapshot: runtime_snapshot,
+        }),
         Arc::new(ProxyMetrics::new().unwrap()),
         DrainController::default(),
         shutdown_rx,
@@ -234,4 +281,53 @@ async fn test_tcp_listener_forwards_bytes() {
     let _ = shutdown_tx.send(());
     proxy_task.await.unwrap().unwrap();
     upstream_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_tcp_listener_uses_latest_runtime_snapshot() {
+    let (first_upstream, first_task) = spawn_one_shot_tcp_server(*b"old!").await;
+    let (second_upstream, second_task) = spawn_one_shot_tcp_server(*b"new!").await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let listener_config = TcpListenerConfig {
+        name: "echo".to_string(),
+        listen: proxy_addr.to_string(),
+        mode: TcpListenerMode::Tcp,
+        upstream: Some("echo".to_string()),
+        sni_routes: HashMap::new(),
+        maxconn: None,
+    };
+    let runtime = Arc::new(SwitchingTcpRuntime {
+        snapshot: RwLock::new(tcp_runtime_snapshot(
+            first_upstream,
+            listener_config.clone(),
+        )),
+    });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_task = tokio::spawn(run_tcp_listener(
+        proxy_listener,
+        listener_config.clone(),
+        runtime.clone(),
+        Arc::new(ProxyMetrics::new().unwrap()),
+        DrainController::default(),
+        shutdown_rx,
+    ));
+
+    let mut first_client = TcpStream::connect(proxy_addr).await.unwrap();
+    first_client.write_all(b"ping").await.unwrap();
+    let mut response = [0_u8; 4];
+    first_client.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"old!");
+    first_task.await.unwrap();
+
+    runtime.replace(tcp_runtime_snapshot(second_upstream, listener_config));
+    let mut second_client = TcpStream::connect(proxy_addr).await.unwrap();
+    second_client.write_all(b"ping").await.unwrap();
+    second_client.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"new!");
+
+    let _ = shutdown_tx.send(());
+    proxy_task.await.unwrap().unwrap();
+    second_task.await.unwrap();
 }

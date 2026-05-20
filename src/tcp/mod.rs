@@ -12,11 +12,20 @@ use crate::proxy::balancer::{BalanceContext, Balancer};
 use crate::runtime::drain::DrainController;
 use crate::runtime::timeouts::ResolvedTimeoutPolicy;
 
+#[derive(Clone)]
+pub struct TcpRuntimeSnapshot {
+    pub config: Arc<AppConfig>,
+    pub balancer: Arc<Balancer>,
+}
+
+pub trait TcpRuntime: Send + Sync {
+    fn snapshot(&self) -> TcpRuntimeSnapshot;
+}
+
 pub async fn run_tcp_listener(
     listener: TcpListener,
     config: TcpListenerConfig,
-    balancer: Arc<Balancer>,
-    app_config: Arc<AppConfig>,
+    runtime: Arc<dyn TcpRuntime>,
     metrics: Arc<ProxyMetrics>,
     drain: DrainController,
     mut shutdown: oneshot::Receiver<()>,
@@ -41,16 +50,14 @@ pub async fn run_tcp_listener(
             None => None,
         };
         let config = config.clone();
-        let balancer = Arc::clone(&balancer);
-        let app_config = Arc::clone(&app_config);
+        let runtime = Arc::clone(&runtime);
         let metrics = Arc::clone(&metrics);
         let remote_ip = remote_addr.ip().to_string();
         tokio::spawn(async move {
             let _drain_lease = drain_lease;
             let _maxconn_permit = maxconn_permit;
             if let Err(error) =
-                handle_tcp_connection(stream, config, balancer, app_config, metrics, remote_ip)
-                    .await
+                handle_tcp_connection(stream, config, runtime, metrics, remote_ip).await
             {
                 tracing::warn!(%error, "TCP proxy connection failed");
             }
@@ -63,8 +70,7 @@ pub async fn run_tcp_listener(
 async fn handle_tcp_connection(
     mut downstream: TcpStream,
     config: TcpListenerConfig,
-    balancer: Arc<Balancer>,
-    app_config: Arc<AppConfig>,
+    runtime: Arc<dyn TcpRuntime>,
     metrics: Arc<ProxyMetrics>,
     remote_ip: String,
 ) -> anyhow::Result<()> {
@@ -76,7 +82,9 @@ async fn handle_tcp_connection(
     .filter(|upstream| !upstream.trim().is_empty())
     .context("TCP listener has no upstream")?;
 
-    let selected = balancer
+    let runtime = runtime.snapshot();
+    let selected = runtime
+        .balancer
         .select(
             upstream,
             BalanceContext {
@@ -89,7 +97,7 @@ async fn handle_tcp_connection(
     let _target_lease = selected.active_connection;
     let target_addr = target_socket_addr(&target)
         .with_context(|| format!("invalid TCP target address {target}"))?;
-    let connect_timeout = resolved_connect_timeout(&app_config, upstream, &target);
+    let connect_timeout = resolved_connect_timeout(&runtime.config, upstream, &target);
     let connect = TcpStream::connect(&target_addr);
     let mut upstream_stream = timeout_optional(connect_timeout, connect)
         .await
