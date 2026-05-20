@@ -1429,11 +1429,12 @@ mod tests {
     };
     use crate::config::yaml::{AppConfig, Fallback};
     use crate::db::Database;
-    use crate::models::{BalanceAlgorithm, Target, Upstream};
+    use crate::models::{BalanceAlgorithm, LimitPolicy, Target, Upstream};
     use crate::observability::metrics::ProxyMetrics;
     use crate::proxy::balancer::{BalanceContext, Balancer};
     use crate::proxy::health::HealthRegistry;
     use crate::runtime::state::{RuntimeState, TargetKey};
+    use crate::runtime::timeouts::{ResolvedTimeoutPolicy, TimeoutPolicy};
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1502,6 +1503,34 @@ mod tests {
         assert_eq!(normalize_host_key("Example.COM:80"), "example.com");
         assert_eq!(normalize_host_key("Example.COM:443"), "example.com");
         assert_eq!(normalize_host_key("Example.COM:8443"), "example.com:8443");
+    }
+
+    #[test]
+    fn resolved_queue_timeout_fills_limit_policy_without_overriding_explicit_value() {
+        let timeout_policy = ResolvedTimeoutPolicy::resolve(
+            &TimeoutPolicy {
+                queue_timeout_ms: 250,
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+        );
+
+        let inherited = super::limit_policy_with_resolved_queue_timeout(
+            LimitPolicy::default(),
+            &timeout_policy,
+        );
+        assert_eq!(inherited.queue_timeout_ms, Some(250));
+
+        let explicit = super::limit_policy_with_resolved_queue_timeout(
+            LimitPolicy {
+                queue_timeout_ms: Some(7),
+                ..Default::default()
+            },
+            &timeout_policy,
+        );
+        assert_eq!(explicit.queue_timeout_ms, Some(7));
     }
 
     #[test]

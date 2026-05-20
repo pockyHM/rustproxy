@@ -313,8 +313,9 @@ pub async fn handle_proxy_with_target(
         }
     });
     if proxy_context.limit_policy.queue_timeout_ms.is_none() {
-        proxy_context.limit_policy.queue_timeout_ms =
-            Some(duration_millis_u64(proxy_context.timeout_policy.queue_timeout));
+        proxy_context.limit_policy.queue_timeout_ms = Some(duration_millis_u64(
+            proxy_context.timeout_policy.queue_timeout,
+        ));
     }
     let mut limit_permit = match (
         proxy_context.limit_state.as_deref(),
@@ -563,6 +564,8 @@ pub async fn handle_proxy_with_target(
                             let _target_lease = target_lease;
                             let _drain_lease = drain_lease;
                             let tunnel = tunnel_upgraded(client_upgrade, upstream_upgrade);
+                            // This is a total tunnel lifetime cap. A true idle timeout needs
+                            // per-direction activity tracking in the tunnel copy loop.
                             match timeout_optional(tunnel_timeout, tunnel).await {
                                 Ok(Ok(())) => {}
                                 Ok(Err(e)) => {
@@ -1142,7 +1145,10 @@ fn next_retry_target(
     )
 }
 
-async fn timeout_optional<F, T>(duration: Duration, future: F) -> Result<T, tokio::time::error::Elapsed>
+async fn timeout_optional<F, T>(
+    duration: Duration,
+    future: F,
+) -> Result<T, tokio::time::error::Elapsed>
 where
     F: std::future::Future<Output = T>,
 {
