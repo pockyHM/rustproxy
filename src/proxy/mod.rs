@@ -291,27 +291,6 @@ pub async fn handle_proxy_with_target(
             metrics: Arc::clone(metrics),
         }
     });
-    let mut target_metric = metrics.as_ref().map(|metrics| {
-        metrics
-            .target_active_connections
-            .with_label_values(&[
-                proxy_context.metric_labels.upstream.as_str(),
-                target_base.as_str(),
-            ])
-            .inc();
-        metrics
-            .target_queue_length
-            .with_label_values(&[
-                proxy_context.metric_labels.upstream.as_str(),
-                target_base.as_str(),
-            ])
-            .set(0.0);
-        TargetMetricGuard {
-            metrics: Arc::clone(metrics),
-            upstream: proxy_context.metric_labels.upstream.clone(),
-            target: target_base.clone(),
-        }
-    });
     if proxy_context.limit_policy.queue_timeout_ms.is_none() {
         proxy_context.limit_policy.queue_timeout_ms = Some(duration_millis_u64(
             proxy_context.timeout_policy.queue_timeout,
@@ -323,10 +302,17 @@ pub async fn handle_proxy_with_target(
     ) {
         (Some(limit_state), Some(limit_context)) => {
             match limit_state
-                .check(
+                .check_with_queue_guard(
                     limit_context,
                     &proxy_context.limit_policy,
                     request.headers(),
+                    || {
+                        begin_target_queue_guard(
+                            metrics.as_ref(),
+                            &proxy_context.metric_labels.upstream,
+                            &target_base,
+                        )
+                    },
                 )
                 .await
             {
@@ -390,6 +376,11 @@ pub async fn handle_proxy_with_target(
         }
         _ => None::<LimitPermit>,
     };
+    let mut target_metric = begin_target_metric(
+        metrics.as_ref(),
+        &proxy_context.metric_labels.upstream,
+        &target_base,
+    );
     let retry_enabled = retry_policy_requires_buffering(&proxy_context.retry_policy);
     let max_body_bytes = proxy_context.limit_policy.max_body_bytes;
 
@@ -738,6 +729,12 @@ pub async fn handle_proxy_with_target(
                             );
                             drop(current_lease.take());
                             current_target_base = next_target.url;
+                            switch_target_metric(
+                                &mut target_metric,
+                                metrics.as_ref(),
+                                &proxy_context.metric_labels.upstream,
+                                &current_target_base,
+                            );
                             current_lease = Some(next_target.active_connection);
                             attempt_index += 1;
                             continue;
@@ -802,6 +799,12 @@ pub async fn handle_proxy_with_target(
                             );
                             drop(current_lease.take());
                             current_target_base = next_target.url;
+                            switch_target_metric(
+                                &mut target_metric,
+                                metrics.as_ref(),
+                                &proxy_context.metric_labels.upstream,
+                                &current_target_base,
+                            );
                             current_lease = Some(next_target.active_connection);
                             attempt_index += 1;
                             continue;
@@ -839,6 +842,12 @@ pub async fn handle_proxy_with_target(
                             );
                             drop(current_lease.take());
                             current_target_base = next_target.url;
+                            switch_target_metric(
+                                &mut target_metric,
+                                metrics.as_ref(),
+                                &proxy_context.metric_labels.upstream,
+                                &current_target_base,
+                            );
                             current_lease = Some(next_target.active_connection);
                             attempt_index += 1;
                             continue;
@@ -1177,6 +1186,52 @@ fn record_upstream_retry(
     }
 }
 
+fn begin_target_metric(
+    metrics: Option<&Arc<ProxyMetrics>>,
+    upstream: &str,
+    target: &str,
+) -> Option<TargetMetricGuard> {
+    metrics.map(|metrics| {
+        metrics
+            .target_active_connections
+            .with_label_values(&[upstream, target])
+            .inc();
+        TargetMetricGuard {
+            metrics: Arc::clone(metrics),
+            upstream: upstream.to_string(),
+            target: target.to_string(),
+        }
+    })
+}
+
+fn switch_target_metric(
+    current: &mut Option<TargetMetricGuard>,
+    metrics: Option<&Arc<ProxyMetrics>>,
+    upstream: &str,
+    target: &str,
+) {
+    drop(current.take());
+    *current = begin_target_metric(metrics, upstream, target);
+}
+
+fn begin_target_queue_guard(
+    metrics: Option<&Arc<ProxyMetrics>>,
+    upstream: &str,
+    target: &str,
+) -> Option<TargetQueueGuard> {
+    metrics.map(|metrics| {
+        metrics
+            .target_queue_length
+            .with_label_values(&[upstream, target])
+            .inc();
+        TargetQueueGuard {
+            metrics: Arc::clone(metrics),
+            upstream: upstream.to_string(),
+            target: target.to_string(),
+        }
+    })
+}
+
 struct ActiveConnectionGuard {
     metrics: Arc<ProxyMetrics>,
 }
@@ -1197,6 +1252,21 @@ impl Drop for TargetMetricGuard {
     fn drop(&mut self) {
         self.metrics
             .target_active_connections
+            .with_label_values(&[self.upstream.as_str(), self.target.as_str()])
+            .dec();
+    }
+}
+
+struct TargetQueueGuard {
+    metrics: Arc<ProxyMetrics>,
+    upstream: String,
+    target: String,
+}
+
+impl Drop for TargetQueueGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .target_queue_length
             .with_label_values(&[self.upstream.as_str(), self.target.as_str()])
             .dec();
     }
@@ -1415,16 +1485,17 @@ fn websocket_disabled() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_target_uri, collect_request_body, guard_response, is_websocket_upgrade,
-        not_found_page, record_proxy_metrics, retry_policy_requires_buffering,
-        sanitize_retry_request, ProxyMetricLabels, RequestBodyReadError,
+        begin_target_metric, begin_target_queue_guard, build_target_uri, collect_request_body,
+        guard_response, is_websocket_upgrade, not_found_page, record_proxy_metrics,
+        retry_policy_requires_buffering, sanitize_retry_request, switch_target_metric,
+        ProxyMetricLabels, RequestBodyReadError,
     };
     use crate::models::RetryPolicy;
     use crate::observability::metrics::ProxyMetrics;
     use crate::runtime::drain::DrainController;
     use axum::body::Body;
     use http::{HeaderMap, Response, StatusCode, Uri};
-    use std::time::Instant;
+    use std::{sync::Arc, time::Instant};
 
     #[test]
     fn builds_target_uri_for_matched_upstream() {
@@ -1516,6 +1587,50 @@ mod tests {
         assert!(output.contains("upstream=\"canary\""));
         assert!(output.contains("status=\"202\""));
         assert!(output.contains("rustproxy_proxy_request_duration_seconds"));
+    }
+
+    #[test]
+    fn target_queue_guard_tracks_waiting_metric() {
+        let metrics = Arc::new(ProxyMetrics::new().unwrap());
+        let gauge = metrics
+            .target_queue_length
+            .with_label_values(&["canary", "http://canary.internal:8080"]);
+
+        let guard =
+            begin_target_queue_guard(Some(&metrics), "canary", "http://canary.internal:8080")
+                .unwrap();
+        assert_eq!(gauge.get(), 1.0);
+
+        drop(guard);
+        assert_eq!(gauge.get(), 0.0);
+    }
+
+    #[test]
+    fn switch_target_metric_moves_active_target_gauge() {
+        let metrics = Arc::new(ProxyMetrics::new().unwrap());
+        let first = metrics
+            .target_active_connections
+            .with_label_values(&["canary", "http://canary-a.internal:8080"]);
+        let second = metrics
+            .target_active_connections
+            .with_label_values(&["canary", "http://canary-b.internal:8080"]);
+
+        let mut guard =
+            begin_target_metric(Some(&metrics), "canary", "http://canary-a.internal:8080");
+        assert_eq!(first.get(), 1.0);
+        assert_eq!(second.get(), 0.0);
+
+        switch_target_metric(
+            &mut guard,
+            Some(&metrics),
+            "canary",
+            "http://canary-b.internal:8080",
+        );
+        assert_eq!(first.get(), 0.0);
+        assert_eq!(second.get(), 1.0);
+
+        drop(guard);
+        assert_eq!(second.get(), 0.0);
     }
 
     #[test]

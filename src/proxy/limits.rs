@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::{header, HeaderMap};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::models::{LimitPolicy, RateLimitKey};
 
@@ -40,6 +40,20 @@ impl LimitState {
         policy: &LimitPolicy,
         headers: &HeaderMap,
     ) -> Result<LimitPermit, LimitRejection> {
+        self.check_with_queue_guard(ctx, policy, headers, || ())
+            .await
+    }
+
+    pub async fn check_with_queue_guard<G, F>(
+        &self,
+        ctx: &LimitContext,
+        policy: &LimitPolicy,
+        headers: &HeaderMap,
+        queue_guard: F,
+    ) -> Result<LimitPermit, LimitRejection>
+    where
+        F: FnOnce() -> G,
+    {
         if let Some(max_body_bytes) = policy.max_body_bytes {
             if content_length(headers).is_some_and(|length| length > max_body_bytes) {
                 return Err(LimitRejection::BodyTooLarge);
@@ -59,7 +73,7 @@ impl LimitState {
             let semaphore = self
                 .semaphore_for(format!("{}:{}", ctx.listen, ctx.rule), max_connections)
                 .await;
-            Some(acquire_permit(semaphore, policy.queue_timeout_ms).await?)
+            Some(acquire_permit(semaphore, policy.queue_timeout_ms, queue_guard).await?)
         } else {
             None
         };
@@ -85,10 +99,21 @@ impl LimitState {
     }
 }
 
-async fn acquire_permit(
+async fn acquire_permit<G, F>(
     semaphore: Arc<Semaphore>,
     queue_timeout_ms: Option<u64>,
-) -> Result<OwnedSemaphorePermit, LimitRejection> {
+    queue_guard: F,
+) -> Result<OwnedSemaphorePermit, LimitRejection>
+where
+    F: FnOnce() -> G,
+{
+    match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => return Ok(permit),
+        Err(TryAcquireError::NoPermits) => {}
+        Err(TryAcquireError::Closed) => return Err(LimitRejection::QueueTimeout),
+    }
+
+    let _queue_guard = queue_guard();
     let acquire = semaphore.acquire_owned();
     match queue_timeout_ms {
         Some(timeout_ms) => tokio::time::timeout(Duration::from_millis(timeout_ms), acquire)
@@ -160,6 +185,10 @@ mod tests {
     use super::*;
     use crate::models::{LimitPolicy, RateLimitKey};
     use http::HeaderMap;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::Duration;
 
     fn ctx() -> LimitContext {
@@ -212,6 +241,61 @@ mod tests {
 
         drop(first);
         assert!(pending.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn max_connections_queue_guard_tracks_wait_only() {
+        struct QueueGuard(Arc<AtomicUsize>);
+
+        impl QueueGuard {
+            fn new(waiting: Arc<AtomicUsize>) -> Self {
+                waiting.fetch_add(1, Ordering::SeqCst);
+                Self(waiting)
+            }
+        }
+
+        impl Drop for QueueGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let limits = LimitState::default();
+        let policy = LimitPolicy {
+            max_connections: Some(1),
+            queue_timeout_ms: Some(100),
+            ..Default::default()
+        };
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let immediate_called = Arc::new(AtomicBool::new(false));
+        let immediate_called_for_guard = Arc::clone(&immediate_called);
+
+        let first = limits
+            .check_with_queue_guard(&ctx(), &policy, &HeaderMap::new(), move || {
+                immediate_called_for_guard.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert!(!immediate_called.load(Ordering::SeqCst));
+
+        let second_ctx = ctx();
+        let second_headers = HeaderMap::new();
+        let waiting_for_guard = Arc::clone(&waiting);
+        let pending =
+            limits.check_with_queue_guard(&second_ctx, &policy, &second_headers, move || {
+                QueueGuard::new(waiting_for_guard)
+            });
+        tokio::pin!(pending);
+
+        tokio::select! {
+            _ = &mut pending => panic!("second request should wait for permit"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert_eq!(waiting.load(Ordering::SeqCst), 1);
+
+        drop(first);
+        assert!(pending.await.is_ok());
+        assert_eq!(waiting.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
