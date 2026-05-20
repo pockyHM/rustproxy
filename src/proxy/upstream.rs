@@ -24,18 +24,15 @@ mod tests {
                 Target {
                     url: "http://a".to_string(),
                     weight: 10,
-                    timeouts: Default::default(),
                 },
                 Target {
                     url: "http://b".to_string(),
                     weight: 0,
-                    timeouts: Default::default(),
                 },
             ],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         };
 

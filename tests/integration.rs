@@ -33,12 +33,10 @@ fn build_config() -> AppConfig {
         targets: vec![Target {
             url: "http://canary.internal:8080".to_string(),
             weight: 100,
-            timeouts: Default::default(),
         }],
         health_check: Default::default(),
         balance: Default::default(),
         retry: Default::default(),
-        timeouts: Default::default(),
         sticky: Default::default(),
     };
 
@@ -156,12 +154,10 @@ fn tcp_runtime_snapshot_named(
             targets: vec![Target {
                 url: format!("tcp://{upstream_addr}"),
                 weight: 100,
-                timeouts: Default::default(),
             }],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         },
     );
@@ -303,18 +299,15 @@ async fn sticky_header_reuses_target_and_remaps_when_disabled() {
                 Target {
                     url: "http://sticky-a.internal:8080".to_string(),
                     weight: 1,
-                    timeouts: Default::default(),
                 },
                 Target {
                     url: "http://sticky-b.internal:8080".to_string(),
                     weight: 1,
-                    timeouts: Default::default(),
                 },
             ],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: StickyPolicy {
                 enabled: true,
                 source: StickyKeySource::Header {

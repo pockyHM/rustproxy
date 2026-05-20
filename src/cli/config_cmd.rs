@@ -79,15 +79,10 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
                     name: name.clone(),
                     skip_ssl: false,
                     websocket: false,
-                    targets: vec![Target {
-                        url,
-                        weight,
-                        timeouts: Default::default(),
-                    }],
+                    targets: vec![Target { url, weight }],
                     health_check: Default::default(),
                     balance: Default::default(),
                     retry: Default::default(),
-                    timeouts: Default::default(),
                     sticky: Default::default(),
                 },
             );
@@ -99,11 +94,7 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
             let Some(upstream) = config.upstreams.get_mut(&name) else {
                 anyhow::bail!("upstream '{name}' not found");
             };
-            upstream.targets.push(Target {
-                url,
-                weight,
-                timeouts: Default::default(),
-            });
+            upstream.targets.push(Target { url, weight });
             db.save_full_config(&config)?;
             println!("target added to upstream {name}");
         }

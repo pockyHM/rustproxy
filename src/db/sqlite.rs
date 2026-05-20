@@ -12,7 +12,7 @@ use crate::config::yaml::{
 use crate::models::{
     BalanceAlgorithm, ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType,
     HostMatcher, LocationMatchType, LocationMatcher, MatchSet, Operator, RetryPolicy, Rule,
-    RuleTimeoutPolicy, RuleTls, Target, TargetTimeoutPolicy, Upstream, UpstreamTimeoutPolicy,
+    RuleTimeoutPolicy, RuleTls, Target, Upstream,
 };
 use crate::runtime::timeouts::{ConnectionLimitPolicy, TimeoutPolicy};
 
@@ -548,7 +548,7 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
         let targets = load_targets(conn, &name)?;
         let (skip_ssl, websocket) = load_upstream_options(conn, &name)?;
         let health_check = load_health_check(conn, &name)?;
-        let (balance, retry, timeouts, sticky) = load_upstream_policy(conn, &name)?;
+        let (balance, retry, sticky) = load_upstream_policy(conn, &name)?;
         upstreams.push(Upstream {
             name,
             skip_ssl,
@@ -557,7 +557,6 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
             health_check,
             balance,
             retry,
-            timeouts,
             sticky,
         });
     }
@@ -609,27 +608,13 @@ fn load_health_check(conn: &Connection, upstream_name: &str) -> Result<HealthChe
 fn load_upstream_policy(
     conn: &Connection,
     upstream_name: &str,
-) -> Result<(
-    BalanceAlgorithm,
-    RetryPolicy,
-    UpstreamTimeoutPolicy,
-    crate::stick::StickyPolicy,
-)> {
-    let (balance, retry_json, timeout_json, sticky_json): (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = conn
+) -> Result<(BalanceAlgorithm, RetryPolicy, crate::stick::StickyPolicy)> {
+    let (balance, retry_json, sticky_json): (String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT balance, retry_policy, timeout_policy, sticky_policy FROM upstreams WHERE name = ?1",
+            "SELECT balance, retry_policy, sticky_policy FROM upstreams WHERE name = ?1",
             params![upstream_name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-    let timeouts =
-        json_column_or_default::<UpstreamTimeoutPolicy>(timeout_json.as_deref(), || {
-            format!("failed to parse upstreams.timeout_policy for upstream '{upstream_name}'")
-        })?;
     let sticky =
         json_column_or_default::<crate::stick::StickyPolicy>(sticky_json.as_deref(), || {
             format!("failed to parse upstreams.sticky_policy for upstream '{upstream_name}'")
@@ -637,39 +622,20 @@ fn load_upstream_policy(
     Ok((
         parse_balance_algorithm(&balance),
         json_or_default(retry_json.as_deref()),
-        timeouts,
         sticky,
     ))
 }
 
 fn load_targets(conn: &Connection, upstream_name: &str) -> Result<Vec<Target>> {
     let mut stmt = conn
-        .prepare(
-            "SELECT url, weight, timeout_policy FROM targets WHERE upstream_name = ?1 ORDER BY sort_order",
-        )?;
+        .prepare("SELECT url, weight FROM targets WHERE upstream_name = ?1 ORDER BY sort_order")?;
     let rows = stmt.query_map(params![upstream_name], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)? as u32,
-            row.get::<_, Option<String>>(2)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
     })?;
     let mut targets = Vec::new();
     for row in rows {
-        let (url, weight, timeout_json) = row?;
-        let timeouts = json_column_or_default::<TargetTimeoutPolicy>(
-            timeout_json.as_deref(),
-            || {
-                format!(
-                "failed to parse targets.timeout_policy for upstream '{upstream_name}' target '{url}'"
-            )
-            },
-        )?;
-        targets.push(Target {
-            url,
-            weight,
-            timeouts,
-        });
+        let (url, weight) = row?;
+        targets.push(Target { url, weight });
     }
     Ok(targets)
 }
@@ -762,7 +728,7 @@ fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()
     let retry_policy = serde_json::to_string(&upstream.retry)?;
     let sticky_policy = serde_json::to_string(&upstream.sticky)?;
     tx.execute(
-        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy, timeout_policy, sticky_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy, sticky_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             upstream.name,
             upstream.skip_ssl,
@@ -777,7 +743,6 @@ fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()
             upstream.health_check.unhealthy_threshold,
             balance_algorithm_str(upstream.balance),
             retry_policy,
-            serde_json::to_string(&upstream.timeouts)?,
             sticky_policy,
         ],
     )?;
@@ -819,14 +784,8 @@ fn insert_targets(
 ) -> Result<()> {
     for (i, target) in targets.iter().enumerate() {
         tx.execute(
-            "INSERT INTO targets (upstream_name, url, weight, sort_order, timeout_policy) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                upstream_name,
-                target.url,
-                target.weight,
-                i as i64,
-                serde_json::to_string(&target.timeouts)?,
-            ],
+            "INSERT INTO targets (upstream_name, url, weight, sort_order) VALUES (?1, ?2, ?3, ?4)",
+            params![upstream_name, target.url, target.weight, i as i64,],
         )?;
     }
     Ok(())
@@ -896,10 +855,9 @@ fn delete_upstream_targets(tx: &rusqlite::Transaction, upstream_name: &str) -> R
 
 fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
     let retry_policy = serde_json::to_string(&upstream.retry)?;
-    let timeout_policy = serde_json::to_string(&upstream.timeouts)?;
     let sticky_policy = serde_json::to_string(&upstream.sticky)?;
     let changes = tx.execute(
-        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, timeout_policy = ?13, sticky_policy = ?14, updated_at = datetime('now') WHERE name = ?15",
+        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, sticky_policy = ?13, updated_at = datetime('now') WHERE name = ?14",
         params![
             upstream.skip_ssl,
             upstream.websocket,
@@ -913,7 +871,6 @@ fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Resul
             upstream.health_check.unhealthy_threshold,
             balance_algorithm_str(upstream.balance),
             retry_policy,
-            timeout_policy,
             sticky_policy,
             upstream.name,
         ],
@@ -944,7 +901,6 @@ CREATE TABLE IF NOT EXISTS upstreams (
     health_check_unhealthy_threshold INTEGER NOT NULL DEFAULT 2,
     balance                          TEXT NOT NULL DEFAULT 'weighted_round_robin',
     retry_policy                     TEXT,
-    timeout_policy                   TEXT,
     sticky_policy                    TEXT,
     created_at                       TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at                       TEXT NOT NULL DEFAULT (datetime('now'))
@@ -955,8 +911,7 @@ CREATE TABLE IF NOT EXISTS targets (
     upstream_name TEXT NOT NULL REFERENCES upstreams(name) ON DELETE CASCADE,
     url           TEXT NOT NULL,
     weight        INTEGER NOT NULL DEFAULT 100,
-    sort_order    INTEGER NOT NULL DEFAULT 0,
-    timeout_policy TEXT
+    sort_order    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS rules (
@@ -1111,9 +1066,7 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'weighted_round_robin'",
     )?;
     add_column_if_missing(conn, "upstreams", "retry_policy", "TEXT")?;
-    add_column_if_missing(conn, "upstreams", "timeout_policy", "TEXT")?;
     add_column_if_missing(conn, "upstreams", "sticky_policy", "TEXT")?;
-    add_column_if_missing(conn, "targets", "timeout_policy", "TEXT")?;
 
     Ok(())
 }
@@ -1264,18 +1217,15 @@ mod tests {
                             Target {
                                 url: "http://a:8080".to_string(),
                                 weight: 70,
-                                timeouts: Default::default(),
                             },
                             Target {
                                 url: "http://b:8080".to_string(),
                                 weight: 30,
-                                timeouts: Default::default(),
                             },
                         ],
                         health_check: Default::default(),
                         balance: Default::default(),
                         retry: Default::default(),
-                        timeouts: Default::default(),
                         sticky: Default::default(),
                     },
                 );
@@ -1394,9 +1344,6 @@ mod tests {
             listener_maxconn: Some(128),
         };
         config.rules[0].timeouts.server_timeout_seconds = Some(8);
-        let upstream = config.upstreams.get_mut("backend-1").unwrap();
-        upstream.timeouts.connect_timeout_seconds = Some(4);
-        upstream.targets[0].timeouts.server_timeout_seconds = Some(5);
 
         db.save_full_config(&config).unwrap();
         let loaded = db.load_config().unwrap();
@@ -1407,12 +1354,6 @@ mod tests {
         assert_eq!(loaded.request_timeout, 12);
         assert_eq!(loaded.pool_idle_timeout, 14);
         assert_eq!(loaded.rules[0].timeouts.server_timeout_seconds, Some(8));
-        let loaded_upstream = loaded.upstreams.get("backend-1").unwrap();
-        assert_eq!(loaded_upstream.timeouts.connect_timeout_seconds, Some(4));
-        assert_eq!(
-            loaded_upstream.targets[0].timeouts.server_timeout_seconds,
-            Some(5)
-        );
     }
 
     #[test]
@@ -1544,46 +1485,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_upstream_timeout_policy_fails_load_config() {
-        let db = Database::open_in_memory().unwrap();
-        let config = make_test_config();
-        db.save_full_config(&config).unwrap();
-        db.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE upstreams SET timeout_policy = ?1 WHERE name = ?2",
-                params!["{malformed", "backend-1"],
-            )
-            .unwrap();
-
-        let err = db.load_config().unwrap_err();
-
-        assert!(err.to_string().contains("upstreams.timeout_policy"));
-        assert!(err.to_string().contains("backend-1"));
-    }
-
-    #[test]
-    fn malformed_target_timeout_policy_fails_load_config() {
-        let db = Database::open_in_memory().unwrap();
-        let config = make_test_config();
-        db.save_full_config(&config).unwrap();
-        db.conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE targets SET timeout_policy = ?1 WHERE upstream_name = ?2 AND url = ?3",
-                params!["{malformed", "backend-1", "http://a:8080"],
-            )
-            .unwrap();
-
-        let err = db.load_config().unwrap_err();
-
-        assert!(err.to_string().contains("targets.timeout_policy"));
-        assert!(err.to_string().contains("http://a:8080"));
-    }
-
-    #[test]
     fn test_is_empty() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.is_empty().unwrap());
@@ -1654,12 +1555,10 @@ mod tests {
             targets: vec![Target {
                 url: "http://c:9090".to_string(),
                 weight: 100,
-                timeouts: Default::default(),
             }],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         };
         db.create_upstream(&new_upstream).unwrap();

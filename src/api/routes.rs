@@ -1395,7 +1395,7 @@ async fn proxy_handler(
             ),
             None => (
                 config.fallback.url.clone(),
-                ResolvedTimeoutPolicy::resolve(&config.timeouts, None, None, None),
+                ResolvedTimeoutPolicy::resolve(&config.timeouts, None),
                 ProxyMetricLabels::fallback(listen_label),
                 Default::default(),
                 Vec::new(),
@@ -1460,24 +1460,13 @@ fn resolve_proxy_timeout_policy(
     rule: &Rule,
     target_url: &str,
 ) -> ResolvedTimeoutPolicy {
-    let upstream = config.upstreams.get(&rule.upstream);
-    let target = upstream.and_then(|upstream| {
-        upstream
-            .targets
-            .iter()
-            .find(|target| target.url == target_url)
-    });
+    let _ = target_url;
     let mut rule_timeouts = rule.timeouts.clone();
     if rule_timeouts.server_timeout_seconds.is_none() && rule.request_timeout > 0 {
         rule_timeouts.server_timeout_seconds = Some(rule.request_timeout);
     }
 
-    ResolvedTimeoutPolicy::resolve(
-        &config.timeouts,
-        Some(&rule_timeouts),
-        upstream.map(|upstream| &upstream.timeouts),
-        target.map(|target| &target.timeouts),
-    )
+    ResolvedTimeoutPolicy::resolve(&config.timeouts, Some(&rule_timeouts))
 }
 
 fn limit_policy_with_resolved_queue_timeout(
@@ -1668,7 +1657,7 @@ mod tests {
     };
     use crate::config::yaml::{AppConfig, Fallback, TcpListenerConfig, TcpListenerMode};
     use crate::db::Database;
-    use crate::models::{BalanceAlgorithm, LimitPolicy, Target, Upstream};
+    use crate::models::{BalanceAlgorithm, LimitPolicy, Rule, Target, Upstream};
     use crate::observability::metrics::ProxyMetrics;
     use crate::proxy::balancer::{BalanceContext, Balancer};
     use crate::proxy::health::HealthRegistry;
@@ -1686,7 +1675,6 @@ mod tests {
         Target {
             url: url.to_string(),
             weight,
-            timeouts: Default::default(),
         }
     }
 
@@ -1727,7 +1715,6 @@ mod tests {
             health_check: Default::default(),
             balance: BalanceAlgorithm::LeastConnections,
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         }
     }
@@ -1754,8 +1741,6 @@ mod tests {
                 ..Default::default()
             },
             None,
-            None,
-            None,
         );
 
         let inherited = super::limit_policy_with_resolved_queue_timeout(
@@ -1772,6 +1757,39 @@ mod tests {
             &timeout_policy,
         );
         assert_eq!(explicit.queue_timeout_ms, Some(7));
+    }
+
+    #[test]
+    fn route_timeout_overrides_global_timeout() {
+        let mut config = app_config_with_upstream(least_connections_upstream());
+        config.timeouts.server_timeout_seconds = 60;
+
+        let rule = Rule {
+            id: "rule-1".to_string(),
+            name: "route".to_string(),
+            priority: 10,
+            host: Default::default(),
+            location: Default::default(),
+            match_set: None,
+            conditions: None,
+            upstream: "backend".to_string(),
+            weight: 100,
+            is_fallback: false,
+            listen: None,
+            request_timeout: 0,
+            timeouts: crate::models::RuleTimeoutPolicy {
+                server_timeout_seconds: Some(11),
+                ..Default::default()
+            },
+            tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
+        };
+
+        let resolved = super::resolve_proxy_timeout_policy(&config, &rule, "http://a");
+
+        assert_eq!(resolved.server_timeout, Duration::from_secs(11));
     }
 
     #[test]

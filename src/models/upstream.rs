@@ -11,7 +11,6 @@ mod tests {
         let target = Target {
             url: "http://localhost:8080".to_string(),
             weight: 100,
-            timeouts: Default::default(),
         };
         let json = serde_json::to_string(&target).unwrap();
         let parsed: Target = serde_json::from_str(&json).unwrap();
@@ -24,7 +23,6 @@ mod tests {
         let target1 = Target {
             url: "http://localhost:8080".to_string(),
             weight: 50,
-            timeouts: Default::default(),
         };
         let target2 = target1.clone();
         assert_eq!(target1, target2);
@@ -40,18 +38,15 @@ mod tests {
                 Target {
                     url: "http://localhost:8080".to_string(),
                     weight: 80,
-                    timeouts: Default::default(),
                 },
                 Target {
                     url: "http://localhost:8081".to_string(),
                     weight: 20,
-                    timeouts: Default::default(),
                 },
             ],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         };
         let json = serde_json::to_string(&upstream).unwrap();
@@ -73,12 +68,10 @@ mod tests {
             targets: vec![Target {
                 url: "http://localhost:9090".to_string(),
                 weight: 100,
-                timeouts: Default::default(),
             }],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         };
         assert_eq!(upstream.targets.len(), 1);
@@ -95,18 +88,15 @@ mod tests {
                 Target {
                     url: "http://localhost:8080".to_string(),
                     weight: 50,
-                    timeouts: Default::default(),
                 },
                 Target {
                     url: "http://localhost:8081".to_string(),
                     weight: 50,
-                    timeouts: Default::default(),
                 },
             ],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         };
         let cloned = upstream.clone();
@@ -120,7 +110,6 @@ mod tests {
         let target = Target {
             url: "http://debug:9999".to_string(),
             weight: 42,
-            timeouts: Default::default(),
         };
         let debug_str = format!("{:?}", target);
         assert!(debug_str.contains("http://debug:9999"));
@@ -137,7 +126,6 @@ mod tests {
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
-            timeouts: Default::default(),
             sticky: Default::default(),
         };
         let debug_str = format!("{:?}", upstream);
@@ -190,9 +178,7 @@ targets:
         let upstream: Upstream = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(upstream.balance, BalanceAlgorithm::WeightedRoundRobin);
         assert_eq!(upstream.retry.attempts, 0);
-        assert_eq!(upstream.timeouts, UpstreamTimeoutPolicy::default());
         assert_eq!(upstream.sticky, StickyPolicy::default());
-        assert_eq!(upstream.targets[0].timeouts, TargetTimeoutPolicy::default());
     }
 
     #[test]
@@ -227,7 +213,7 @@ targets:
     }
 
     #[test]
-    fn test_upstream_and_target_timeout_policy_serde() {
+    fn test_upstream_and_target_timeout_policy_is_ignored() {
         let yaml = r#"
 name: api
 timeouts:
@@ -241,13 +227,9 @@ targets:
 
         let upstream: Upstream = serde_yaml::from_str(yaml).unwrap();
 
-        assert_eq!(upstream.timeouts.connect_timeout_seconds, Some(3));
-        assert_eq!(upstream.targets[0].timeouts.server_timeout_seconds, Some(9));
-
         let serialized = serde_json::to_string(&upstream).unwrap();
-        assert!(serialized.contains("\"timeouts\""));
-        assert!(serialized.contains("\"connect_timeout_seconds\":3"));
-        assert!(serialized.contains("\"server_timeout_seconds\":9"));
+        assert!(!serialized.contains("\"timeouts\""));
+        assert_eq!(upstream.targets[0].url, "http://127.0.0.1:8080");
     }
 }
 
@@ -255,8 +237,6 @@ targets:
 pub struct Target {
     pub url: String,
     pub weight: u32,
-    #[serde(default)]
-    pub timeouts: TargetTimeoutPolicy,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,43 +343,5 @@ pub struct Upstream {
     #[serde(default)]
     pub retry: RetryPolicy,
     #[serde(default)]
-    pub timeouts: UpstreamTimeoutPolicy,
-    #[serde(default)]
     pub sticky: StickyPolicy,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpstreamTimeoutPolicy {
-    #[serde(default)]
-    pub connect_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub client_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub server_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub http_request_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub http_keepalive_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub tunnel_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub queue_timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetTimeoutPolicy {
-    #[serde(default)]
-    pub connect_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub client_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub server_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub http_request_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub http_keepalive_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub tunnel_timeout_seconds: Option<u64>,
-    #[serde(default)]
-    pub queue_timeout_ms: Option<u64>,
 }

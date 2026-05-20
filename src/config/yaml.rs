@@ -778,12 +778,10 @@ fallback:
                 targets: vec![Target {
                     url: "http://localhost:8080".to_string(),
                     weight: 100,
-                    timeouts: Default::default(),
                 }],
                 health_check: Default::default(),
                 balance: Default::default(),
                 retry: Default::default(),
-                timeouts: Default::default(),
                 sticky: Default::default(),
             },
         );

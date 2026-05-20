@@ -7,7 +7,7 @@ type Lang = 'en' | 'zh';
 type Theme = 'light' | 'dark';
 type AccessLogLevel = 'debug' | 'info' | 'warn' | 'error';
 type ApiResponse<T> = { success: boolean; data: T; error?: string };
-type Target = { url: string; weight: number; timeouts?: TimeoutOverridePolicy };
+type Target = { url: string; weight: number };
 type HealthCheckMode = 'tcp' | 'http';
 type BalanceAlgorithm = 'weighted_round_robin' | 'least_connections' | 'ip_hash' | 'consistent_hash' | 'url_hash';
 type HealthCheck = {
@@ -72,7 +72,6 @@ type Upstream = {
   websocket?: boolean;
   balance?: BalanceAlgorithm;
   retry?: RetryPolicy;
-  timeouts?: TimeoutOverridePolicy;
   sticky?: StickyPolicy;
   targets: Target[];
   health_check?: Partial<HealthCheck>;
@@ -2358,9 +2357,8 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
       balance: draft.balance ?? 'weighted_round_robin',
       retry: normalizeRetryPolicy(draft.retry),
       health_check: normalizeHealthCheck(draft.health_check),
-      timeouts: normalizeTimeoutOverride(draft.timeouts),
       sticky: normalizeStickyPolicy(draft.sticky),
-      targets: draft.targets.map((target) => ({ ...target, timeouts: normalizeTimeoutOverride(target.timeouts) })),
+      targets: draft.targets.map((target) => ({ url: target.url, weight: target.weight })),
     };
     await api<Upstream>(editing ? `/api/upstreams/${encodeURIComponent(editing)}` : '/api/upstreams', { method: editing ? 'PUT' : 'POST', token, body });
     await refreshConfig(token, setConfig, setNotice);
@@ -2510,19 +2508,11 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
                     <Field label="URL"><input value={target.url} onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, url: e.target.value }))} required /></Field>
                     <Field label={t('table.weight')}><input type="number" min="0" value={target.weight} onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, weight: Number(e.target.value) }))} /></Field>
                     <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 24 }} onClick={() => setDraft({ ...draft, targets: draft.targets.filter((_, j) => j !== i) })}><Icon name="close" size={16} /></button>
-                    <div className="target-timeouts">
-                      <TimeoutOverrideEditor
-                        title={`${t('config.timeouts')} · ${i + 1}`}
-                        value={target.timeouts}
-                        onChange={(timeouts) => setDraft(replaceTarget(draft, i, { ...target, timeouts }))}
-                      />
-                    </div>
                   </div>
                 ))}
               </div>
-              <button type="button" className="btn btn-secondary" style={{ marginTop: 10 }} onClick={() => setDraft({ ...draft, targets: [...draft.targets, { url: 'http://127.0.0.1:8080', weight: 100, timeouts: {} }] })}><Icon name="add" size={16} />{t('action.addTarget')}</button>
+              <button type="button" className="btn btn-secondary" style={{ marginTop: 10 }} onClick={() => setDraft({ ...draft, targets: [...draft.targets, { url: 'http://127.0.0.1:8080', weight: 100 }] })}><Icon name="add" size={16} />{t('action.addTarget')}</button>
             </section>
-            <TimeoutOverrideEditor title={t('config.timeouts')} value={draft.timeouts} onChange={(timeouts) => setDraft({ ...draft, timeouts })} />
             <StickyPolicyEditor draft={draft} setDraft={setDraft} />
             <HealthCheckEditor draft={draft} setDraft={setDraft} />
             <div className="modal-footer">
@@ -2994,7 +2984,7 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <h3 className="card-title-sm">{t('config.schema')}</h3>
             <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log.level, monitoring.prometheus, fallback, timeouts, limits, pool_idle_timeout, tcp_keepalive</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">balance, retry, skip_ssl, websocket, sticky, timeouts, targets[].timeouts, health_check</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">balance, retry, skip_ssl, websocket, sticky, targets[].url, targets[].weight, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
             <div className="schema-entry"><span className="schema-key" style={{ color: '#89DDFF' }}>tcp_listeners[]</span><span className="schema-val">name, listen, mode, upstream, sni_routes, maxconn</span></div>
             <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions(header/cookie/jwt)</span></div>
@@ -3340,9 +3330,8 @@ function newUpstream(): Upstream {
     websocket: false,
     balance: 'weighted_round_robin',
     retry: { ...defaultRetryPolicy, retry_on_status: [] },
-    timeouts: {},
     sticky: { ...defaultStickyPolicy },
-    targets: [{ url: 'http://127.0.0.1:8080', weight: 100, timeouts: {} }],
+    targets: [{ url: 'http://127.0.0.1:8080', weight: 100 }],
     health_check: { ...defaultHealthCheck },
   };
 }
@@ -3379,10 +3368,9 @@ function normalizeUpstream(upstream: Upstream): Upstream {
     ...upstream,
     balance: BALANCE_ALGORITHMS.includes(upstream.balance as BalanceAlgorithm) ? upstream.balance : 'weighted_round_robin',
     retry: normalizeRetryPolicy(upstream.retry),
-    timeouts: normalizeTimeoutOverride(upstream.timeouts),
     sticky: normalizeStickyPolicy(upstream.sticky),
     health_check: normalizeHealthCheck(upstream.health_check),
-    targets: (upstream.targets ?? []).map((target) => ({ url: target.url, weight: Number(target.weight ?? 0), timeouts: normalizeTimeoutOverride(target.timeouts) })),
+    targets: (upstream.targets ?? []).map((target) => ({ url: target.url, weight: Number(target.weight ?? 0) })),
   };
 }
 

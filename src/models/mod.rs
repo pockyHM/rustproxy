@@ -6,7 +6,4 @@ pub use rule::{
     HostMatchType, HostMatcher, LimitPolicy, LocationMatchType, LocationMatcher, MatchSet,
     Operator, PathAction, RateLimitKey, Rule, RuleTimeoutPolicy, RuleTls,
 };
-pub use upstream::{
-    BalanceAlgorithm, HealthCheck, HealthCheckMode, RetryPolicy, Target, TargetTimeoutPolicy,
-    Upstream, UpstreamTimeoutPolicy,
-};
+pub use upstream::{BalanceAlgorithm, HealthCheck, HealthCheckMode, RetryPolicy, Target, Upstream};

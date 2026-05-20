@@ -89,8 +89,7 @@ async fn handle_tcp_connection(
         ),
         TcpListenerMode::TlsPassthrough => {
             let client_timeout =
-                ResolvedTimeoutPolicy::resolve(&runtime.config.timeouts, None, None, None)
-                    .client_timeout;
+                ResolvedTimeoutPolicy::resolve(&runtime.config.timeouts, None).client_timeout;
             let (prefix, sni) = timeout_optional(
                 client_timeout,
                 sni::read_client_hello_prefix(&mut downstream),
@@ -175,20 +174,8 @@ async fn handle_tcp_connection(
 }
 
 fn resolved_connect_timeout(config: &AppConfig, upstream_name: &str, target_url: &str) -> Duration {
-    let upstream = config.upstreams.get(upstream_name);
-    let target = upstream.and_then(|upstream| {
-        upstream
-            .targets
-            .iter()
-            .find(|target| target.url == target_url)
-    });
-    ResolvedTimeoutPolicy::resolve(
-        &config.timeouts,
-        None,
-        upstream.map(|upstream| &upstream.timeouts),
-        target.map(|target| &target.timeouts),
-    )
-    .connect_timeout
+    let _ = (upstream_name, target_url);
+    ResolvedTimeoutPolicy::resolve(&config.timeouts, None).connect_timeout
 }
 
 async fn timeout_optional<F, T>(
