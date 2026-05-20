@@ -272,6 +272,8 @@ mod tests {
         let yaml = crate::config::yaml::AppConfig {
             listen: "0.0.0.0:3000".to_string(),
             proxy_listen: "0.0.0.0:80".to_string(),
+            timeouts: Default::default(),
+            limits: Default::default(),
             connect_timeout: 10,
             request_timeout: 60,
             pool_max_idle_per_host: 32,
@@ -413,6 +415,24 @@ pub struct LimitPolicy {
     pub max_connections: Option<u32>,
     #[serde(default)]
     pub max_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleTimeoutPolicy {
+    #[serde(default)]
+    pub connect_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub client_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub server_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub http_request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub http_keepalive_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub tunnel_timeout_seconds: Option<u64>,
     #[serde(default)]
     pub queue_timeout_ms: Option<u64>,
 }

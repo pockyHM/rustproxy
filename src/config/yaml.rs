@@ -1,4 +1,5 @@
 use crate::models::{HostMatchType, LocationMatchType, MatchSet, Rule, Upstream};
+use crate::runtime::timeouts::{ConnectionLimitPolicy, TimeoutPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -126,6 +127,10 @@ pub struct AppConfig {
     pub listen: String,
     #[serde(default = "default_proxy_listen")]
     pub proxy_listen: String,
+    #[serde(default, skip_serializing_if = "TimeoutPolicy::is_default")]
+    pub timeouts: TimeoutPolicy,
+    #[serde(default, skip_serializing_if = "ConnectionLimitPolicy::is_default")]
+    pub limits: ConnectionLimitPolicy,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
     #[serde(default = "default_request_timeout")]
@@ -153,6 +158,33 @@ pub struct AppConfig {
     #[serde(default)]
     pub upstreams: HashMap<String, Upstream>,
     pub fallback: Fallback,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            proxy_listen: default_proxy_listen(),
+            timeouts: TimeoutPolicy::default(),
+            limits: ConnectionLimitPolicy::default(),
+            connect_timeout: default_connect_timeout(),
+            request_timeout: default_request_timeout(),
+            pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            pool_idle_timeout: default_pool_idle_timeout(),
+            tcp_keepalive: default_tcp_keepalive(),
+            certificate_dir: default_certificate_dir(),
+            access_log: AccessLogConfig::default(),
+            monitoring: MonitoringConfig::default(),
+            certificates: Vec::new(),
+            tls_listeners: Vec::new(),
+            match_sets: Vec::new(),
+            rules: Vec::new(),
+            upstreams: HashMap::new(),
+            fallback: Fallback {
+                url: "404".to_string(),
+            },
+        }
+    }
 }
 
 fn default_listen() -> String {
@@ -203,14 +235,34 @@ impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: AppConfig = serde_yaml::from_str(&content)?;
+        config.normalize_timeout_aliases();
         config.normalize_rules();
         Ok(config)
     }
 
     pub fn to_compact_yaml(&self) -> anyhow::Result<String> {
-        let mut value = serde_yaml::to_value(self)?;
+        let mut config = self.clone();
+        config.normalize_timeout_aliases();
+        let mut value = serde_yaml::to_value(&config)?;
         compact_yaml_value(&mut value);
         Ok(serde_yaml::to_string(&value)?)
+    }
+
+    pub fn normalize_timeout_aliases(&mut self) {
+        let legacy_alias_changed = self.connect_timeout != default_connect_timeout()
+            || self.request_timeout != default_request_timeout()
+            || self.pool_idle_timeout != default_pool_idle_timeout();
+
+        if self.timeouts.is_default() && legacy_alias_changed {
+            self.timeouts.connect_timeout_seconds = self.connect_timeout;
+            self.timeouts.server_timeout_seconds = self.request_timeout;
+            self.timeouts.http_request_timeout_seconds = self.request_timeout;
+            self.timeouts.http_keepalive_timeout_seconds = self.pool_idle_timeout;
+        } else {
+            self.connect_timeout = self.timeouts.connect_timeout_seconds;
+            self.request_timeout = self.timeouts.server_timeout_seconds;
+            self.pool_idle_timeout = self.timeouts.http_keepalive_timeout_seconds;
+        }
     }
 
     pub fn normalize_rules(&mut self) {
@@ -362,6 +414,17 @@ mod tests {
     }
 
     #[test]
+    fn timeout_policy_defaults_keep_existing_behavior() {
+        let yaml = r#"
+fallback: { url: "404" }
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.timeouts.connect_timeout_seconds, 10);
+        assert_eq!(config.timeouts.server_timeout_seconds, 60);
+        assert_eq!(config.limits.global_maxconn, None);
+    }
+
+    #[test]
     fn test_app_config_load() {
         let yaml_content = r#"
 listen: "0.0.0.0:8080"
@@ -486,6 +549,8 @@ fallback:
         let config = AppConfig {
             listen: "0.0.0.0:3000".to_string(),
             proxy_listen: "0.0.0.0:80".to_string(),
+            timeouts: Default::default(),
+            limits: Default::default(),
             connect_timeout: 10,
             request_timeout: 60,
             pool_max_idle_per_host: 32,

@@ -12,6 +12,7 @@ use crate::models::{
     HostMatcher, LocationMatchType, LocationMatcher, MatchSet, Operator, RetryPolicy, Rule,
     RuleTls, Target, Upstream,
 };
+use crate::runtime::timeouts::{ConnectionLimitPolicy, TimeoutPolicy};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -336,6 +337,14 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         .unwrap_or(None)
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
+    let timeouts = get_setting(conn, "timeouts")
+        .unwrap_or(None)
+        .and_then(|v| serde_json::from_str::<TimeoutPolicy>(&v).ok())
+        .unwrap_or_default();
+    let limits = get_setting(conn, "limits")
+        .unwrap_or(None)
+        .and_then(|v| serde_json::from_str::<ConnectionLimitPolicy>(&v).ok())
+        .unwrap_or_default();
     let certificate_dir = get_setting(conn, "certificate_dir")
         .unwrap_or(None)
         .unwrap_or_else(|| "/etc/rustproxy/cert.d".to_string());
@@ -371,6 +380,8 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
     let mut config = AppConfig {
         listen,
         proxy_listen,
+        timeouts,
+        limits,
         connect_timeout,
         request_timeout,
         pool_max_idle_per_host,
@@ -386,6 +397,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         upstreams: upstream_map,
         fallback: Fallback { url: fallback_url },
     };
+    config.normalize_timeout_aliases();
     config.normalize_rules();
     Ok(config)
 }
@@ -579,11 +591,14 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
 
     // Settings
     let mut config = config.clone();
+    config.normalize_timeout_aliases();
     config.normalize_rules();
 
     set_setting_tx(tx, "listen", &config.listen)?;
     set_setting_tx(tx, "proxy_listen", &config.proxy_listen)?;
     set_setting_tx(tx, "fallback_url", &config.fallback.url)?;
+    set_setting_tx(tx, "timeouts", &serde_json::to_string(&config.timeouts)?)?;
+    set_setting_tx(tx, "limits", &serde_json::to_string(&config.limits)?)?;
     set_setting_tx(tx, "connect_timeout", &config.connect_timeout.to_string())?;
     set_setting_tx(tx, "request_timeout", &config.request_timeout.to_string())?;
     set_setting_tx(
@@ -1068,6 +1083,8 @@ mod tests {
         AppConfig {
             listen: "0.0.0.0:8080".to_string(),
             proxy_listen: "0.0.0.0:80".to_string(),
+            timeouts: Default::default(),
+            limits: Default::default(),
             match_sets: vec![MatchSet {
                 name: "admin-host".to_string(),
                 conditions: Some(ConditionExpr::Leaf {
@@ -1230,6 +1247,34 @@ mod tests {
         assert_eq!(loaded_upstream.retry.retry_on_status, vec![502, 503]);
         assert!(loaded_upstream.retry.retry_on_timeout);
         assert!(loaded_upstream.retry.retry_on_connect_error);
+    }
+
+    #[test]
+    fn round_trips_timeout_and_limit_settings() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = make_test_config();
+        config.timeouts = TimeoutPolicy {
+            connect_timeout_seconds: 3,
+            client_timeout_seconds: 11,
+            server_timeout_seconds: 12,
+            http_request_timeout_seconds: 13,
+            http_keepalive_timeout_seconds: 14,
+            tunnel_timeout_seconds: 15,
+            queue_timeout_ms: 250,
+        };
+        config.limits = ConnectionLimitPolicy {
+            global_maxconn: Some(1024),
+            listener_maxconn: Some(128),
+        };
+
+        db.save_full_config(&config).unwrap();
+        let loaded = db.load_config().unwrap();
+
+        assert_eq!(loaded.timeouts, config.timeouts);
+        assert_eq!(loaded.limits, config.limits);
+        assert_eq!(loaded.connect_timeout, 3);
+        assert_eq!(loaded.request_timeout, 12);
+        assert_eq!(loaded.pool_idle_timeout, 14);
     }
 
     #[test]

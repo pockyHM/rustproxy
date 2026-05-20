@@ -1407,6 +1407,8 @@ mod tests {
         AppConfig {
             listen: "127.0.0.1:3000".to_string(),
             proxy_listen: "127.0.0.1:8080".to_string(),
+            timeouts: Default::default(),
+            limits: Default::default(),
             connect_timeout: 10,
             request_timeout: 60,
             pool_max_idle_per_host: 32,

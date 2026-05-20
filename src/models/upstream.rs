@@ -285,3 +285,39 @@ pub struct Upstream {
     #[serde(default)]
     pub retry: RetryPolicy,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamTimeoutPolicy {
+    #[serde(default)]
+    pub connect_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub client_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub server_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub http_request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub http_keepalive_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub tunnel_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetTimeoutPolicy {
+    #[serde(default)]
+    pub connect_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub client_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub server_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub http_request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub http_keepalive_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub tunnel_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub queue_timeout_ms: Option<u64>,
+}

@@ -30,6 +30,8 @@ fn build_config() -> AppConfig {
     AppConfig {
         listen: "127.0.0.1:0".to_string(),
         proxy_listen: "0.0.0.0:80".to_string(),
+        timeouts: Default::default(),
+        limits: Default::default(),
         rules: vec![Rule {
             id: "canary-header".to_string(),
             name: "Route canary header".to_string(),
