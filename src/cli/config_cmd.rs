@@ -320,10 +320,23 @@ fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> Result<()
             validate_upstream_url(value)?;
             config.fallback.url = value.to_string();
         }
-        "connect_timeout" => config.connect_timeout = parse_u64(key, value)?,
-        "request_timeout" => config.request_timeout = parse_u64(key, value)?,
+        "connect_timeout" => {
+            let value = parse_u64(key, value)?;
+            config.connect_timeout = value;
+            config.timeouts.connect_timeout_seconds = value;
+        }
+        "request_timeout" => {
+            let value = parse_u64(key, value)?;
+            config.request_timeout = value;
+            config.timeouts.server_timeout_seconds = value;
+            config.timeouts.http_request_timeout_seconds = value;
+        }
         "pool_max_idle_per_host" => config.pool_max_idle_per_host = parse_usize(key, value)?,
-        "pool_idle_timeout" => config.pool_idle_timeout = parse_u64(key, value)?,
+        "pool_idle_timeout" => {
+            let value = parse_u64(key, value)?;
+            config.pool_idle_timeout = value;
+            config.timeouts.http_keepalive_timeout_seconds = value;
+        }
         "tcp_keepalive" => config.tcp_keepalive = parse_u64(key, value)?,
         "access_log_enabled" => config.access_log.enabled = parse_bool(key, value)?,
         "access_log_path" => {
@@ -516,6 +529,7 @@ fn unknown_key<T>(key: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use std::collections::HashMap;
 
     fn config() -> AppConfig {
@@ -575,6 +589,36 @@ mod tests {
         );
         assert_eq!(config.access_log.buffer_size, Some(2048));
         assert_eq!(config.access_log.level, AccessLogLevel::Warn);
+    }
+
+    #[test]
+    fn legacy_timeout_setters_sync_timeout_policy_before_save() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = config();
+        config.timeouts.connect_timeout_seconds = 99;
+        config.timeouts.server_timeout_seconds = 88;
+        config.timeouts.http_request_timeout_seconds = 88;
+        config.timeouts.http_keepalive_timeout_seconds = 77;
+
+        set_config_value(&mut config, "connect_timeout", "2").unwrap();
+        set_config_value(&mut config, "request_timeout", "30").unwrap();
+        set_config_value(&mut config, "pool_idle_timeout", "45").unwrap();
+
+        assert_eq!(config.timeouts.connect_timeout_seconds, 2);
+        assert_eq!(config.timeouts.server_timeout_seconds, 30);
+        assert_eq!(config.timeouts.http_request_timeout_seconds, 30);
+        assert_eq!(config.timeouts.http_keepalive_timeout_seconds, 45);
+
+        db.save_full_config(&config).unwrap();
+        let loaded = db.load_config().unwrap();
+
+        assert_eq!(loaded.timeouts.connect_timeout_seconds, 2);
+        assert_eq!(loaded.timeouts.server_timeout_seconds, 30);
+        assert_eq!(loaded.timeouts.http_request_timeout_seconds, 30);
+        assert_eq!(loaded.timeouts.http_keepalive_timeout_seconds, 45);
+        assert_eq!(loaded.connect_timeout, 2);
+        assert_eq!(loaded.request_timeout, 30);
+        assert_eq!(loaded.pool_idle_timeout, 45);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::config::yaml::{
 use crate::models::{
     BalanceAlgorithm, ConditionExpr, ConditionType, HealthCheck, HealthCheckMode, HostMatchType,
     HostMatcher, LocationMatchType, LocationMatcher, MatchSet, Operator, RetryPolicy, Rule,
-    RuleTls, Target, Upstream,
+    RuleTimeoutPolicy, RuleTls, Target, TargetTimeoutPolicy, Upstream, UpstreamTimeoutPolicy,
 };
 use crate::runtime::timeouts::{ConnectionLimitPolicy, TimeoutPolicy};
 
@@ -305,6 +305,16 @@ where
     }
 }
 
+fn json_column_or_default<T>(json: Option<&str>, context: impl FnOnce() -> String) -> Result<T>
+where
+    T: DeserializeOwned + Default,
+{
+    match json {
+        Some(value) => serde_json::from_str(value).with_context(context),
+        None => Ok(T::default()),
+    }
+}
+
 fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
@@ -409,71 +419,99 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
 }
 
 fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
+    struct RuleRow {
+        id: String,
+        name: String,
+        priority: i32,
+        upstream: String,
+        weight: u32,
+        expr_json: Option<String>,
+        listen: Option<String>,
+        tls_enabled: bool,
+        tls_certificate: Option<String>,
+        is_fallback: bool,
+        match_set: Option<String>,
+        host_type: Option<String>,
+        host_value: Option<String>,
+        location_type: Option<String>,
+        location_value: Option<String>,
+        request_timeout: u64,
+        header_policy_json: Option<String>,
+        path_actions_json: Option<String>,
+        limit_policy_json: Option<String>,
+        timeout_policy_json: Option<String>,
+    }
+
     let mut stmt = conn.prepare(
         "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy, timeout_policy FROM rules ORDER BY priority DESC, rowid ASC"
     )?;
     let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let priority: i32 = row.get(2)?;
-        let upstream: String = row.get(3)?;
-        let weight: u32 = row.get::<_, i64>(4)? as u32;
-        let expr_json: Option<String> = row.get(5)?;
-        let listen: Option<String> = row.get(6)?;
-        let tls_enabled: bool = row.get::<_, i64>(7)? != 0;
-        let tls_certificate: Option<String> = row.get(8)?;
-        let is_fallback: bool = row.get::<_, i64>(9)? != 0;
-        let match_set: Option<String> = row.get(10)?;
-        let host_type: Option<String> = row.get(11)?;
-        let host_value: Option<String> = row.get(12)?;
-        let location_type: Option<String> = row.get(13)?;
-        let location_value: Option<String> = row.get(14)?;
-        let request_timeout: u64 = row.get::<_, i64>(15)? as u64;
-        let header_policy_json: Option<String> = row.get(16)?;
-        let path_actions_json: Option<String> = row.get(17)?;
-        let limit_policy_json: Option<String> = row.get(18)?;
-        let timeout_policy_json: Option<String> = row.get(19)?;
-        let conditions =
-            expr_json.and_then(|json| serde_json::from_str::<ConditionExpr>(&json).ok());
-        let mut timeouts =
-            json_or_default::<crate::models::RuleTimeoutPolicy>(timeout_policy_json.as_deref());
-        if timeouts.server_timeout_seconds.is_none() && request_timeout > 0 {
-            timeouts.server_timeout_seconds = Some(request_timeout);
-        }
-
-        Ok(Rule {
-            id,
-            name,
-            priority,
-            host: HostMatcher {
-                match_type: parse_host_match_type(host_type.as_deref()),
-                value: host_value,
-            },
-            location: LocationMatcher {
-                match_type: parse_location_match_type(location_type.as_deref()),
-                value: location_value.unwrap_or_else(|| "/".to_string()),
-            },
-            match_set,
-            conditions,
-            upstream,
-            weight,
-            is_fallback,
-            listen,
-            request_timeout,
-            tls: tls_certificate.map(|certificate| RuleTls {
-                enabled: tls_enabled,
-                certificate,
-            }),
-            header_policy: json_or_default(header_policy_json.as_deref()),
-            path_actions: json_or_default(path_actions_json.as_deref()),
-            limit_policy: json_or_default(limit_policy_json.as_deref()),
-            timeouts,
+        Ok(RuleRow {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            priority: row.get(2)?,
+            upstream: row.get(3)?,
+            weight: row.get::<_, i64>(4)? as u32,
+            expr_json: row.get(5)?,
+            listen: row.get(6)?,
+            tls_enabled: row.get::<_, i64>(7)? != 0,
+            tls_certificate: row.get(8)?,
+            is_fallback: row.get::<_, i64>(9)? != 0,
+            match_set: row.get(10)?,
+            host_type: row.get(11)?,
+            host_value: row.get(12)?,
+            location_type: row.get(13)?,
+            location_value: row.get(14)?,
+            request_timeout: row.get::<_, i64>(15)? as u64,
+            header_policy_json: row.get(16)?,
+            path_actions_json: row.get(17)?,
+            limit_policy_json: row.get(18)?,
+            timeout_policy_json: row.get(19)?,
         })
     })?;
 
     let mut rules = Vec::new();
     for row in rows {
-        rules.push(row?);
+        let row = row?;
+        let conditions = row
+            .expr_json
+            .and_then(|json| serde_json::from_str::<ConditionExpr>(&json).ok());
+        let mut timeouts = json_column_or_default::<RuleTimeoutPolicy>(
+            row.timeout_policy_json.as_deref(),
+            || format!("failed to parse rules.timeout_policy for rule '{}'", row.id),
+        )?;
+        if timeouts.server_timeout_seconds.is_none() && row.request_timeout > 0 {
+            timeouts.server_timeout_seconds = Some(row.request_timeout);
+        }
+
+        rules.push(Rule {
+            id: row.id,
+            name: row.name,
+            priority: row.priority,
+            host: HostMatcher {
+                match_type: parse_host_match_type(row.host_type.as_deref()),
+                value: row.host_value,
+            },
+            location: LocationMatcher {
+                match_type: parse_location_match_type(row.location_type.as_deref()),
+                value: row.location_value.unwrap_or_else(|| "/".to_string()),
+            },
+            match_set: row.match_set,
+            conditions,
+            upstream: row.upstream,
+            weight: row.weight,
+            is_fallback: row.is_fallback,
+            listen: row.listen,
+            request_timeout: row.request_timeout,
+            tls: row.tls_certificate.map(|certificate| RuleTls {
+                enabled: row.tls_enabled,
+                certificate,
+            }),
+            header_policy: json_or_default(row.header_policy_json.as_deref()),
+            path_actions: json_or_default(row.path_actions_json.as_deref()),
+            limit_policy: json_or_default(row.limit_policy_json.as_deref()),
+            timeouts,
+        });
     }
     Ok(rules)
 }
@@ -566,26 +604,22 @@ fn load_health_check(conn: &Connection, upstream_name: &str) -> Result<HealthChe
 fn load_upstream_policy(
     conn: &Connection,
     upstream_name: &str,
-) -> Result<(
-    BalanceAlgorithm,
-    RetryPolicy,
-    crate::models::UpstreamTimeoutPolicy,
-)> {
-    conn.query_row(
-        "SELECT balance, retry_policy, timeout_policy FROM upstreams WHERE name = ?1",
-        params![upstream_name],
-        |row| {
-            let balance: String = row.get(0)?;
-            let retry_json: Option<String> = row.get(1)?;
-            let timeout_json: Option<String> = row.get(2)?;
-            Ok((
-                parse_balance_algorithm(&balance),
-                json_or_default(retry_json.as_deref()),
-                json_or_default(timeout_json.as_deref()),
-            ))
-        },
-    )
-    .map_err(Into::into)
+) -> Result<(BalanceAlgorithm, RetryPolicy, UpstreamTimeoutPolicy)> {
+    let (balance, retry_json, timeout_json): (String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT balance, retry_policy, timeout_policy FROM upstreams WHERE name = ?1",
+            params![upstream_name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let timeouts =
+        json_column_or_default::<UpstreamTimeoutPolicy>(timeout_json.as_deref(), || {
+            format!("failed to parse upstreams.timeout_policy for upstream '{upstream_name}'")
+        })?;
+    Ok((
+        parse_balance_algorithm(&balance),
+        json_or_default(retry_json.as_deref()),
+        timeouts,
+    ))
 }
 
 fn load_targets(conn: &Connection, upstream_name: &str) -> Result<Vec<Target>> {
@@ -594,15 +628,28 @@ fn load_targets(conn: &Connection, upstream_name: &str) -> Result<Vec<Target>> {
             "SELECT url, weight, timeout_policy FROM targets WHERE upstream_name = ?1 ORDER BY sort_order",
         )?;
     let rows = stmt.query_map(params![upstream_name], |row| {
-        Ok(Target {
-            url: row.get(0)?,
-            weight: row.get::<_, i64>(1)? as u32,
-            timeouts: json_or_default(row.get::<_, Option<String>>(2)?.as_deref()),
-        })
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? as u32,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?;
     let mut targets = Vec::new();
     for row in rows {
-        targets.push(row?);
+        let (url, weight, timeout_json) = row?;
+        let timeouts = json_column_or_default::<TargetTimeoutPolicy>(
+            timeout_json.as_deref(),
+            || {
+                format!(
+                "failed to parse targets.timeout_policy for upstream '{upstream_name}' target '{url}'"
+            )
+            },
+        )?;
+        targets.push(Target {
+            url,
+            weight,
+            timeouts,
+        });
     }
     Ok(targets)
 }
@@ -1341,6 +1388,73 @@ mod tests {
         let err = db.load_config().unwrap_err();
 
         assert!(err.to_string().contains("timeouts"));
+    }
+
+    #[test]
+    fn malformed_rule_timeout_policy_fails_load_config() {
+        let db = Database::open_in_memory().unwrap();
+        let config = make_test_config();
+        db.save_full_config(&config).unwrap();
+        db.set_setting(
+            "timeouts",
+            &serde_json::to_string(&config.timeouts).unwrap(),
+        )
+        .unwrap();
+        db.set_setting("limits", &serde_json::to_string(&config.limits).unwrap())
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rules SET timeout_policy = ?1 WHERE id = ?2",
+                params!["{malformed", "rule-1"],
+            )
+            .unwrap();
+
+        let err = db.load_config().unwrap_err();
+
+        assert!(err.to_string().contains("rules.timeout_policy"));
+        assert!(err.to_string().contains("rule-1"));
+    }
+
+    #[test]
+    fn malformed_upstream_timeout_policy_fails_load_config() {
+        let db = Database::open_in_memory().unwrap();
+        let config = make_test_config();
+        db.save_full_config(&config).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE upstreams SET timeout_policy = ?1 WHERE name = ?2",
+                params!["{malformed", "backend-1"],
+            )
+            .unwrap();
+
+        let err = db.load_config().unwrap_err();
+
+        assert!(err.to_string().contains("upstreams.timeout_policy"));
+        assert!(err.to_string().contains("backend-1"));
+    }
+
+    #[test]
+    fn malformed_target_timeout_policy_fails_load_config() {
+        let db = Database::open_in_memory().unwrap();
+        let config = make_test_config();
+        db.save_full_config(&config).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE targets SET timeout_policy = ?1 WHERE upstream_name = ?2 AND url = ?3",
+                params!["{malformed", "backend-1", "http://a:8080"],
+            )
+            .unwrap();
+
+        let err = db.load_config().unwrap_err();
+
+        assert!(err.to_string().contains("targets.timeout_policy"));
+        assert!(err.to_string().contains("http://a:8080"));
     }
 
     #[test]
