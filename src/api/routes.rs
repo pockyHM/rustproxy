@@ -21,7 +21,7 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use rustls::pki_types::pem::PemObject;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tower_http::trace::TraceLayer;
@@ -99,6 +99,7 @@ pub struct AppState {
     proxy_runtime: Arc<ArcSwap<ProxyRuntime>>,
     runtime_state: RuntimeState,
     listener_manager: Arc<ListenerManager>,
+    listener_lifecycle: Arc<Mutex<()>>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -160,6 +161,7 @@ impl AppState {
     }
 
     pub(crate) async fn sync_proxy_listeners(&self, config: &AppConfig) -> anyhow::Result<()> {
+        let _lifecycle = self.listener_lifecycle.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -170,6 +172,7 @@ impl AppState {
     }
 
     pub(crate) async fn shutdown_proxy_listeners(&self) {
+        let _lifecycle = self.listener_lifecycle.lock().await;
         self.shutting_down.store(true, Ordering::Release);
         self.listener_manager.shutdown_all().await;
     }
@@ -1284,6 +1287,7 @@ where
         proxy_runtime,
         runtime_state,
         listener_manager: Arc::new(ListenerManager::default()),
+        listener_lifecycle: Arc::new(Mutex::new(())),
         shutting_down: Arc::new(AtomicBool::new(false)),
     };
 
@@ -1385,8 +1389,9 @@ mod tests {
     use arc_swap::ArcSwap;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::RwLock;
 
     fn target(url: &str, weight: u32) -> Target {
@@ -1482,6 +1487,7 @@ mod tests {
             proxy_runtime,
             runtime_state,
             listener_manager: Arc::new(Default::default()),
+            listener_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
 
@@ -1566,6 +1572,7 @@ mod tests {
             proxy_runtime,
             runtime_state,
             listener_manager: Arc::new(Default::default()),
+            listener_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(true)),
         };
         let mut desired = config.clone();
@@ -1582,5 +1589,59 @@ mod tests {
             .unwrap();
 
         assert!(state.listener_manager.handles.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_proxy_listeners_waits_for_listener_lifecycle_lock() {
+        crate::install_rustls_crypto_provider();
+        let config = app_config_with_upstream(least_connections_upstream());
+        let health = HealthRegistry::new();
+        let health_config = ConfigSnapshot::new();
+        health_config.update(&config.upstreams);
+        let jwt_secret = "test-secret".to_string();
+        let runtime_state = RuntimeState::default();
+        let proxy_runtime = Arc::new(ArcSwap::from_pointee(ProxyRuntime {
+            matcher: Arc::new(Matcher::new_verified_with_match_sets(
+                config.rules.clone(),
+                config.match_sets.clone(),
+                jwt_secret.clone(),
+            )),
+            balancer: Arc::new(Balancer::new_with_runtime(
+                config.upstreams.clone(),
+                Some(health.clone()),
+                runtime_state.clone(),
+            )),
+            config: Arc::new(config.clone()),
+            clients: Arc::new(ProxyClients::new(None, 32, None, None)),
+            access_logger: None,
+            limits: Arc::new(LimitState::default()),
+        }));
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            db: Arc::new(Database::open_in_memory().unwrap()),
+            jwt_secret: Arc::new(jwt_secret),
+            metrics: Arc::new(ProxyMetrics::new().unwrap()),
+            health,
+            health_config,
+            proxy_runtime,
+            runtime_state,
+            listener_manager: Arc::new(Default::default()),
+            listener_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        };
+
+        let guard = state.listener_lifecycle.lock().await;
+        let shutdown = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state.shutdown_proxy_listeners().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!state.shutting_down.load(Ordering::Acquire));
+
+        drop(guard);
+        shutdown.await.unwrap();
+        assert!(state.shutting_down.load(Ordering::Acquire));
     }
 }
