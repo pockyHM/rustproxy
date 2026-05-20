@@ -36,6 +36,7 @@ use crate::{
         retry::{should_retry, AttemptOutcome},
     },
     runtime::drain::DrainLease,
+    runtime::timeouts::ResolvedTimeoutPolicy,
 };
 
 // ── TLS verification bypass ──
@@ -129,7 +130,7 @@ pub struct ProxyAccessLogContext {
 pub struct ProxyRequestContext {
     pub access: ProxyAccessLogContext,
     pub metric_labels: ProxyMetricLabels,
-    pub request_timeout_override: u64,
+    pub timeout_policy: ResolvedTimeoutPolicy,
     pub header_policy: HeaderPolicy,
     pub path_actions: Vec<PathAction>,
     pub limit_state: Option<Arc<LimitState>>,
@@ -146,6 +147,7 @@ pub struct ProxyRequestContext {
 struct GuardedResponseBody {
     inner: Pin<Box<Body>>,
     _active_connection: Option<ActiveConnectionGuard>,
+    _target_metric: Option<TargetMetricGuard>,
     _limit_permit: Option<LimitPermit>,
     _target_lease: Option<TargetLease>,
     _drain_lease: Option<DrainLease>,
@@ -289,6 +291,31 @@ pub async fn handle_proxy_with_target(
             metrics: Arc::clone(metrics),
         }
     });
+    let mut target_metric = metrics.as_ref().map(|metrics| {
+        metrics
+            .target_active_connections
+            .with_label_values(&[
+                proxy_context.metric_labels.upstream.as_str(),
+                target_base.as_str(),
+            ])
+            .inc();
+        metrics
+            .target_queue_length
+            .with_label_values(&[
+                proxy_context.metric_labels.upstream.as_str(),
+                target_base.as_str(),
+            ])
+            .set(0.0);
+        TargetMetricGuard {
+            metrics: Arc::clone(metrics),
+            upstream: proxy_context.metric_labels.upstream.clone(),
+            target: target_base.clone(),
+        }
+    });
+    if proxy_context.limit_policy.queue_timeout_ms.is_none() {
+        proxy_context.limit_policy.queue_timeout_ms =
+            Some(duration_millis_u64(proxy_context.timeout_policy.queue_timeout));
+    }
     let mut limit_permit = match (
         proxy_context.limit_state.as_deref(),
         proxy_context.limit_context.as_ref(),
@@ -334,6 +361,16 @@ pub async fn handle_proxy_with_target(
                     ));
                 }
                 Err(limits::LimitRejection::QueueTimeout) => {
+                    if let Some(metrics) = metrics.as_deref() {
+                        metrics
+                            .target_connection_rejections
+                            .with_label_values(&[
+                                proxy_context.metric_labels.upstream.as_str(),
+                                target_base.as_str(),
+                                "queue_timeout",
+                            ])
+                            .inc();
+                    }
                     return Ok(record_proxy_outcome(
                         service_unavailable(),
                         metrics.as_deref(),
@@ -459,16 +496,8 @@ pub async fn handle_proxy_with_target(
         ));
     }
 
-    let effective_request_timeout = if proxy_context.request_timeout_override > 0 {
-        proxy_context.request_timeout_override
-    } else {
-        config.request_timeout
-    };
-    let request_timeout = if effective_request_timeout > 0 {
-        Some(Duration::from_secs(effective_request_timeout))
-    } else {
-        None
-    };
+    let server_timeout = proxy_context.timeout_policy.server_timeout;
+    let tunnel_timeout = proxy_context.timeout_policy.tunnel_timeout;
 
     if is_websocket {
         let target_uri = match build_target_uri(&target_base, &forward_uri) {
@@ -497,10 +526,7 @@ pub async fn handle_proxy_with_target(
             .is_some_and(|s| s.eq_ignore_ascii_case("https"));
         let client_upgrade = Some(hyper::upgrade::on(&mut request));
         let send_future = send_upstream_request(&clients, request, is_https, upstream_skip_ssl);
-        let result = match request_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, send_future).await,
-            None => Ok(send_future.await),
-        };
+        let result = timeout_optional(server_timeout, send_future).await;
 
         return match result {
             Ok(Ok(mut resp)) => {
@@ -526,17 +552,25 @@ pub async fn handle_proxy_with_target(
                     if let Some(client_upgrade) = client_upgrade {
                         let upstream_upgrade = hyper::upgrade::on(&mut resp);
                         let active_connection = active_connection.take();
+                        let target_metric = target_metric.take();
                         let limit_permit = limit_permit.take();
                         let target_lease = proxy_context.target_lease.take();
                         let drain_lease = proxy_context.drain_lease.take();
                         tokio::spawn(async move {
                             let _active_connection = active_connection;
+                            let _target_metric = target_metric;
                             let _limit_permit = limit_permit;
                             let _target_lease = target_lease;
                             let _drain_lease = drain_lease;
-                            if let Err(e) = tunnel_upgraded(client_upgrade, upstream_upgrade).await
-                            {
-                                tracing::warn!(%e, "websocket tunnel closed with error");
+                            let tunnel = tunnel_upgraded(client_upgrade, upstream_upgrade);
+                            match timeout_optional(tunnel_timeout, tunnel).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(%e, "websocket tunnel closed with error");
+                                }
+                                Err(_) => {
+                                    tracing::warn!("websocket tunnel timed out");
+                                }
                             }
                         });
                     }
@@ -557,6 +591,7 @@ pub async fn handle_proxy_with_target(
                 let response = guard_response(
                     resp.map(Body::new),
                     active_connection.take(),
+                    target_metric.take(),
                     limit_permit.take(),
                     proxy_context.target_lease.take(),
                     proxy_context.drain_lease.take(),
@@ -679,10 +714,7 @@ pub async fn handle_proxy_with_target(
 
             let send_future =
                 send_upstream_request(&clients, attempt_request, is_https, upstream_skip_ssl);
-            let result = match request_timeout {
-                Some(timeout) => tokio::time::timeout(timeout, send_future).await,
-                None => Ok(send_future.await),
-            };
+            let result = timeout_optional(server_timeout, send_future).await;
 
             match result {
                 Ok(Ok(mut resp)) => {
@@ -695,6 +727,12 @@ pub async fn handle_proxy_with_target(
                         if let Some(next_target) =
                             next_retry_target(&proxy_context, Some(current_target_base.as_str()))
                         {
+                            record_upstream_retry(
+                                metrics.as_deref(),
+                                &proxy_context.metric_labels.upstream,
+                                &current_target_base,
+                                "status",
+                            );
                             drop(current_lease.take());
                             current_target_base = next_target.url;
                             current_lease = Some(next_target.active_connection);
@@ -725,6 +763,7 @@ pub async fn handle_proxy_with_target(
                     let response = guard_response(
                         resp.map(Body::new),
                         active_connection.take(),
+                        target_metric.take(),
                         limit_permit.take(),
                         current_lease.take(),
                         proxy_context.drain_lease.take(),
@@ -752,6 +791,12 @@ pub async fn handle_proxy_with_target(
                         if let Some(next_target) =
                             next_retry_target(&proxy_context, Some(current_target_base.as_str()))
                         {
+                            record_upstream_retry(
+                                metrics.as_deref(),
+                                &proxy_context.metric_labels.upstream,
+                                &current_target_base,
+                                "connect_error",
+                            );
                             drop(current_lease.take());
                             current_target_base = next_target.url;
                             current_lease = Some(next_target.active_connection);
@@ -783,6 +828,12 @@ pub async fn handle_proxy_with_target(
                         if let Some(next_target) =
                             next_retry_target(&proxy_context, Some(current_target_base.as_str()))
                         {
+                            record_upstream_retry(
+                                metrics.as_deref(),
+                                &proxy_context.metric_labels.upstream,
+                                &current_target_base,
+                                "timeout",
+                            );
                             drop(current_lease.take());
                             current_target_base = next_target.url;
                             current_lease = Some(next_target.active_connection);
@@ -877,10 +928,7 @@ pub async fn handle_proxy_with_target(
         .scheme_str()
         .is_some_and(|s| s.eq_ignore_ascii_case("https"));
     let send_future = send_upstream_request(&clients, request, is_https, upstream_skip_ssl);
-    let result = match request_timeout {
-        Some(timeout) => tokio::time::timeout(timeout, send_future).await,
-        None => Ok(send_future.await),
-    };
+    let result = timeout_optional(server_timeout, send_future).await;
 
     match result {
         Ok(Ok(mut resp)) => {
@@ -907,6 +955,7 @@ pub async fn handle_proxy_with_target(
             let response = guard_response(
                 resp.map(Body::new),
                 active_connection.take(),
+                target_metric.take(),
                 limit_permit.take(),
                 proxy_context.target_lease.take(),
                 proxy_context.drain_lease.take(),
@@ -975,6 +1024,7 @@ async fn send_upstream_request(
 fn guard_response(
     response: Response<Body>,
     active_connection: Option<ActiveConnectionGuard>,
+    target_metric: Option<TargetMetricGuard>,
     limit_permit: Option<LimitPermit>,
     target_lease: Option<TargetLease>,
     drain_lease: Option<DrainLease>,
@@ -983,6 +1033,7 @@ fn guard_response(
         Body::new(GuardedResponseBody {
             inner: Box::pin(body),
             _active_connection: active_connection,
+            _target_metric: target_metric,
             _limit_permit: limit_permit,
             _target_lease: target_lease,
             _drain_lease: drain_lease,
@@ -1091,6 +1142,35 @@ fn next_retry_target(
     )
 }
 
+async fn timeout_optional<F, T>(duration: Duration, future: F) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    if duration.is_zero() {
+        Ok(future.await)
+    } else {
+        tokio::time::timeout(duration, future).await
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn record_upstream_retry(
+    metrics: Option<&ProxyMetrics>,
+    upstream: &str,
+    target: &str,
+    reason: &str,
+) {
+    if let Some(metrics) = metrics {
+        metrics
+            .upstream_retries
+            .with_label_values(&[upstream, target, reason])
+            .inc();
+    }
+}
+
 struct ActiveConnectionGuard {
     metrics: Arc<ProxyMetrics>,
 }
@@ -1098,6 +1178,21 @@ struct ActiveConnectionGuard {
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         self.metrics.active_connections.dec();
+    }
+}
+
+struct TargetMetricGuard {
+    metrics: Arc<ProxyMetrics>,
+    upstream: String,
+    target: String,
+}
+
+impl Drop for TargetMetricGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .target_active_connections
+            .with_label_values(&[self.upstream.as_str(), self.target.as_str()])
+            .dec();
     }
 }
 
@@ -1354,6 +1449,7 @@ mod tests {
 
         let response = guard_response(
             Response::new(Body::from("ok")),
+            None,
             None,
             None,
             None,

@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const REQUEST_DURATION_BUCKETS_SECONDS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
-    300.0, 600.0, 900.0, 1800.0,
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    900.0, 1800.0,
 ];
 
 pub struct ProxyMetrics {
@@ -17,6 +17,10 @@ pub struct ProxyMetrics {
     pub requests_total: CounterVec,
     pub request_duration: HistogramVec,
     pub active_connections: Gauge,
+    pub target_active_connections: prometheus::GaugeVec,
+    pub target_queue_length: prometheus::GaugeVec,
+    pub target_connection_rejections: CounterVec,
+    pub upstream_retries: CounterVec,
     pub config_reloads: Counter,
 }
 
@@ -49,6 +53,42 @@ impl ProxyMetrics {
         ))?;
         registry.register(Box::new(active_connections.clone()))?;
 
+        let target_active_connections = prometheus::GaugeVec::new(
+            opts!(
+                "rustproxy_proxy_target_active_connections",
+                "Current number of active proxy connections by upstream target."
+            ),
+            &["upstream", "target"],
+        )?;
+        registry.register(Box::new(target_active_connections.clone()))?;
+
+        let target_queue_length = prometheus::GaugeVec::new(
+            opts!(
+                "rustproxy_proxy_target_queue_length",
+                "Current number of queued proxy requests by upstream target."
+            ),
+            &["upstream", "target"],
+        )?;
+        registry.register(Box::new(target_queue_length.clone()))?;
+
+        let target_connection_rejections = CounterVec::new(
+            opts!(
+                "rustproxy_proxy_target_connection_rejections_total",
+                "Total number of target connection rejections."
+            ),
+            &["upstream", "target", "reason"],
+        )?;
+        registry.register(Box::new(target_connection_rejections.clone()))?;
+
+        let upstream_retries = CounterVec::new(
+            opts!(
+                "rustproxy_proxy_upstream_retries_total",
+                "Total number of upstream retry attempts."
+            ),
+            &["upstream", "target", "reason"],
+        )?;
+        registry.register(Box::new(upstream_retries.clone()))?;
+
         let config_reloads = Counter::with_opts(opts!(
             "rustproxy_proxy_config_reloads_total",
             "Total number of proxy configuration reloads."
@@ -62,6 +102,10 @@ impl ProxyMetrics {
             requests_total,
             request_duration,
             active_connections,
+            target_active_connections,
+            target_queue_length,
+            target_connection_rejections,
+            upstream_retries,
             config_reloads,
         })
     }
@@ -217,6 +261,35 @@ mod tests {
         assert!(output.contains("rustproxy_proxy_config_reloads_total"));
         assert!(output.contains("rustproxy_process_cpu_seconds_total"));
         assert!(output.contains("rustproxy_process_resident_memory_bytes"));
+    }
+
+    #[test]
+    fn gathers_target_connection_metric_names() {
+        let metrics = ProxyMetrics::new().unwrap();
+
+        metrics
+            .target_active_connections
+            .with_label_values(&["users", "http://users.internal:8080"])
+            .set(1.0);
+        metrics
+            .target_queue_length
+            .with_label_values(&["users", "http://users.internal:8080"])
+            .set(2.0);
+        metrics
+            .target_connection_rejections
+            .with_label_values(&["users", "http://users.internal:8080", "queue_timeout"])
+            .inc();
+        metrics
+            .upstream_retries
+            .with_label_values(&["users", "http://users.internal:8080", "timeout"])
+            .inc();
+
+        let output = metrics.gather().unwrap();
+
+        assert!(output.contains("rustproxy_proxy_target_active_connections"));
+        assert!(output.contains("rustproxy_proxy_target_queue_length"));
+        assert!(output.contains("rustproxy_proxy_target_connection_rejections_total"));
+        assert!(output.contains("rustproxy_proxy_upstream_retries_total"));
     }
 
     #[test]

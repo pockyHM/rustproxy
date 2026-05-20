@@ -26,7 +26,9 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tower_http::trace::TraceLayer;
 
-use crate::models::{ConditionExpr, ConditionType, HostMatchType, LocationMatchType, Rule};
+use crate::models::{
+    ConditionExpr, ConditionType, HostMatchType, LimitPolicy, LocationMatchType, Rule,
+};
 use crate::{
     auth::middleware::{self as auth_mw},
     config::yaml::AppConfig,
@@ -43,6 +45,7 @@ use crate::{
     },
     runtime::drain::DrainController,
     runtime::state::RuntimeState,
+    runtime::timeouts::ResolvedTimeoutPolicy,
 };
 
 use super::handlers;
@@ -1035,7 +1038,7 @@ async fn proxy_handler(
         clients,
         access_logger,
         target_base,
-        rule_request_timeout,
+        timeout_policy,
         metric_labels,
         header_policy,
         path_actions,
@@ -1083,13 +1086,19 @@ async fn proxy_handler(
                             },
                         )
                         .map(|target| {
+                            let timeout_policy =
+                                resolve_proxy_timeout_policy(&config, rule, &target.url);
+                            let limit_policy = limit_policy_with_resolved_queue_timeout(
+                                rule.limit_policy.clone(),
+                                &timeout_policy,
+                            );
                             (
                                 rule_label,
                                 rule.upstream.clone(),
-                                rule.request_timeout,
+                                timeout_policy,
                                 rule.header_policy.clone(),
                                 rule.path_actions.clone(),
-                                rule.limit_policy.clone(),
+                                limit_policy,
                                 config
                                     .upstreams
                                     .get(&rule.upstream)
@@ -1113,7 +1122,7 @@ async fn proxy_handler(
             .unwrap_or_else(|| config.proxy_listen.clone());
         let (
             target_base,
-            rule_request_timeout,
+            timeout_policy,
             metric_labels,
             header_policy,
             path_actions,
@@ -1125,7 +1134,7 @@ async fn proxy_handler(
             Some((
                 rule,
                 upstream,
-                request_timeout,
+                timeout_policy,
                 header_policy,
                 path_actions,
                 limit_policy,
@@ -1135,7 +1144,7 @@ async fn proxy_handler(
                 target_lease,
             )) => (
                 target,
-                request_timeout,
+                timeout_policy,
                 ProxyMetricLabels {
                     listen: listen_label,
                     rule,
@@ -1150,7 +1159,7 @@ async fn proxy_handler(
             ),
             None => (
                 config.fallback.url.clone(),
-                0,
+                ResolvedTimeoutPolicy::resolve(&config.timeouts, None, None, None),
                 ProxyMetricLabels::fallback(listen_label),
                 Default::default(),
                 Vec::new(),
@@ -1165,7 +1174,7 @@ async fn proxy_handler(
             clients,
             access_logger,
             target_base,
-            rule_request_timeout,
+            timeout_policy,
             metric_labels,
             header_policy,
             path_actions,
@@ -1190,7 +1199,7 @@ async fn proxy_handler(
         ProxyRequestContext {
             access: ProxyAccessLogContext { source },
             metric_labels,
-            request_timeout_override: rule_request_timeout,
+            timeout_policy,
             header_policy,
             path_actions,
             limit_state: Some(limit_state),
@@ -1205,6 +1214,45 @@ async fn proxy_handler(
         },
     )
     .await
+}
+
+fn resolve_proxy_timeout_policy(
+    config: &AppConfig,
+    rule: &Rule,
+    target_url: &str,
+) -> ResolvedTimeoutPolicy {
+    let upstream = config.upstreams.get(&rule.upstream);
+    let target = upstream.and_then(|upstream| {
+        upstream
+            .targets
+            .iter()
+            .find(|target| target.url == target_url)
+    });
+    let mut rule_timeouts = rule.timeouts.clone();
+    if rule_timeouts.server_timeout_seconds.is_none() && rule.request_timeout > 0 {
+        rule_timeouts.server_timeout_seconds = Some(rule.request_timeout);
+    }
+
+    ResolvedTimeoutPolicy::resolve(
+        &config.timeouts,
+        Some(&rule_timeouts),
+        upstream.map(|upstream| &upstream.timeouts),
+        target.map(|target| &target.timeouts),
+    )
+}
+
+fn limit_policy_with_resolved_queue_timeout(
+    mut policy: LimitPolicy,
+    timeout_policy: &ResolvedTimeoutPolicy,
+) -> LimitPolicy {
+    if policy.queue_timeout_ms.is_none() {
+        policy.queue_timeout_ms = Some(duration_millis_u64(timeout_policy.queue_timeout));
+    }
+    policy
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub fn routes(state: AppState) -> Router {

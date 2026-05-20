@@ -196,7 +196,10 @@ mod tests {
             ..Default::default()
         };
 
-        let first = limits.check(&ctx(), &policy, &HeaderMap::new()).await.unwrap();
+        let first = limits
+            .check(&ctx(), &policy, &HeaderMap::new())
+            .await
+            .unwrap();
         let second_ctx = ctx();
         let second_headers = HeaderMap::new();
         let pending = limits.check(&second_ctx, &policy, &second_headers);
@@ -220,10 +223,32 @@ mod tests {
             ..Default::default()
         };
 
-        let _first = limits.check(&ctx(), &policy, &HeaderMap::new()).await.unwrap();
+        let _first = limits
+            .check(&ctx(), &policy, &HeaderMap::new())
+            .await
+            .unwrap();
         let second = limits.check(&ctx(), &policy, &HeaderMap::new()).await;
 
         assert_eq!(second.unwrap_err(), LimitRejection::QueueTimeout);
+    }
+
+    #[tokio::test]
+    async fn rule_maxconn_zero_queue_rejects_second_request() {
+        let limits = LimitState::default();
+        let policy = LimitPolicy {
+            max_connections: Some(1),
+            queue_timeout_ms: Some(0),
+            ..Default::default()
+        };
+
+        let first = limits
+            .check(&ctx(), &policy, &HeaderMap::new())
+            .await
+            .unwrap();
+        let second = limits.check(&ctx(), &policy, &HeaderMap::new()).await;
+
+        assert!(matches!(second, Err(LimitRejection::QueueTimeout)));
+        drop(first);
     }
 
     #[tokio::test]

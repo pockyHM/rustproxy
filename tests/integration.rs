@@ -4,6 +4,7 @@ use http::Request;
 use rustproxy::{
     config::yaml::{AppConfig, Fallback},
     models::{ConditionExpr, ConditionType, Operator, Rule, Target, Upstream},
+    observability::metrics::ProxyMetrics,
     proxy::{
         balancer::{BalanceContext, Balancer},
         matcher::Matcher,
@@ -129,4 +130,33 @@ async fn test_fallback_when_header_does_not_match() {
 
     assert!(matcher.match_request(&request, None).is_none());
     assert_eq!(selected_target, "http://fallback.internal:8080");
+}
+
+#[test]
+fn proxy_metrics_export_target_limit_and_retry_metrics() {
+    let metrics = ProxyMetrics::new().unwrap();
+
+    metrics
+        .target_active_connections
+        .with_label_values(&["canary", "http://canary.internal:8080"])
+        .set(1.0);
+    metrics
+        .target_queue_length
+        .with_label_values(&["canary", "http://canary.internal:8080"])
+        .set(0.0);
+    metrics
+        .target_connection_rejections
+        .with_label_values(&["canary", "http://canary.internal:8080", "queue_timeout"])
+        .inc();
+    metrics
+        .upstream_retries
+        .with_label_values(&["canary", "http://canary.internal:8080", "timeout"])
+        .inc();
+
+    let output = metrics.gather().unwrap();
+
+    assert!(output.contains("rustproxy_proxy_target_active_connections"));
+    assert!(output.contains("rustproxy_proxy_target_queue_length"));
+    assert!(output.contains("rustproxy_proxy_target_connection_rejections_total"));
+    assert!(output.contains("rustproxy_proxy_upstream_retries_total"));
 }
