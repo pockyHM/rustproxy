@@ -201,12 +201,12 @@ pub async fn put_config(
     State(state): State<AppState>,
     Json(mut new_config): Json<AppConfig>,
 ) -> Result<Json<ApiResponse<AppConfig>>, Response> {
-    new_config.sync_timeouts_from_legacy_aliases();
+    let old_config = state.config.read().await.clone();
+    new_config.reconcile_timeout_aliases_for_update(&old_config);
     new_config.normalize_rules();
     super::routes::validate_tls_config(&new_config)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let old_config = state.config.read().await.clone();
     state
         .sync_proxy_listeners(&new_config)
         .await

@@ -272,6 +272,25 @@ impl AppConfig {
         self.timeouts.http_keepalive_timeout_seconds = self.pool_idle_timeout;
     }
 
+    pub fn reconcile_timeout_aliases_for_update(&mut self, previous: &AppConfig) {
+        let legacy_aliases_changed = self.connect_timeout != previous.connect_timeout
+            || self.request_timeout != previous.request_timeout
+            || self.pool_idle_timeout != previous.pool_idle_timeout;
+        let timeout_alias_fields_changed = self.timeouts.connect_timeout_seconds
+            != previous.timeouts.connect_timeout_seconds
+            || self.timeouts.server_timeout_seconds != previous.timeouts.server_timeout_seconds
+            || self.timeouts.http_request_timeout_seconds
+                != previous.timeouts.http_request_timeout_seconds
+            || self.timeouts.http_keepalive_timeout_seconds
+                != previous.timeouts.http_keepalive_timeout_seconds;
+
+        if legacy_aliases_changed && !timeout_alias_fields_changed {
+            self.sync_timeouts_from_legacy_aliases();
+        } else {
+            self.normalize_timeout_aliases();
+        }
+    }
+
     pub fn normalize_rules(&mut self) {
         if self.proxy_listen.trim().is_empty() {
             self.proxy_listen = default_proxy_listen();
@@ -477,6 +496,45 @@ fallback: { url: "404" }
         assert_eq!(config.timeouts.server_timeout_seconds, 17);
         assert_eq!(config.timeouts.http_request_timeout_seconds, 17);
         assert_eq!(config.timeouts.http_keepalive_timeout_seconds, 19);
+    }
+
+    #[test]
+    fn config_update_reconciles_legacy_alias_edits_without_losing_policy_edits() {
+        let previous: AppConfig = serde_yaml::from_str(
+            r#"
+connect_timeout: 3
+request_timeout: 7
+pool_idle_timeout: 11
+timeouts:
+  connect_timeout_seconds: 3
+  server_timeout_seconds: 7
+  http_request_timeout_seconds: 7
+  http_keepalive_timeout_seconds: 11
+fallback: { url: "404" }
+"#,
+        )
+        .unwrap();
+
+        let mut legacy_edit = previous.clone();
+        legacy_edit.connect_timeout = 13;
+        legacy_edit.request_timeout = 17;
+        legacy_edit.pool_idle_timeout = 19;
+        legacy_edit.reconcile_timeout_aliases_for_update(&previous);
+        assert_eq!(legacy_edit.timeouts.connect_timeout_seconds, 13);
+        assert_eq!(legacy_edit.timeouts.server_timeout_seconds, 17);
+        assert_eq!(legacy_edit.timeouts.http_request_timeout_seconds, 17);
+        assert_eq!(legacy_edit.timeouts.http_keepalive_timeout_seconds, 19);
+
+        let mut policy_edit = previous.clone();
+        policy_edit.timeouts.connect_timeout_seconds = 23;
+        policy_edit.timeouts.server_timeout_seconds = 29;
+        policy_edit.timeouts.http_request_timeout_seconds = 31;
+        policy_edit.timeouts.http_keepalive_timeout_seconds = 37;
+        policy_edit.reconcile_timeout_aliases_for_update(&previous);
+        assert_eq!(policy_edit.connect_timeout, 23);
+        assert_eq!(policy_edit.request_timeout, 29);
+        assert_eq!(policy_edit.pool_idle_timeout, 37);
+        assert_eq!(policy_edit.timeouts.http_request_timeout_seconds, 31);
     }
 
     #[test]
