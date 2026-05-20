@@ -139,6 +139,21 @@ type UpstreamHealth = {
   unhealthy: number;
   targets: { url: string; healthy: boolean }[];
 };
+type RuntimeTargetMode = 'enabled' | 'disabled' | 'drain';
+type RuntimeTarget = {
+  url: string;
+  configured_weight: number;
+  effective_weight: number;
+  weight_override: number | null;
+  mode: RuntimeTargetMode;
+  active_connections: number;
+  healthy: boolean;
+  last_error: string | null;
+};
+type RuntimeUpstream = {
+  name: string;
+  targets: RuntimeTarget[];
+};
 type PrometheusRangeResult = {
   status?: string;
   data?: {
@@ -243,6 +258,10 @@ const T: Record<string, [string, string]> = {
   'action.create': ['Create', '创建'],
   'action.edit': ['Edit', '编辑'],
   'action.del': ['Del', '删除'],
+  'action.enable': ['Enable', '启用'],
+  'action.disable': ['Disable', '禁用'],
+  'action.drain': ['Drain', '排空'],
+  'action.apply': ['Apply', '应用'],
   'action.addTarget': ['Add Target', '添加目标'],
   'metric.requests': ['PROXY REQUESTS', '代理请求数'],
   'metric.latency': ['AVG LATENCY', '平均延迟'],
@@ -308,6 +327,23 @@ const T: Record<string, [string, string]> = {
   'table.off': ['Off', '关闭'],
   'table.noRules': ['No rules configured', '暂无路由规则'],
   'table.noUpstreams': ['No upstreams configured', '暂无上游服务'],
+  'table.mode': ['Mode', '模式'],
+  'table.health': ['Health', '健康'],
+  'table.active': ['Active', '活跃'],
+  'table.configuredWeight': ['Configured', '配置权重'],
+  'table.effectiveWeight': ['Effective', '生效权重'],
+  'table.overrideWeight': ['Override', '覆盖权重'],
+  'table.lastError': ['Last error', '最近错误'],
+  'runtime.title': ['Runtime Target Controls', '运行时目标控制'],
+  'runtime.sub': ['Ephemeral target mode and weight overrides; config is not rewritten.', '临时调整目标模式和权重覆盖，不会写回配置。'],
+  'runtime.empty': ['No runtime targets available', '暂无运行时目标'],
+  'runtime.enabled': ['Enabled', '已启用'],
+  'runtime.disabled': ['Disabled', '已禁用'],
+  'runtime.drain': ['Drain', '排空'],
+  'runtime.healthy': ['Healthy', '健康'],
+  'runtime.unhealthy': ['Unhealthy', '异常'],
+  'runtime.overrideNone': ['none', '无'],
+  'notice.runtimeUpdated': ['Runtime target updated', '运行时目标已更新'],
   'inspector.status': ['Runtime status', '运行时状态'],
   'inspector.proxyOk': ['Proxy listener forwarding traffic', '代理监听器正在转发流量'],
   'inspector.apiOk': ['Admin API serving /admin/ and /metrics', '管理 API 提供 /admin/ 和 /metrics'],
@@ -446,6 +482,7 @@ const T: Record<string, [string, string]> = {
   'notice.adminCreated': ['Admin created — please sign in', '管理员已创建 — 请登录'],
   'notice.passwordMismatch': ['Passwords do not match', '密码不匹配'],
   'notice.connecting': ['connecting...', '连接中...'],
+  'notice.loading': ['Loading', '加载中'],
   'notice.sessionExpired': ['Session expired, please sign in again.', '登录已过期，请重新登录。'],
 };
 
@@ -1994,8 +2031,24 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
   const [editing, setEditing] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [upstreamHealth, setUpstreamHealth] = useState<UpstreamHealth[]>([]);
+  const [runtimeUpstreams, setRuntimeUpstreams] = useState<RuntimeUpstream[]>([]);
+  const [runtimeLoading, setRuntimeLoading] = useState(false);
+  const [runtimeError, setRuntimeError] = useState('');
+  const [runtimeAction, setRuntimeAction] = useState<string | null>(null);
+  const [weightDrafts, setWeightDrafts] = useState<Record<string, string>>({});
   const upstreams = Object.values(config.upstreams ?? {});
   const upstreamHealthByName = useMemo(() => Object.fromEntries(upstreamHealth.map((item) => [item.upstream, item])), [upstreamHealth]);
+  const loadRuntime = useCallback(async () => {
+    setRuntimeLoading(true);
+    setRuntimeError('');
+    try {
+      setRuntimeUpstreams(await api<RuntimeUpstream[]>('/api/runtime/upstreams', { token }));
+    } catch (error) {
+      setRuntimeError(errorMessage(error));
+    } finally {
+      setRuntimeLoading(false);
+    }
+  }, [token]);
 
   useEffect(() => {
     let active = true;
@@ -2007,6 +2060,36 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
     const timer = window.setInterval(loadHealth, 5000);
     return () => { active = false; window.clearInterval(timer); };
   }, [token]);
+
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      setRuntimeLoading(true);
+      setRuntimeError('');
+      try {
+        const runtime = await api<RuntimeUpstream[]>('/api/runtime/upstreams', { token });
+        if (active) setRuntimeUpstreams(runtime);
+      } catch (error) {
+        if (active) setRuntimeError(errorMessage(error));
+      } finally {
+        if (active) setRuntimeLoading(false);
+      }
+    }
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token]);
+
+  useEffect(() => {
+    setWeightDrafts((current) => {
+      const next: Record<string, string> = {};
+      runtimeUpstreams.forEach((upstream) => upstream.targets.forEach((target) => {
+        const key = runtimeTargetKey(upstream.name, target.url);
+        next[key] = current[key] ?? String(target.effective_weight);
+      }));
+      return next;
+    });
+  }, [runtimeUpstreams]);
 
   function openCreate() { setEditing(null); setDraft(newUpstream()); setShowModal(true); }
   function openEdit(u: Upstream) { setEditing(u.name); setDraft(normalizeUpstream(structuredClone(u))); setShowModal(true); }
@@ -2031,7 +2114,40 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
     setNotice({ type: 'success', message: t('notice.upstreamDeleted') });
   }
 
-  async function handleReload() { await refreshConfig(token, setConfig, setNotice); setNotice({ type: 'success', message: t('notice.configReloaded') }); }
+  async function handleReload() {
+    await Promise.all([refreshConfig(token, setConfig, setNotice), loadRuntime()]);
+    setNotice({ type: 'success', message: t('notice.configReloaded') });
+  }
+
+  async function applyRuntimeMode(upstream: string, target: RuntimeTarget, mode: RuntimeTargetMode) {
+    const actionKey = runtimeActionKey(upstream, target.url, mode);
+    setRuntimeAction(actionKey);
+    try {
+      await runtimeTargetOperation(token, upstream, mode, target.url);
+      await loadRuntime();
+      setNotice({ type: 'success', message: t('notice.runtimeUpdated') });
+    } catch (error) {
+      setNotice({ type: 'error', message: errorMessage(error) });
+    } finally {
+      setRuntimeAction(null);
+    }
+  }
+
+  async function applyRuntimeWeight(upstream: string, target: RuntimeTarget) {
+    const key = runtimeTargetKey(upstream, target.url);
+    const weight = clampInt(weightDrafts[key] ?? String(target.effective_weight), 0, 1_000_000, target.effective_weight);
+    const actionKey = runtimeActionKey(upstream, target.url, 'weight');
+    setRuntimeAction(actionKey);
+    try {
+      await runtimeTargetWeight(token, upstream, target.url, weight);
+      await loadRuntime();
+      setNotice({ type: 'success', message: t('notice.runtimeUpdated') });
+    } catch (error) {
+      setNotice({ type: 'error', message: errorMessage(error) });
+    } finally {
+      setRuntimeAction(null);
+    }
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, gap: 16 }}>
@@ -2058,6 +2174,16 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
           ))}
         </tbody></table>
       </div></div>
+      <RuntimeTargetsPanel
+        runtimeUpstreams={runtimeUpstreams}
+        loading={runtimeLoading}
+        error={runtimeError}
+        action={runtimeAction}
+        weightDrafts={weightDrafts}
+        setWeightDrafts={setWeightDrafts}
+        onMode={applyRuntimeMode}
+        onWeight={applyRuntimeWeight}
+      />
       {showModal && (
         <Modal title={editing ? t('modal.editUpstream') : t('modal.newUpstream')} onClose={() => setShowModal(false)}>
           <form onSubmit={submit} className="config-form">
@@ -2137,6 +2263,104 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
           </form>
         </Modal>
       )}
+    </div>
+  );
+}
+
+function RuntimeTargetsPanel({
+  runtimeUpstreams,
+  loading,
+  error,
+  action,
+  weightDrafts,
+  setWeightDrafts,
+  onMode,
+  onWeight,
+}: {
+  runtimeUpstreams: RuntimeUpstream[];
+  loading: boolean;
+  error: string;
+  action: string | null;
+  weightDrafts: Record<string, string>;
+  setWeightDrafts: (drafts: Record<string, string> | ((current: Record<string, string>) => Record<string, string>)) => void;
+  onMode: (upstream: string, target: RuntimeTarget, mode: RuntimeTargetMode) => void;
+  onWeight: (upstream: string, target: RuntimeTarget) => void;
+}) {
+  const { t } = useI18n();
+  const rows = runtimeUpstreams.flatMap((upstream) => upstream.targets.map((target) => ({ upstream: upstream.name, target })));
+  return (
+    <div className="table-card runtime-table-card">
+      <div className="runtime-panel-head">
+        <div>
+          <h3 className="card-title-sm">{t('runtime.title')}</h3>
+          <p className="card-desc">{t('runtime.sub')}</p>
+        </div>
+        <span className={loading ? 'runtime-refresh is-loading' : 'runtime-refresh'}>
+          <Icon name="sync" size={15} />{loading ? t('notice.loading') : t('metric.live')}
+        </span>
+      </div>
+      {error && <div className="runtime-error"><Icon name="error" size={16} />{error}</div>}
+      <div className="table-wrap runtime-table-wrap">
+        <table><thead><tr>
+          <th>{t('table.upstream')}</th>
+          <th>{t('table.targets')}</th>
+          <th>{t('table.mode')}</th>
+          <th>{t('table.health')}</th>
+          <th>{t('table.active')}</th>
+          <th>{t('table.configuredWeight')}</th>
+          <th>{t('table.effectiveWeight')}</th>
+          <th>{t('table.overrideWeight')}</th>
+          <th>{t('table.lastError')}</th>
+          <th>{t('table.actions')}</th>
+        </tr></thead><tbody>
+          {rows.length === 0 ? (
+            <tr><td colSpan={10} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 32 }}>{t('runtime.empty')}</td></tr>
+          ) : rows.map(({ upstream, target }) => {
+            const key = runtimeTargetKey(upstream, target.url);
+            const isPending = Boolean(action?.startsWith(`${key}\u0000`));
+            return (
+              <tr key={key}>
+                <td className="td-upstream">{upstream}</td>
+                <td className="td-mono runtime-target-url" title={target.url}>{target.url}</td>
+                <td><span className={`runtime-mode-badge mode-${target.mode}`}>{runtimeModeLabel(target.mode, t)}</span></td>
+                <td><span className={target.healthy ? 'runtime-health is-healthy' : 'runtime-health is-unhealthy'}><span />{target.healthy ? t('runtime.healthy') : t('runtime.unhealthy')}</span></td>
+                <td className="td-mono">{formatNumber(target.active_connections)}</td>
+                <td className="td-mono">{formatNumber(target.configured_weight)}</td>
+                <td className="td-mono">{formatNumber(target.effective_weight)}</td>
+                <td>
+                  <div className="runtime-weight-control">
+                    <input
+                      type="number"
+                      min="0"
+                      value={weightDrafts[key] ?? String(target.effective_weight)}
+                      onChange={(event) => setWeightDrafts((current) => ({ ...current, [key]: event.target.value }))}
+                      aria-label={`${t('table.overrideWeight')} ${target.url}`}
+                    />
+                    <button className="btn btn-secondary btn-sm" type="button" disabled={isPending} onClick={() => onWeight(upstream, target)} title={t('action.apply')}>
+                      <Icon name="check" size={15} />
+                    </button>
+                  </div>
+                  <span className="runtime-override-note">{target.weight_override === null ? t('runtime.overrideNone') : formatNumber(target.weight_override)}</span>
+                </td>
+                <td className="td-mono runtime-last-error" title={target.last_error ?? ''}>{target.last_error ?? '—'}</td>
+                <td>
+                  <div className="runtime-actions">
+                    <button className="btn btn-ghost btn-sm" type="button" disabled={isPending || target.mode === 'enabled'} onClick={() => onMode(upstream, target, 'enabled')} title={t('action.enable')}>
+                      <Icon name="play_arrow" size={15} /><span>{t('action.enable')}</span>
+                    </button>
+                    <button className="btn btn-ghost btn-sm" type="button" disabled={isPending || target.mode === 'drain'} onClick={() => onMode(upstream, target, 'drain')} title={t('action.drain')}>
+                      <Icon name="pause_circle" size={15} /><span>{t('action.drain')}</span>
+                    </button>
+                    <button className="btn btn-danger btn-sm" type="button" disabled={isPending || target.mode === 'disabled'} onClick={() => onMode(upstream, target, 'disabled')} title={t('action.disable')}>
+                      <Icon name="block" size={15} /><span>{t('action.disable')}</span>
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody></table>
+      </div>
     </div>
   );
 }
@@ -2524,8 +2748,39 @@ async function prometheusRange(token: string, query: string, start: number, end:
   return api<PrometheusRangeResult>(`/api/monitoring/query-range?${params}`, { token });
 }
 
+async function runtimeTargetOperation(token: string, upstream: string, mode: RuntimeTargetMode, target: string): Promise<RuntimeTarget> {
+  const action = mode === 'enabled' ? 'enable' : mode === 'disabled' ? 'disable' : 'drain';
+  return api<RuntimeTarget>(`/api/runtime/upstreams/${encodeURIComponent(upstream)}/targets/${action}`, {
+    method: 'POST',
+    token,
+    body: { target },
+  });
+}
+
+async function runtimeTargetWeight(token: string, upstream: string, target: string, weight: number): Promise<RuntimeTarget> {
+  return api<RuntimeTarget>(`/api/runtime/upstreams/${encodeURIComponent(upstream)}/targets/weight`, {
+    method: 'POST',
+    token,
+    body: { target, weight },
+  });
+}
+
 function firstSeries(result: PrometheusRangeResult): ChartPoint[] {
   return result.data?.result?.[0]?.values?.map(([t, v]) => ({ t, v: Number(v) })).filter((point) => Number.isFinite(point.v)) ?? [];
+}
+
+function runtimeTargetKey(upstream: string, target: string): string {
+  return `${upstream}\u0000${target}`;
+}
+
+function runtimeActionKey(upstream: string, target: string, action: string): string {
+  return `${runtimeTargetKey(upstream, target)}\u0000${action}`;
+}
+
+function runtimeModeLabel(mode: RuntimeTargetMode, t: (key: string) => string): string {
+  if (mode === 'disabled') return t('runtime.disabled');
+  if (mode === 'drain') return t('runtime.drain');
+  return t('runtime.enabled');
 }
 
 function parsePrometheus(text: string): PrometheusMetric[] {
