@@ -3,8 +3,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::http::Uri;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore};
+
+pub mod sni;
 
 use crate::config::yaml::{AppConfig, TcpListenerConfig, TcpListenerMode};
 use crate::observability::metrics::ProxyMetrics;
@@ -74,15 +77,46 @@ async fn handle_tcp_connection(
     metrics: Arc<ProxyMetrics>,
     remote_ip: String,
 ) -> anyhow::Result<()> {
-    let upstream = match config.mode {
-        TcpListenerMode::Tcp => config.upstream.as_deref(),
-        // Task 7 adds ClientHello SNI routing. Until then a default upstream can still work.
-        TcpListenerMode::TlsPassthrough => config.upstream.as_deref(),
-    }
-    .filter(|upstream| !upstream.trim().is_empty())
-    .context("TCP listener has no upstream")?;
-
     let runtime = runtime.snapshot();
+    let (upstream, prefix) = match config.mode {
+        TcpListenerMode::Tcp => (
+            config
+                .upstream
+                .as_deref()
+                .filter(|upstream| !upstream.trim().is_empty())
+                .context("TCP listener has no upstream")?,
+            Vec::new(),
+        ),
+        TcpListenerMode::TlsPassthrough => {
+            let client_timeout =
+                ResolvedTimeoutPolicy::resolve(&runtime.config.timeouts, None, None, None)
+                    .client_timeout;
+            let (prefix, sni) = timeout_optional(
+                client_timeout,
+                sni::read_client_hello_prefix(&mut downstream),
+            )
+            .await
+            .context("TLS ClientHello read timed out")??;
+            let route = sni
+                .as_deref()
+                .and_then(|host| config.sni_routes.get(host).map(String::as_str))
+                .or_else(|| {
+                    config
+                        .upstream
+                        .as_deref()
+                        .filter(|upstream| !upstream.trim().is_empty())
+                });
+            let Some(upstream) = route else {
+                metrics
+                    .target_connection_rejections
+                    .with_label_values(&["-", "-", "no_sni_route"])
+                    .inc();
+                anyhow::bail!("no TLS passthrough route for SNI {:?}", sni);
+            };
+            (upstream, prefix)
+        }
+    };
+
     let selected = runtime
         .balancer
         .select(
@@ -103,6 +137,9 @@ async fn handle_tcp_connection(
         .await
         .context("TCP upstream connect timed out")?
         .with_context(|| format!("failed to connect TCP upstream {target_addr}"))?;
+    if !prefix.is_empty() {
+        upstream_stream.write_all(&prefix).await?;
+    }
 
     let started = Instant::now();
     metrics

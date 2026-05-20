@@ -133,11 +133,19 @@ fn tcp_runtime_snapshot(
     upstream_addr: std::net::SocketAddr,
     listener_config: TcpListenerConfig,
 ) -> TcpRuntimeSnapshot {
+    tcp_runtime_snapshot_named("echo", upstream_addr, listener_config)
+}
+
+fn tcp_runtime_snapshot_named(
+    upstream_name: &str,
+    upstream_addr: std::net::SocketAddr,
+    listener_config: TcpListenerConfig,
+) -> TcpRuntimeSnapshot {
     let mut upstreams = HashMap::new();
     upstreams.insert(
-        "echo".to_string(),
+        upstream_name.to_string(),
         Upstream {
-            name: "echo".to_string(),
+            name: upstream_name.to_string(),
             skip_ssl: false,
             websocket: false,
             targets: vec![Target {
@@ -159,6 +167,65 @@ fn tcp_runtime_snapshot(
             ..build_config()
         }),
     }
+}
+
+async fn spawn_tls_passthrough_upstream(
+    response: [u8; 4],
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut header = [0_u8; 5];
+        stream.read_exact(&mut header).await.unwrap();
+        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        let mut prefix = header.to_vec();
+        let start = prefix.len();
+        prefix.resize(start + record_len, 0);
+        stream.read_exact(&mut prefix[start..]).await.unwrap();
+        stream.write_all(&response).await.unwrap();
+        prefix
+    });
+    (addr, task)
+}
+
+fn client_hello(host: &str) -> Vec<u8> {
+    let host = host.as_bytes();
+    let mut server_name = Vec::new();
+    server_name.extend_from_slice(&((host.len() + 3) as u16).to_be_bytes());
+    server_name.push(0);
+    server_name.extend_from_slice(&(host.len() as u16).to_be_bytes());
+    server_name.extend_from_slice(host);
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0_u16.to_be_bytes());
+    extensions.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&server_name);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0_u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&2_u16.to_be_bytes());
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(1);
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::new();
+    handshake.push(1);
+    handshake.push(((body.len() >> 16) & 0xff) as u8);
+    handshake.push(((body.len() >> 8) & 0xff) as u8);
+    handshake.push((body.len() & 0xff) as u8);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.push(22);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
 }
 
 #[tokio::test]
@@ -330,4 +397,132 @@ async fn test_tcp_listener_uses_latest_runtime_snapshot() {
     let _ = shutdown_tx.send(());
     proxy_task.await.unwrap().unwrap();
     second_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_tls_passthrough_routes_by_sni() {
+    let (app_upstream, app_task) = spawn_tls_passthrough_upstream(*b"app!").await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let listener_config = TcpListenerConfig {
+        name: "tls-app".to_string(),
+        listen: proxy_addr.to_string(),
+        mode: TcpListenerMode::TlsPassthrough,
+        upstream: None,
+        sni_routes: {
+            let mut routes = HashMap::new();
+            routes.insert("app.example.com".to_string(), "app".to_string());
+            routes
+        },
+        maxconn: None,
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_task = tokio::spawn(run_tcp_listener(
+        proxy_listener,
+        listener_config.clone(),
+        Arc::new(StaticTcpRuntime {
+            snapshot: tcp_runtime_snapshot_named("app", app_upstream, listener_config),
+        }),
+        Arc::new(ProxyMetrics::new().unwrap()),
+        DrainController::default(),
+        shutdown_rx,
+    ));
+
+    let hello = client_hello("app.example.com");
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(&hello).await.unwrap();
+    let mut response = [0_u8; 4];
+    client.read_exact(&mut response).await.unwrap();
+
+    assert_eq!(&response, b"app!");
+    assert_eq!(app_task.await.unwrap(), hello);
+
+    let _ = shutdown_tx.send(());
+    proxy_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn test_tls_passthrough_uses_default_upstream_when_sni_misses() {
+    let (default_upstream, default_task) = spawn_tls_passthrough_upstream(*b"def!").await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let listener_config = TcpListenerConfig {
+        name: "tls-default".to_string(),
+        listen: proxy_addr.to_string(),
+        mode: TcpListenerMode::TlsPassthrough,
+        upstream: Some("default".to_string()),
+        sni_routes: HashMap::new(),
+        maxconn: None,
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_task = tokio::spawn(run_tcp_listener(
+        proxy_listener,
+        listener_config.clone(),
+        Arc::new(StaticTcpRuntime {
+            snapshot: tcp_runtime_snapshot_named("default", default_upstream, listener_config),
+        }),
+        Arc::new(ProxyMetrics::new().unwrap()),
+        DrainController::default(),
+        shutdown_rx,
+    ));
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(&client_hello("missing.example.com"))
+        .await
+        .unwrap();
+    let mut response = [0_u8; 4];
+    client.read_exact(&mut response).await.unwrap();
+
+    assert_eq!(&response, b"def!");
+
+    let _ = shutdown_tx.send(());
+    proxy_task.await.unwrap().unwrap();
+    default_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_tls_passthrough_records_no_sni_route_rejection() {
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let listener_config = TcpListenerConfig {
+        name: "tls-strict".to_string(),
+        listen: proxy_addr.to_string(),
+        mode: TcpListenerMode::TlsPassthrough,
+        upstream: None,
+        sni_routes: {
+            let mut routes = HashMap::new();
+            routes.insert("app.example.com".to_string(), "app".to_string());
+            routes
+        },
+        maxconn: None,
+    };
+    let metrics = Arc::new(ProxyMetrics::new().unwrap());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_task = tokio::spawn(run_tcp_listener(
+        proxy_listener,
+        listener_config.clone(),
+        Arc::new(StaticTcpRuntime {
+            snapshot: tcp_runtime_snapshot_named("app", proxy_addr, listener_config),
+        }),
+        Arc::clone(&metrics),
+        DrainController::default(),
+        shutdown_rx,
+    ));
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(&client_hello("missing.example.com"))
+        .await
+        .unwrap();
+    let mut response = [0_u8; 1];
+    assert_eq!(client.read(&mut response).await.unwrap(), 0);
+
+    let output = metrics.gather().unwrap();
+    assert!(output.contains("reason=\"no_sni_route\""));
+
+    let _ = shutdown_tx.send(());
+    proxy_task.await.unwrap().unwrap();
 }
