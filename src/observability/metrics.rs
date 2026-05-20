@@ -21,6 +21,9 @@ pub struct ProxyMetrics {
     pub target_queue_length: prometheus::GaugeVec,
     pub target_connection_rejections: CounterVec,
     pub upstream_retries: CounterVec,
+    pub tcp_connections_total: CounterVec,
+    pub tcp_connection_duration: HistogramVec,
+    pub tcp_bytes_total: CounterVec,
     pub config_reloads: Counter,
 }
 
@@ -89,6 +92,34 @@ impl ProxyMetrics {
         )?;
         registry.register(Box::new(upstream_retries.clone()))?;
 
+        let tcp_connections_total = CounterVec::new(
+            opts!(
+                "rustproxy_tcp_connections_total",
+                "Total number of TCP proxy connections."
+            ),
+            &["listen", "upstream", "target"],
+        )?;
+        registry.register(Box::new(tcp_connections_total.clone()))?;
+
+        let tcp_connection_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "rustproxy_tcp_connection_duration_seconds",
+                "TCP proxy connection duration in seconds.",
+            )
+            .buckets(REQUEST_DURATION_BUCKETS_SECONDS.to_vec()),
+            &["listen", "upstream", "target"],
+        )?;
+        registry.register(Box::new(tcp_connection_duration.clone()))?;
+
+        let tcp_bytes_total = CounterVec::new(
+            opts!(
+                "rustproxy_tcp_bytes_total",
+                "Total number of bytes proxied by TCP listeners."
+            ),
+            &["listen", "upstream", "target", "direction"],
+        )?;
+        registry.register(Box::new(tcp_bytes_total.clone()))?;
+
         let config_reloads = Counter::with_opts(opts!(
             "rustproxy_proxy_config_reloads_total",
             "Total number of proxy configuration reloads."
@@ -106,6 +137,9 @@ impl ProxyMetrics {
             target_queue_length,
             target_connection_rejections,
             upstream_retries,
+            tcp_connections_total,
+            tcp_connection_duration,
+            tcp_bytes_total,
             config_reloads,
         })
     }
@@ -283,6 +317,23 @@ mod tests {
             .upstream_retries
             .with_label_values(&["users", "http://users.internal:8080", "timeout"])
             .inc();
+        metrics
+            .tcp_connections_total
+            .with_label_values(&["127.0.0.1:6379", "users", "http://users.internal:8080"])
+            .inc();
+        metrics
+            .tcp_connection_duration
+            .with_label_values(&["127.0.0.1:6379", "users", "http://users.internal:8080"])
+            .observe(0.1);
+        metrics
+            .tcp_bytes_total
+            .with_label_values(&[
+                "127.0.0.1:6379",
+                "users",
+                "http://users.internal:8080",
+                "client_to_upstream",
+            ])
+            .inc();
 
         let output = metrics.gather().unwrap();
 
@@ -290,6 +341,9 @@ mod tests {
         assert!(output.contains("rustproxy_proxy_target_queue_length"));
         assert!(output.contains("rustproxy_proxy_target_connection_rejections_total"));
         assert!(output.contains("rustproxy_proxy_upstream_retries_total"));
+        assert!(output.contains("rustproxy_tcp_connections_total"));
+        assert!(output.contains("rustproxy_tcp_connection_duration_seconds"));
+        assert!(output.contains("rustproxy_tcp_bytes_total"));
     }
 
     #[test]

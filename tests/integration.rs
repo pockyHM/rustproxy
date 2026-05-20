@@ -1,14 +1,21 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use http::Request;
 use rustproxy::{
-    config::yaml::{AppConfig, Fallback},
+    config::yaml::{AppConfig, Fallback, TcpListenerConfig, TcpListenerMode},
     models::{ConditionExpr, ConditionType, Operator, Rule, Target, Upstream},
     observability::metrics::ProxyMetrics,
     proxy::{
         balancer::{BalanceContext, Balancer},
         matcher::Matcher,
     },
+    runtime::drain::DrainController,
+    tcp::run_tcp_listener,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
 };
 
 fn build_config() -> AppConfig {
@@ -160,4 +167,71 @@ fn proxy_metrics_export_target_limit_and_retry_metrics() {
     assert!(output.contains("rustproxy_proxy_target_queue_length"));
     assert!(output.contains("rustproxy_proxy_target_connection_rejections_total"));
     assert!(output.contains("rustproxy_proxy_upstream_retries_total"));
+}
+
+#[tokio::test]
+async fn test_tcp_listener_forwards_bytes() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.unwrap();
+        let mut buf = [0_u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(&buf).await.unwrap();
+    });
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let listener_config = TcpListenerConfig {
+        name: "echo".to_string(),
+        listen: proxy_addr.to_string(),
+        mode: TcpListenerMode::Tcp,
+        upstream: Some("echo".to_string()),
+        sni_routes: HashMap::new(),
+        maxconn: None,
+    };
+    let mut upstreams = HashMap::new();
+    upstreams.insert(
+        "echo".to_string(),
+        Upstream {
+            name: "echo".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![Target {
+                url: format!("tcp://{upstream_addr}"),
+                weight: 100,
+                timeouts: Default::default(),
+            }],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+        },
+    );
+    let app_config = AppConfig {
+        upstreams: upstreams.clone(),
+        tcp_listeners: vec![listener_config.clone()],
+        ..build_config()
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let proxy_task = tokio::spawn(run_tcp_listener(
+        proxy_listener,
+        listener_config,
+        Arc::new(Balancer::new(upstreams)),
+        Arc::new(app_config),
+        Arc::new(ProxyMetrics::new().unwrap()),
+        DrainController::default(),
+        shutdown_rx,
+    ));
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut response = [0_u8; 4];
+    client.read_exact(&mut response).await.unwrap();
+
+    assert_eq!(&response, b"ping");
+
+    let _ = shutdown_tx.send(());
+    proxy_task.await.unwrap().unwrap();
+    upstream_task.await.unwrap();
 }

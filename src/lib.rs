@@ -7,6 +7,7 @@ pub mod models;
 pub mod observability;
 pub mod proxy;
 pub mod runtime;
+pub mod tcp;
 pub mod version;
 
 pub fn install_rustls_crypto_provider() {

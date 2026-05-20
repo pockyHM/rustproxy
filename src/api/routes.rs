@@ -31,7 +31,7 @@ use crate::models::{
 };
 use crate::{
     auth::middleware::{self as auth_mw},
-    config::yaml::AppConfig,
+    config::yaml::{AppConfig, TcpListenerConfig},
     db::Database,
     observability::{access_log::AccessLogger, metrics::ProxyMetrics},
     proxy::balancer::{BalanceContext, Balancer},
@@ -46,6 +46,7 @@ use crate::{
     runtime::drain::DrainController,
     runtime::state::RuntimeState,
     runtime::timeouts::ResolvedTimeoutPolicy,
+    tcp::run_tcp_listener,
 };
 
 use super::handlers;
@@ -68,6 +69,7 @@ struct ProxyRuntime {
 enum ListenerProtocol {
     Http,
     Https,
+    Tcp,
 }
 
 #[derive(Clone)]
@@ -76,6 +78,7 @@ struct ListenerSpec {
     protocol: ListenerProtocol,
     signature: String,
     acceptor: Option<TlsAcceptor>,
+    tcp_listener: Option<TcpListenerConfig>,
 }
 
 struct ListenerHandle {
@@ -542,9 +545,10 @@ fn rule_tls_enabled(rule: &Rule) -> bool {
 }
 
 fn validate_listener_protocol_conflicts(config: &AppConfig) -> anyhow::Result<()> {
-    let mut http_ports: HashMap<u16, String> = HashMap::new();
+    config.validate_tcp_listeners()?;
+    let mut occupied_ports: HashMap<u16, String> = HashMap::new();
     if let Some(port) = extract_port(&config.proxy_listen) {
-        http_ports.insert(port, config.proxy_listen.clone());
+        occupied_ports.insert(port, config.proxy_listen.clone());
     }
 
     for rule in config.rules.iter().filter(|rule| !rule_tls_enabled(rule)) {
@@ -552,7 +556,7 @@ fn validate_listener_protocol_conflicts(config: &AppConfig) -> anyhow::Result<()
             continue;
         };
         if let Some(port) = extract_port(listen) {
-            http_ports.entry(port).or_insert_with(|| listen.clone());
+            occupied_ports.entry(port).or_insert_with(|| listen.clone());
         }
     }
 
@@ -560,14 +564,30 @@ fn validate_listener_protocol_conflicts(config: &AppConfig) -> anyhow::Result<()
         let Some(port) = extract_port(&listener.listen) else {
             continue;
         };
-        if let Some(http_listen) = http_ports.get(&port) {
+        if let Some(existing_listen) = occupied_ports.get(&port) {
             anyhow::bail!(
-                "HTTPS listener ({}) conflicts with HTTP listener ({}) on port {}",
+                "HTTPS listener ({}) conflicts with listener ({}) on port {}",
                 listener.listen,
-                http_listen,
+                existing_listen,
                 port
             );
         }
+        occupied_ports.insert(port, listener.listen);
+    }
+
+    for listener in &config.tcp_listeners {
+        let Some(port) = extract_port(&listener.listen) else {
+            continue;
+        };
+        if let Some(existing_listen) = occupied_ports.get(&port) {
+            anyhow::bail!(
+                "TCP listener ({}) conflicts with listener ({}) on port {}",
+                listener.listen,
+                existing_listen,
+                port
+            );
+        }
+        occupied_ports.insert(port, listener.listen.clone());
     }
 
     Ok(())
@@ -584,6 +604,7 @@ fn proxy_listener_specs(config: &AppConfig) -> anyhow::Result<HashMap<String, Li
             protocol: ListenerProtocol::Http,
             signature: String::new(),
             acceptor: None,
+            tcp_listener: None,
         },
     );
 
@@ -600,6 +621,7 @@ fn proxy_listener_specs(config: &AppConfig) -> anyhow::Result<HashMap<String, Li
             protocol: ListenerProtocol::Http,
             signature: String::new(),
             acceptor: None,
+            tcp_listener: None,
         });
     }
 
@@ -611,11 +633,61 @@ fn proxy_listener_specs(config: &AppConfig) -> anyhow::Result<HashMap<String, Li
                 acceptor: Some(tls_acceptor(config, &listener)?),
                 protocol: ListenerProtocol::Https,
                 listen: listener.listen,
+                tcp_listener: None,
+            },
+        );
+    }
+
+    for listener in &config.tcp_listeners {
+        specs.insert(
+            listener.listen.clone(),
+            ListenerSpec {
+                signature: tcp_listener_signature(config, listener),
+                acceptor: None,
+                protocol: ListenerProtocol::Tcp,
+                listen: listener.listen.clone(),
+                tcp_listener: Some(listener.clone()),
             },
         );
     }
 
     Ok(specs)
+}
+
+fn tcp_listener_signature(config: &AppConfig, listener: &TcpListenerConfig) -> String {
+    let mut sni_routes: Vec<_> = listener.sni_routes.iter().collect();
+    sni_routes.sort_by_key(|(host, _)| *host);
+    let sni_routes = sni_routes
+        .into_iter()
+        .map(|(host, upstream)| {
+            format!(
+                "{host}={upstream}:{}",
+                upstream_fingerprint(config, upstream)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let upstream = listener.upstream.as_deref().unwrap_or_default();
+    format!(
+        "mode={:?};upstream={}:{};sni={};maxconn={:?};timeouts={}",
+        listener.mode,
+        upstream,
+        upstream_fingerprint(config, upstream),
+        sni_routes,
+        listener.maxconn,
+        serde_json::to_string(&config.timeouts).unwrap_or_default()
+    )
+}
+
+fn upstream_fingerprint(config: &AppConfig, upstream_name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    upstream_name.hash(&mut hasher);
+    if let Some(upstream) = config.upstreams.get(upstream_name) {
+        serde_json::to_string(upstream)
+            .unwrap_or_default()
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn tls_listener_signature(config: &AppConfig, listener: &EffectiveTlsListener) -> String {
@@ -825,25 +897,28 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
         .await
         .with_context(|| format!("failed to bind proxy listener to {}", spec.listen))?;
     let drain = DrainController::default();
-    let app = proxy_router(state, Some(spec.listen.clone()), Some(drain.clone()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let listen = spec.listen.clone();
     let protocol = spec.protocol;
     let join = match spec.protocol {
-        ListenerProtocol::Http => tokio::spawn(async move {
-            if let Err(error) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
+        ListenerProtocol::Http => {
+            let app = proxy_router(state, Some(spec.listen.clone()), Some(drain.clone()));
+            tokio::spawn(async move {
+                if let Err(error) = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                {
+                    tracing::error!(addr = %listen, %error, "HTTP proxy listener failed");
+                }
             })
-            .await
-            {
-                tracing::error!(addr = %listen, %error, "HTTP proxy listener failed");
-            }
-        }),
+        }
         ListenerProtocol::Https => {
+            let app = proxy_router(state, Some(spec.listen.clone()), Some(drain.clone()));
             let acceptor = spec
                 .acceptor
                 .clone()
@@ -854,6 +929,32 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
                     serve_tls(listener, app, acceptor, listener_drain, shutdown_rx).await
                 {
                     tracing::error!(addr = %listen, %error, "HTTPS proxy listener failed");
+                }
+            })
+        }
+        ListenerProtocol::Tcp => {
+            let listener_config = spec
+                .tcp_listener
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("TCP listener missing config"))?;
+            let runtime = state.proxy_runtime.load_full();
+            let balancer = runtime.balancer.clone();
+            let config = runtime.config.clone();
+            let metrics = state.metrics.clone();
+            let listener_drain = drain.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_tcp_listener(
+                    listener,
+                    listener_config,
+                    balancer,
+                    config,
+                    metrics,
+                    listener_drain,
+                    shutdown_rx,
+                )
+                .await
+                {
+                    tracing::error!(addr = %listen, %error, "TCP proxy listener failed");
                 }
             })
         }
@@ -1424,10 +1525,10 @@ fn spawn_health_checker(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        client_ip_string, normalize_host_key, AppState, ConfigSnapshot, LimitState, Matcher,
-        ProxyClients, ProxyRuntime,
+        client_ip_string, normalize_host_key, AppState, ConfigSnapshot, LimitState,
+        ListenerProtocol, Matcher, ProxyClients, ProxyRuntime,
     };
-    use crate::config::yaml::{AppConfig, Fallback};
+    use crate::config::yaml::{AppConfig, Fallback, TcpListenerConfig, TcpListenerMode};
     use crate::db::Database;
     use crate::models::{BalanceAlgorithm, LimitPolicy, Target, Upstream};
     use crate::observability::metrics::ProxyMetrics;
@@ -1532,6 +1633,45 @@ mod tests {
             &timeout_policy,
         );
         assert_eq!(explicit.queue_timeout_ms, Some(7));
+    }
+
+    #[test]
+    fn proxy_listener_specs_include_tcp_listeners() {
+        let mut config = app_config_with_upstream(least_connections_upstream());
+        config.tcp_listeners = vec![TcpListenerConfig {
+            name: "redis".to_string(),
+            listen: "127.0.0.1:6379".to_string(),
+            mode: TcpListenerMode::Tcp,
+            upstream: Some("backend".to_string()),
+            sni_routes: HashMap::new(),
+            maxconn: Some(64),
+        }];
+
+        let specs = super::proxy_listener_specs(&config).unwrap();
+        let spec = specs.get("127.0.0.1:6379").unwrap();
+
+        assert_eq!(spec.protocol, ListenerProtocol::Tcp);
+        assert_eq!(spec.tcp_listener.as_ref().unwrap().name, "redis");
+    }
+
+    #[test]
+    fn proxy_listener_specs_reject_tcp_port_conflicts() {
+        let mut config = app_config_with_upstream(least_connections_upstream());
+        config.tcp_listeners = vec![TcpListenerConfig {
+            name: "redis".to_string(),
+            listen: config.proxy_listen.clone(),
+            mode: TcpListenerMode::Tcp,
+            upstream: Some("backend".to_string()),
+            sni_routes: HashMap::new(),
+            maxconn: None,
+        }];
+
+        let err = match super::proxy_listener_specs(&config) {
+            Ok(_) => panic!("TCP listener conflict should fail"),
+            Err(error) => error,
+        };
+
+        assert!(err.to_string().contains("conflicts"));
     }
 
     #[test]
