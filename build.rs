@@ -38,7 +38,10 @@ fn main() {
     println!("cargo:rustc-env=RUSTPROXY_BUILD_VERSION={build_version}");
     println!("cargo:rustc-env=RUSTPROXY_PACKAGE_VERSION={package_version}");
     println!("cargo:rustc-env=RUSTPROXY_GIT_REF={ref_name}");
-    println!("cargo:rustc-env=RUSTPROXY_GIT_REF_KIND={}", detected_ref.kind);
+    println!(
+        "cargo:rustc-env=RUSTPROXY_GIT_REF_KIND={}",
+        detected_ref.kind
+    );
     println!("cargo:rustc-env=RUSTPROXY_GIT_COMMIT={commit}");
     println!("cargo:rustc-env=RUSTPROXY_GIT_DIRTY={dirty}");
 }

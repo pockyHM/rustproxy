@@ -40,8 +40,8 @@ where
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     #[test]
