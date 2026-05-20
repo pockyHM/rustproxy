@@ -140,6 +140,7 @@ pub struct ProxyRequestContext {
     pub balancer: Option<Arc<Balancer>>,
     pub balance_client_ip: String,
     pub balance_path: String,
+    pub sticky_cookie: Option<HeaderValue>,
     pub target_lease: Option<TargetLease>,
     pub drain_lease: Option<DrainLease>,
 }
@@ -541,6 +542,7 @@ pub async fn handle_proxy_with_target(
                     ));
                 }
                 if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                    apply_sticky_cookie(resp.headers_mut(), proxy_context.sticky_cookie.as_ref());
                     if let Some(client_upgrade) = client_upgrade {
                         let upstream_upgrade = hyper::upgrade::on(&mut resp);
                         let active_connection = active_connection.take();
@@ -583,7 +585,13 @@ pub async fn handle_proxy_with_target(
                     ));
                 }
                 let response = guard_response(
-                    resp.map(Body::new),
+                    {
+                        apply_sticky_cookie(
+                            resp.headers_mut(),
+                            proxy_context.sticky_cookie.as_ref(),
+                        );
+                        resp.map(Body::new)
+                    },
                     active_connection.take(),
                     target_metric.take(),
                     limit_permit.take(),
@@ -761,7 +769,13 @@ pub async fn handle_proxy_with_target(
                         ));
                     }
                     let response = guard_response(
-                        resp.map(Body::new),
+                        {
+                            apply_sticky_cookie(
+                                resp.headers_mut(),
+                                proxy_context.sticky_cookie.as_ref(),
+                            );
+                            resp.map(Body::new)
+                        },
                         active_connection.take(),
                         target_metric.take(),
                         limit_permit.take(),
@@ -965,7 +979,10 @@ pub async fn handle_proxy_with_target(
             }
 
             let response = guard_response(
-                resp.map(Body::new),
+                {
+                    apply_sticky_cookie(resp.headers_mut(), proxy_context.sticky_cookie.as_ref());
+                    resp.map(Body::new)
+                },
                 active_connection.take(),
                 target_metric.take(),
                 limit_permit.take(),
@@ -1051,6 +1068,12 @@ fn guard_response(
             _drain_lease: drain_lease,
         })
     })
+}
+
+fn apply_sticky_cookie(headers: &mut HeaderMap, cookie: Option<&HeaderValue>) {
+    if let Some(cookie) = cookie {
+        headers.append(header::SET_COOKIE, cookie.clone());
+    }
 }
 
 fn set_target_request_parts(request: &mut Request<Body>, target_uri: Uri) {

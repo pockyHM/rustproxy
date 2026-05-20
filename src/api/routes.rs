@@ -1239,6 +1239,7 @@ async fn proxy_handler(
         balancer,
         balance_client_ip,
         balance_path,
+        sticky_cookie,
         target_lease,
     ) = {
         let runtime = state.proxy_runtime.load();
@@ -1266,13 +1267,46 @@ async fn proxy_handler(
                     } else {
                         rule.name.clone()
                     };
-                    let sticky_key = config.upstreams.get(&rule.upstream).and_then(|upstream| {
-                        crate::stick::extract_sticky_key(
-                            &upstream.sticky,
-                            &match_request,
-                            Some(source.as_str()),
-                        )
-                    });
+                    let (sticky_key, sticky_cookie) =
+                        config
+                            .upstreams
+                            .get(&rule.upstream)
+                            .map_or((None, None), |upstream| {
+                                if upstream.sticky.enabled && upstream.sticky.cookie.is_some() {
+                                    let cookie_header = match_request
+                                        .headers()
+                                        .get(http::header::COOKIE)
+                                        .and_then(|value| value.to_str().ok());
+                                    if let Some(key) =
+                                        crate::stick::persistence::read_binding_cookie(
+                                            cookie_header,
+                                            &upstream.sticky,
+                                            state.jwt_secret.as_str(),
+                                        )
+                                    {
+                                        (Some(key), None)
+                                    } else {
+                                        let key = crate::stick::persistence::new_sticky_key();
+                                        let cookie =
+                                            crate::stick::persistence::issue_binding_cookie(
+                                                &upstream.sticky,
+                                                &key,
+                                                state.jwt_secret.as_str(),
+                                            )
+                                            .ok();
+                                        (Some(key), cookie)
+                                    }
+                                } else {
+                                    (
+                                        crate::stick::extract_sticky_key(
+                                            &upstream.sticky,
+                                            &match_request,
+                                            Some(source.as_str()),
+                                        ),
+                                        None,
+                                    )
+                                }
+                            });
                     runtime
                         .balancer
                         .select(
@@ -1310,6 +1344,7 @@ async fn proxy_handler(
                                 },
                                 target.url,
                                 target.active_connection,
+                                sticky_cookie,
                             )
                         })
                 })
@@ -1328,6 +1363,7 @@ async fn proxy_handler(
             retry_policy,
             limit_context,
             target_lease,
+            sticky_cookie,
         ) = match selected {
             Some((
                 rule,
@@ -1340,6 +1376,7 @@ async fn proxy_handler(
                 limit_context,
                 target,
                 target_lease,
+                sticky_cookie,
             )) => (
                 target,
                 timeout_policy,
@@ -1354,6 +1391,7 @@ async fn proxy_handler(
                 retry_policy,
                 Some(limit_context),
                 Some(target_lease),
+                sticky_cookie,
             ),
             None => (
                 config.fallback.url.clone(),
@@ -1363,6 +1401,7 @@ async fn proxy_handler(
                 Vec::new(),
                 Default::default(),
                 Default::default(),
+                None,
                 None,
                 None,
             ),
@@ -1383,6 +1422,7 @@ async fn proxy_handler(
             balancer,
             source.clone(),
             request_path,
+            sticky_cookie,
             target_lease,
         )
     };
@@ -1407,6 +1447,7 @@ async fn proxy_handler(
             balancer: Some(balancer),
             balance_client_ip,
             balance_path,
+            sticky_cookie,
             target_lease,
             drain_lease,
         },

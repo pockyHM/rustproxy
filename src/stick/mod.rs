@@ -1,3 +1,5 @@
+pub mod persistence;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
