@@ -173,6 +173,10 @@ impl AppState {
         self.shutting_down.store(true, Ordering::Release);
         self.listener_manager.shutdown_all().await;
     }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
 }
 
 impl ListenerManager {
@@ -202,8 +206,21 @@ impl ListenerManager {
 
         let mut started = Vec::new();
         for spec in additions {
+            if state.is_shutting_down() {
+                for (_, handle) in started {
+                    stop_listener(handle).await;
+                }
+                return Ok(());
+            }
             match start_listener(state.clone(), spec.clone()).await {
                 Ok(handle) => {
+                    if state.is_shutting_down() {
+                        stop_listener(handle).await;
+                        for (_, handle) in started {
+                            stop_listener(handle).await;
+                        }
+                        return Ok(());
+                    }
                     tracing::info!(listen = %spec.listen, protocol = ?spec.protocol, "proxy listener hot-added");
                     started.push((spec.listen.clone(), handle));
                 }
@@ -222,6 +239,9 @@ impl ListenerManager {
 
         let mut replaced = Vec::new();
         for (listen, desired_spec) in replacements {
+            if state.is_shutting_down() {
+                return Ok(());
+            }
             let Some(old_handle) = handles.remove(&listen) else {
                 continue;
             };
@@ -234,8 +254,15 @@ impl ListenerManager {
             );
             stop_listener(old_handle).await;
 
+            if state.is_shutting_down() {
+                return Ok(());
+            }
             match start_listener(state.clone(), desired_spec.clone()).await {
                 Ok(new_handle) => {
+                    if state.is_shutting_down() {
+                        stop_listener(new_handle).await;
+                        return Ok(());
+                    }
                     handles.insert(listen, new_handle);
                     replaced.push((old_spec.listen.clone(), old_spec));
                 }
@@ -250,9 +277,16 @@ impl ListenerManager {
                         if let Some(replaced_new) = handles.remove(&replaced_listen) {
                             stop_listener(replaced_new).await;
                         }
+                        if state.is_shutting_down() {
+                            continue;
+                        }
                         match start_listener(state.clone(), replaced_old_spec.clone()).await {
                             Ok(restored) => {
-                                handles.insert(replaced_old_spec.listen.clone(), restored);
+                                if state.is_shutting_down() {
+                                    stop_listener(restored).await;
+                                } else {
+                                    handles.insert(replaced_old_spec.listen.clone(), restored);
+                                }
                             }
                             Err(restore_error) => {
                                 tracing::error!(
@@ -263,16 +297,22 @@ impl ListenerManager {
                             }
                         }
                     }
-                    match start_listener(state.clone(), old_spec.clone()).await {
-                        Ok(restored) => {
-                            handles.insert(old_spec.listen.clone(), restored);
-                        }
-                        Err(restore_error) => {
-                            tracing::error!(
-                                listen = %old_spec.listen,
-                                %restore_error,
-                                "failed to restore previous listener after replacement failure"
-                            );
+                    if !state.is_shutting_down() {
+                        match start_listener(state.clone(), old_spec.clone()).await {
+                            Ok(restored) => {
+                                if state.is_shutting_down() {
+                                    stop_listener(restored).await;
+                                } else {
+                                    handles.insert(old_spec.listen.clone(), restored);
+                                }
+                            }
+                            Err(restore_error) => {
+                                tracing::error!(
+                                    listen = %old_spec.listen,
+                                    %restore_error,
+                                    "failed to restore previous listener after replacement failure"
+                                );
+                            }
                         }
                     }
                     return Err(error);
@@ -1532,6 +1572,14 @@ mod tests {
         desired.proxy_listen = "127.0.0.1:0".to_string();
 
         state.sync_proxy_listeners(&desired).await.unwrap();
+
+        assert!(state.listener_manager.handles.read().await.is_empty());
+
+        state
+            .listener_manager
+            .sync(state.clone(), &desired)
+            .await
+            .unwrap();
 
         assert!(state.listener_manager.handles.read().await.is_empty());
     }
