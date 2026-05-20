@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 
-use crate::api::server;
+use crate::api::routes as server;
 use crate::config::yaml::AppConfig;
-use crate::db::{Database, migration};
+use crate::db::{migration, Database};
 
 pub async fn run(db_path: &str, yaml_path: &str) -> Result<()> {
     let db =
@@ -31,5 +31,17 @@ pub async fn run(db_path: &str, yaml_path: &str) -> Result<()> {
     }
 
     let config = db.load_config()?;
-    server::run(config, db).await
+    let shutdown = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => tracing::info!("shutdown signal received"),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "signal handling unavailable; continuing without graceful signal shutdown"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    server::run_until_shutdown(config, db, shutdown).await
 }

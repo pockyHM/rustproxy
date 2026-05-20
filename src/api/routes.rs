@@ -1,7 +1,9 @@
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
+    future::Future,
     hash::{Hash, Hasher},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -38,10 +40,13 @@ use crate::{
     proxy::{
         handle_proxy_with_target, ProxyAccessLogContext, ProxyMetricLabels, ProxyRequestContext,
     },
+    runtime::drain::DrainController,
     runtime::state::RuntimeState,
 };
 
 use super::handlers;
+
+const LISTENER_DRAIN_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Pre-built proxy runtime shared across all requests.
 /// Replaced atomically when config changes — includes clients for hot-reload.
@@ -73,6 +78,7 @@ struct ListenerHandle {
     spec: ListenerSpec,
     shutdown: oneshot::Sender<()>,
     join: JoinHandle<()>,
+    drain: DrainController,
 }
 
 #[derive(Default)]
@@ -156,6 +162,10 @@ impl AppState {
             .sync(self.clone(), config)
             .await
             .context("failed to sync proxy listeners")
+    }
+
+    pub(crate) async fn shutdown_proxy_listeners(&self) {
+        self.listener_manager.shutdown_all().await;
     }
 }
 
@@ -272,6 +282,20 @@ impl ListenerManager {
         }
 
         Ok(())
+    }
+
+    async fn shutdown_all(&self) {
+        let handles = {
+            let mut handles = self.handles.write().await;
+            handles
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+
+        for handle in handles {
+            stop_listener(handle).await;
+        }
     }
 }
 
@@ -705,6 +729,7 @@ async fn serve_tls(
     listener: TcpListener,
     app: Router,
     acceptor: TlsAcceptor,
+    drain: DrainController,
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     loop {
@@ -712,9 +737,13 @@ async fn serve_tls(
             result = listener.accept() => result?,
             _ = &mut shutdown => break,
         };
+        let Some(connection_lease) = drain.try_acquire() else {
+            break;
+        };
         let app = app.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            let _connection_lease = connection_lease;
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -743,7 +772,8 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
     let listener = TcpListener::bind(&spec.listen)
         .await
         .with_context(|| format!("failed to bind proxy listener to {}", spec.listen))?;
-    let app = proxy_router(state, Some(spec.listen.clone()));
+    let drain = DrainController::default();
+    let app = proxy_router(state, Some(spec.listen.clone()), Some(drain.clone()));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let listen = spec.listen.clone();
     let protocol = spec.protocol;
@@ -766,8 +796,11 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
                 .acceptor
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("HTTPS listener missing TLS acceptor"))?;
+            let listener_drain = drain.clone();
             tokio::spawn(async move {
-                if let Err(error) = serve_tls(listener, app, acceptor, shutdown_rx).await {
+                if let Err(error) =
+                    serve_tls(listener, app, acceptor, listener_drain, shutdown_rx).await
+                {
                     tracing::error!(addr = %listen, %error, "HTTPS proxy listener failed");
                 }
             })
@@ -778,18 +811,71 @@ async fn start_listener(state: AppState, spec: ListenerSpec) -> anyhow::Result<L
         spec,
         shutdown: shutdown_tx,
         join,
+        drain,
     })
 }
 
 async fn stop_listener(mut handle: ListenerHandle) {
+    handle.drain.start_draining();
     let _ = handle.shutdown.send(());
-    tokio::select! {
-        _ = &mut handle.join => {}
-        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-            handle.join.abort();
-            let _ = handle.join.await;
-        }
+    let deadline = Instant::now() + LISTENER_DRAIN_HARD_TIMEOUT;
+
+    if tokio::time::timeout(LISTENER_DRAIN_HARD_TIMEOUT, &mut handle.join)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            listen = %handle.spec.listen,
+            "proxy listener did not stop before hard drain timeout; aborting listener task"
+        );
+        handle.join.abort();
+        let _ = handle.join.await;
+        return;
     }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !handle.drain.wait_empty(remaining).await {
+        tracing::warn!(
+            listen = %handle.spec.listen,
+            active = handle.drain.active(),
+            "proxy listener drain timed out with active leases"
+        );
+    }
+}
+
+async fn drain_proxy_request(
+    Extension(drain): Extension<DrainController>,
+    request: Request<Body>,
+    next: middleware::Next,
+) -> Result<Response<Body>, std::convert::Infallible> {
+    let Some(_lease) = drain.try_acquire() else {
+        return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+
+    Ok(next.run(request).await)
+}
+
+fn proxy_router(
+    state: AppState,
+    listen_addr: Option<String>,
+    drain: Option<DrainController>,
+) -> Router {
+    let router = Router::new()
+        .fallback(any(proxy_handler))
+        .layer(TraceLayer::new_for_http());
+    let router = if let Some(listen_addr) = listen_addr {
+        router.layer(Extension(listen_addr))
+    } else {
+        router
+    };
+    let router = if let Some(drain) = drain {
+        router
+            .layer(middleware::from_fn(drain_proxy_request))
+            .layer(Extension(drain))
+    } else {
+        router
+    };
+    Router::new().merge(router).with_state(state)
 }
 
 /// API + Admin UI router (no proxy fallback).
@@ -873,19 +959,6 @@ fn normalize_host_key(host: &str) -> String {
     } else {
         host
     }
-}
-
-/// Proxy-only router (no API routes).
-fn proxy_router(state: AppState, listen_addr: Option<String>) -> Router {
-    let router = Router::new()
-        .fallback(any(proxy_handler))
-        .layer(TraceLayer::new_for_http());
-    let router = if let Some(listen_addr) = listen_addr {
-        router.layer(Extension(listen_addr))
-    } else {
-        router
-    };
-    Router::new().merge(router).with_state(state)
 }
 
 async fn proxy_handler(
@@ -1095,6 +1168,17 @@ pub fn routes(state: AppState) -> Router {
 }
 
 pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
+    run_until_shutdown(config, db, std::future::pending::<()>()).await
+}
+
+pub async fn run_until_shutdown<S>(
+    config: AppConfig,
+    db: Database,
+    shutdown: S,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let api_listen = config.listen.clone();
     let jwt_secret = db.ensure_jwt_secret()?;
 
@@ -1169,15 +1253,19 @@ pub async fn run(config: AppConfig, db: Database) -> anyhow::Result<()> {
     spawn_health_checker(state.clone());
 
     // API listener (main, blocking — keeps process alive)
-    let app = api_router(state);
+    let app = api_router(state.clone());
     let listener = TcpListener::bind(&api_listen)
         .await
         .with_context(|| format!("failed to bind API server to {api_listen}"))?;
 
     tracing::info!(%api_listen, "API server listening");
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
         .await
-        .context("API server failed")?;
+        .context("API server failed");
+
+    state.shutdown_proxy_listeners().await;
+    result?;
 
     Ok(())
 }
