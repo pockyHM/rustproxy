@@ -7,7 +7,7 @@ type Lang = 'en' | 'zh';
 type Theme = 'light' | 'dark';
 type AccessLogLevel = 'debug' | 'info' | 'warn' | 'error';
 type ApiResponse<T> = { success: boolean; data: T; error?: string };
-type Target = { url: string; weight: number };
+type Target = { url: string; weight: number; timeouts?: TimeoutOverridePolicy };
 type HealthCheckMode = 'tcp' | 'http';
 type BalanceAlgorithm = 'weighted_round_robin' | 'least_connections' | 'ip_hash' | 'consistent_hash' | 'url_hash';
 type HealthCheck = {
@@ -26,17 +26,68 @@ type RetryPolicy = {
   retry_on_timeout: boolean;
   retry_on_connect_error: boolean;
 };
+type TimeoutPolicy = {
+  connect_timeout_seconds: number;
+  client_timeout_seconds: number;
+  server_timeout_seconds: number;
+  http_request_timeout_seconds: number;
+  http_keepalive_timeout_seconds: number;
+  tunnel_timeout_seconds: number;
+  queue_timeout_ms: number;
+};
+type TimeoutOverridePolicy = {
+  connect_timeout_seconds?: number | null;
+  client_timeout_seconds?: number | null;
+  server_timeout_seconds?: number | null;
+  http_request_timeout_seconds?: number | null;
+  http_keepalive_timeout_seconds?: number | null;
+  tunnel_timeout_seconds?: number | null;
+  queue_timeout_ms?: number | null;
+};
+type ConnectionLimitPolicy = {
+  global_maxconn?: number | null;
+  listener_maxconn?: number | null;
+};
+type StickyKeySource =
+  | { type: 'ip' }
+  | { type: 'header'; name: string }
+  | { type: 'cookie'; name: string }
+  | { type: 'jwt_claim'; claim_path: string };
+type StickyCookiePolicy = {
+  name: string;
+  path?: string | null;
+  secure: boolean;
+  http_only: boolean;
+  same_site?: string | null;
+};
+type StickyPolicy = {
+  enabled: boolean;
+  source: StickyKeySource;
+  ttl_seconds: number;
+  cookie?: StickyCookiePolicy | null;
+};
 type Upstream = {
   name: string;
   skip_ssl?: boolean;
   websocket?: boolean;
   balance?: BalanceAlgorithm;
   retry?: RetryPolicy;
+  timeouts?: TimeoutOverridePolicy;
+  sticky?: StickyPolicy;
   targets: Target[];
   health_check?: Partial<HealthCheck>;
 };
 type Certificate = { name: string; cert: string; key: string };
 type TlsListener = { enabled: boolean; listen: string; certificate: string };
+type TcpListenerMode = 'tcp' | 'tls_passthrough';
+type TcpListener = {
+  name: string;
+  listen: string;
+  mode: TcpListenerMode;
+  upstream?: string | null;
+  sni_routes?: Record<string, string>;
+  maxconn?: number | null;
+};
 type RuleTls = { enabled: boolean; certificate: string };
 type HeaderMutationOp = 'set' | 'add' | 'remove';
 type HeaderMutation = { op: HeaderMutationOp; name: string; value?: string | null };
@@ -77,6 +128,7 @@ type Rule = {
   is_fallback?: boolean;
   listen?: string | null;
   request_timeout?: number;
+  timeouts?: TimeoutOverridePolicy;
   tls?: RuleTls | null;
   header_policy?: HeaderPolicy;
   path_actions?: PathAction[];
@@ -85,6 +137,8 @@ type Rule = {
 type AppConfig = {
   listen: string;
   proxy_listen?: string;
+  timeouts?: TimeoutPolicy;
+  limits?: ConnectionLimitPolicy;
   connect_timeout?: number;
   request_timeout?: number;
   pool_max_idle_per_host?: number;
@@ -108,6 +162,7 @@ type AppConfig = {
   };
   certificates?: Certificate[];
   tls_listeners?: TlsListener[];
+  tcp_listeners?: TcpListener[];
   match_sets?: MatchSet[];
   rules: Rule[];
   upstreams: Record<string, Upstream>;
@@ -231,6 +286,36 @@ const T: Record<string, [string, string]> = {
   'config.websocket': ['Enable WebSocket proxy', '启用 WebSocket 代理'],
   'config.connectTimeout': ['Connect timeout (s)', '连接超时 (秒)'],
   'config.requestTimeout': ['Request timeout (s)', '请求超时 (秒)'],
+  'config.clientTimeout': ['Client timeout (s)', '客户端超时 (秒)'],
+  'config.serverTimeout': ['Server timeout (s)', '上游超时 (秒)'],
+  'config.httpRequestTimeout': ['HTTP request timeout (s)', 'HTTP 请求超时 (秒)'],
+  'config.httpKeepaliveTimeout': ['HTTP keep-alive timeout (s)', 'HTTP Keep-alive 超时 (秒)'],
+  'config.tunnelTimeout': ['Tunnel timeout (s)', '隧道超时 (秒)'],
+  'config.queueTimeout': ['Queue timeout (ms)', '队列超时 (毫秒)'],
+  'config.globalMaxconn': ['Global maxconn', '全局最大连接'],
+  'config.listenerMaxconn': ['Listener maxconn', '监听最大连接'],
+  'config.timeouts': ['Timeout Policy', '超时策略'],
+  'config.limits': ['Connection Limits', '连接上限'],
+  'config.tcpListeners': ['TCP Listeners', 'TCP 监听'],
+  'config.addTcpListener': ['Add TCP listener', '添加 TCP 监听'],
+  'config.tcpMode': ['Mode', '模式'],
+  'config.sniRoutes': ['SNI routes', 'SNI 路由'],
+  'config.sniHost': ['SNI host', 'SNI 主机'],
+  'config.defaultUpstream': ['Default upstream', '默认上游'],
+  'config.inheritHint': ['Blank inherits parent', '留空继承上级'],
+  'sticky.title': ['Sticky Sessions', '会话保持'],
+  'sticky.enabled': ['Enable sticky routing', '启用会话保持'],
+  'sticky.source': ['Sticky source', '保持来源'],
+  'sticky.ttl': ['TTL (s)', 'TTL (秒)'],
+  'sticky.cookie': ['Persistence cookie', '持久化 Cookie'],
+  'sticky.cookieEnabled': ['Issue signed cookie', '下发签名 Cookie'],
+  'sticky.cookieName': ['Cookie name', 'Cookie 名称'],
+  'sticky.cookiePath': ['Cookie path', 'Cookie 路径'],
+  'sticky.sameSite': ['SameSite', 'SameSite'],
+  'sticky.secure': ['Secure', 'Secure'],
+  'sticky.httpOnly': ['HttpOnly', 'HttpOnly'],
+  'sticky.sourceName': ['Header/Cookie name', 'Header/Cookie 名称'],
+  'sticky.claimPath': ['JWT claim path', 'JWT Claim 路径'],
   'config.poolMaxIdle': ['Max idle per host', '每主机最大空闲连接'],
   'config.poolIdleTimeout': ['Pool idle timeout (s)', '连接池空闲超时 (秒)'],
   'config.tcpKeepalive': ['TCP keepalive (s)', 'TCP Keepalive (秒)'],
@@ -506,6 +591,32 @@ const defaultRetryPolicy: RetryPolicy = {
   retry_on_timeout: false,
   retry_on_connect_error: false,
 };
+const defaultTimeoutPolicy: TimeoutPolicy = {
+  connect_timeout_seconds: 10,
+  client_timeout_seconds: 60,
+  server_timeout_seconds: 60,
+  http_request_timeout_seconds: 60,
+  http_keepalive_timeout_seconds: 90,
+  tunnel_timeout_seconds: 60,
+  queue_timeout_ms: 0,
+};
+const defaultConnectionLimits: ConnectionLimitPolicy = {
+  global_maxconn: null,
+  listener_maxconn: null,
+};
+const defaultStickyPolicy: StickyPolicy = {
+  enabled: false,
+  source: { type: 'ip' },
+  ttl_seconds: 3600,
+  cookie: null,
+};
+const defaultStickyCookie: StickyCookiePolicy = {
+  name: 'rp_sticky',
+  path: '/',
+  secure: false,
+  http_only: true,
+  same_site: 'lax',
+};
 const defaultHeaderPolicy: HeaderPolicy = { request: [], response: [] };
 const defaultLimitPolicy: LimitPolicy = {
   rate_per_second: null,
@@ -516,6 +627,9 @@ const defaultLimitPolicy: LimitPolicy = {
 };
 const BALANCE_ALGORITHMS: BalanceAlgorithm[] = ['weighted_round_robin', 'least_connections', 'ip_hash', 'consistent_hash', 'url_hash'];
 const RATE_LIMIT_KEYS: RateLimitKey[] = ['ip', 'host', 'route'];
+const TCP_LISTENER_MODES: TcpListenerMode[] = ['tcp', 'tls_passthrough'];
+const STICKY_SOURCE_TYPES: StickyKeySource['type'][] = ['ip', 'header', 'cookie', 'jwt_claim'];
+const SAME_SITE_OPTIONS = ['lax', 'strict', 'none'] as const;
 const HEADER_MUTATION_OPS: HeaderMutationOp[] = ['set', 'add', 'remove'];
 const PATH_ACTION_TYPES = ['strip_prefix', 'rewrite', 'redirect'] as const;
 type PathActionType = typeof PATH_ACTION_TYPES[number];
@@ -540,9 +654,11 @@ const ACCESS_LOG_LEVEL_OPTIONS: DropdownOption[] = [
 
 const emptyConfig: AppConfig = {
   listen: '0.0.0.0:3000', proxy_listen: '0.0.0.0:80',
+  timeouts: { ...defaultTimeoutPolicy },
+  limits: { ...defaultConnectionLimits },
   certificate_dir: '/etc/rustproxy/cert.d', access_log: { enabled: false, path: null, buffer_size: 8192, level: 'info' },
   monitoring: { enabled: false, prometheus: { url: '', auth: { auth_type: 'none' } } },
-  certificates: [], tls_listeners: [], match_sets: [],
+  certificates: [], tls_listeners: [], tcp_listeners: [], match_sets: [],
   rules: [], upstreams: {}, fallback: { url: '404' },
 };
 
@@ -581,12 +697,72 @@ function compactConfigForYaml(value: unknown): unknown {
       if (compactLimit !== undefined) next[key] = compactLimit;
       return next;
     }
+    if (key === 'timeouts') {
+      const compactTimeouts = 'listen' in source && 'fallback' in source
+        ? compactGlobalTimeoutPolicy(item)
+        : compactTimeoutOverridePolicy(item);
+      if (compactTimeouts !== undefined) next[key] = compactTimeouts;
+      return next;
+    }
+    if (key === 'limits') {
+      const compactLimits = compactConnectionLimitPolicy(item);
+      if (compactLimits !== undefined) next[key] = compactLimits;
+      return next;
+    }
+    if (key === 'sticky') {
+      const compactSticky = compactStickyPolicy(item);
+      if (compactSticky !== undefined) next[key] = compactSticky;
+      return next;
+    }
+    if (key === 'tcp_listeners' && Array.isArray(item) && item.length === 0) return next;
     if (key === 'request_timeout' && item === 0 && 'upstream' in source && 'priority' in source) return next;
     const compactItem = compactConfigForYaml(item);
     if (compactItem !== undefined) next[key] = compactItem;
     return next;
   }, {});
   return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function compactGlobalTimeoutPolicy(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const source = { ...defaultTimeoutPolicy, ...(value as Record<string, unknown>) };
+  const compacted: Record<string, unknown> = {};
+  for (const key of Object.keys(defaultTimeoutPolicy) as (keyof TimeoutPolicy)[]) {
+    const value = Number(source[key]);
+    if (Number.isFinite(value) && value !== defaultTimeoutPolicy[key]) compacted[key] = value;
+  }
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function compactTimeoutOverridePolicy(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const compacted: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (item != null && Number(item) > 0) compacted[key] = Number(item);
+  }
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function compactConnectionLimitPolicy(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const source = value as Record<string, unknown>;
+  const compacted: Record<string, unknown> = {};
+  if (source.global_maxconn != null && Number(source.global_maxconn) > 0) compacted.global_maxconn = Number(source.global_maxconn);
+  if (source.listener_maxconn != null && Number(source.listener_maxconn) > 0) compacted.listener_maxconn = Number(source.listener_maxconn);
+  return Object.keys(compacted).length > 0 ? compacted : undefined;
+}
+
+function compactStickyPolicy(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const policy = normalizeStickyPolicy(value as StickyPolicy);
+  if (!policy.enabled) return undefined;
+  const compacted: Record<string, unknown> = {
+    enabled: true,
+    source: policy.source,
+    ttl_seconds: policy.ttl_seconds,
+  };
+  if (policy.cookie) compacted.cookie = policy.cookie;
+  return compacted;
 }
 
 function compactRetryPolicy(value: unknown): unknown {
@@ -1438,6 +1614,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
       weight: 100,
       listen: draft.listen || defaultListen,
       request_timeout: draft.is_fallback ? 0 : Number(draft.request_timeout ?? 0),
+      timeouts: normalizeTimeoutOverride(draft.timeouts),
       tls: draft.is_fallback ? null : draft.tls?.enabled ? { enabled: true, certificate: draft.tls.certificate } : null,
       header_policy: normalizeHeaderPolicy(draft.header_policy),
       path_actions: normalizePathActions(draft.path_actions),
@@ -1552,6 +1729,13 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 />
               </Field>
             </section>}
+            {!draft.is_fallback && (
+              <TimeoutOverrideEditor
+                title={t('config.timeouts')}
+                value={draft.timeouts}
+                onChange={(timeouts) => setDraft({ ...draft, timeouts })}
+              />
+            )}
             <section className="form-section">
               {draft.is_fallback && <h3 className="form-section-title">{t('form.routing')}</h3>}
               {draft.is_fallback && (
@@ -2023,6 +2207,79 @@ function LimitPolicyEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: 
   );
 }
 
+function TimeoutOverrideEditor({ value, onChange, title }: { value?: TimeoutOverridePolicy; onChange: (next: TimeoutOverridePolicy) => void; title: string }) {
+  const { t } = useI18n();
+  const policy = normalizeTimeoutOverride(value);
+  function update(key: keyof TimeoutOverridePolicy, input: string) {
+    onChange({ ...policy, [key]: parseOptionalPositive(input) });
+  }
+  return (
+    <section className="form-section">
+      <h3 className="form-section-title">{title}</h3>
+      <div className="form-grid-3">
+        <Field label={t('config.connectTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.connect_timeout_seconds ?? ''} onChange={(e) => update('connect_timeout_seconds', e.target.value)} /></Field>
+        <Field label={t('config.clientTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.client_timeout_seconds ?? ''} onChange={(e) => update('client_timeout_seconds', e.target.value)} /></Field>
+        <Field label={t('config.serverTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.server_timeout_seconds ?? ''} onChange={(e) => update('server_timeout_seconds', e.target.value)} /></Field>
+        <Field label={t('config.httpRequestTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.http_request_timeout_seconds ?? ''} onChange={(e) => update('http_request_timeout_seconds', e.target.value)} /></Field>
+        <Field label={t('config.httpKeepaliveTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.http_keepalive_timeout_seconds ?? ''} onChange={(e) => update('http_keepalive_timeout_seconds', e.target.value)} /></Field>
+        <Field label={t('config.tunnelTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.tunnel_timeout_seconds ?? ''} onChange={(e) => update('tunnel_timeout_seconds', e.target.value)} /></Field>
+        <Field label={t('config.queueTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.queue_timeout_ms ?? ''} onChange={(e) => update('queue_timeout_ms', e.target.value)} /></Field>
+      </div>
+    </section>
+  );
+}
+
+function StickyPolicyEditor({ draft, setDraft }: { draft: Upstream; setDraft: (upstream: Upstream) => void }) {
+  const { t } = useI18n();
+  const sticky = normalizeStickyPolicy(draft.sticky);
+  function update(patch: Partial<StickyPolicy>) {
+    setDraft({ ...draft, sticky: normalizeStickyPolicy({ ...sticky, ...patch }) });
+  }
+  function updateSource(type: StickyKeySource['type']) {
+    const source: StickyKeySource = type === 'header'
+      ? { type, name: sticky.source.type === 'header' ? sticky.source.name : 'x-user-id' }
+      : type === 'cookie'
+        ? { type, name: sticky.source.type === 'cookie' ? sticky.source.name : 'session' }
+        : type === 'jwt_claim'
+          ? { type, claim_path: sticky.source.type === 'jwt_claim' ? sticky.source.claim_path : 'sub' }
+          : { type: 'ip' };
+    update({ source });
+  }
+  function updateCookie(patch: Partial<StickyCookiePolicy>) {
+    update({ cookie: { ...defaultStickyCookie, ...(sticky.cookie ?? {}), ...patch } });
+  }
+  return (
+    <section className="form-section">
+      <h3 className="form-section-title">{t('sticky.title')}</h3>
+      <label className="toggle-row">
+        <input type="checkbox" checked={sticky.enabled} onChange={(e) => update({ enabled: e.target.checked })} />
+        <span>{t('sticky.enabled')}</span>
+      </label>
+      <div className="form-grid-3">
+        <Field label={t('sticky.source')}>
+          <Dropdown value={sticky.source.type} options={enumOptions(STICKY_SOURCE_TYPES)} onChange={(type) => updateSource(type as StickyKeySource['type'])} />
+        </Field>
+        {('name' in sticky.source) && <Field label={t('sticky.sourceName')}><input value={sticky.source.name} onChange={(e) => update({ source: { ...sticky.source, name: e.target.value } as StickyKeySource })} /></Field>}
+        {sticky.source.type === 'jwt_claim' && <Field label={t('sticky.claimPath')}><input value={sticky.source.claim_path} onChange={(e) => update({ source: { type: 'jwt_claim', claim_path: e.target.value } })} /></Field>}
+        <Field label={t('sticky.ttl')}><input type="number" min="1" value={sticky.ttl_seconds} onChange={(e) => update({ ttl_seconds: clampInt(e.target.value, 1, 31_536_000, 3600) })} /></Field>
+      </div>
+      <label className="toggle-row">
+        <input type="checkbox" checked={Boolean(sticky.cookie)} onChange={(e) => update({ cookie: e.target.checked ? { ...defaultStickyCookie } : null })} />
+        <span>{t('sticky.cookieEnabled')}</span>
+      </label>
+      {sticky.cookie && (
+        <div className="form-grid-3">
+          <Field label={t('sticky.cookieName')}><input value={sticky.cookie.name} onChange={(e) => updateCookie({ name: e.target.value })} /></Field>
+          <Field label={t('sticky.cookiePath')}><input value={sticky.cookie.path ?? '/'} onChange={(e) => updateCookie({ path: e.target.value || '/' })} /></Field>
+          <Field label={t('sticky.sameSite')}><Dropdown value={sticky.cookie.same_site ?? 'lax'} options={enumOptions(SAME_SITE_OPTIONS)} onChange={(same_site) => updateCookie({ same_site })} /></Field>
+          <label className="toggle-row"><input type="checkbox" checked={sticky.cookie.secure} onChange={(e) => updateCookie({ secure: e.target.checked })} /><span>{t('sticky.secure')}</span></label>
+          <label className="toggle-row"><input type="checkbox" checked={sticky.cookie.http_only} onChange={(e) => updateCookie({ http_only: e.target.checked })} /><span>{t('sticky.httpOnly')}</span></label>
+        </div>
+      )}
+    </section>
+  );
+}
+
 /* ===== Upstreams View ===== */
 
 function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
@@ -2101,6 +2358,9 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
       balance: draft.balance ?? 'weighted_round_robin',
       retry: normalizeRetryPolicy(draft.retry),
       health_check: normalizeHealthCheck(draft.health_check),
+      timeouts: normalizeTimeoutOverride(draft.timeouts),
+      sticky: normalizeStickyPolicy(draft.sticky),
+      targets: draft.targets.map((target) => ({ ...target, timeouts: normalizeTimeoutOverride(target.timeouts) })),
     };
     await api<Upstream>(editing ? `/api/upstreams/${encodeURIComponent(editing)}` : '/api/upstreams', { method: editing ? 'PUT' : 'POST', token, body });
     await refreshConfig(token, setConfig, setNotice);
@@ -2250,11 +2510,20 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
                     <Field label="URL"><input value={target.url} onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, url: e.target.value }))} required /></Field>
                     <Field label={t('table.weight')}><input type="number" min="0" value={target.weight} onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, weight: Number(e.target.value) }))} /></Field>
                     <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 24 }} onClick={() => setDraft({ ...draft, targets: draft.targets.filter((_, j) => j !== i) })}><Icon name="close" size={16} /></button>
+                    <div className="target-timeouts">
+                      <TimeoutOverrideEditor
+                        title={`${t('config.timeouts')} · ${i + 1}`}
+                        value={target.timeouts}
+                        onChange={(timeouts) => setDraft(replaceTarget(draft, i, { ...target, timeouts }))}
+                      />
+                    </div>
                   </div>
                 ))}
               </div>
-              <button type="button" className="btn btn-secondary" style={{ marginTop: 10 }} onClick={() => setDraft({ ...draft, targets: [...draft.targets, { url: 'http://127.0.0.1:8080', weight: 100 }] })}><Icon name="add" size={16} />{t('action.addTarget')}</button>
+              <button type="button" className="btn btn-secondary" style={{ marginTop: 10 }} onClick={() => setDraft({ ...draft, targets: [...draft.targets, { url: 'http://127.0.0.1:8080', weight: 100, timeouts: {} }] })}><Icon name="add" size={16} />{t('action.addTarget')}</button>
             </section>
+            <TimeoutOverrideEditor title={t('config.timeouts')} value={draft.timeouts} onChange={(timeouts) => setDraft({ ...draft, timeouts })} />
+            <StickyPolicyEditor draft={draft} setDraft={setDraft} />
             <HealthCheckEditor draft={draft} setDraft={setDraft} />
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
@@ -2426,6 +2695,76 @@ function HealthCheckEditor({ draft, setDraft }: { draft: Upstream; setDraft: (up
   );
 }
 
+function TcpListenersEditor({ config, onChange }: { config: AppConfig; onChange: (listeners: TcpListener[]) => void }) {
+  const { t } = useI18n();
+  const upstreamOptions = Object.keys(config.upstreams ?? {}).map((name) => ({ value: name, label: name }));
+  const listeners = (config.tcp_listeners ?? []).map(normalizeTcpListener);
+  function replace(index: number, listener: TcpListener) {
+    onChange(listeners.map((item, i) => i === index ? normalizeTcpListener(listener) : item));
+  }
+  function updateSniRoute(index: number, host: string, upstream: string, previousHost?: string) {
+    const listener = listeners[index];
+    const routes = { ...(listener.sni_routes ?? {}) };
+    if (previousHost && previousHost !== host) delete routes[previousHost];
+    if (host.trim()) routes[host.trim().toLowerCase()] = upstream;
+    replace(index, { ...listener, sni_routes: routes });
+  }
+  return (
+    <div className="card global-config-card">
+      <div className="section-title-row">
+        <h3 className="card-title-sm">{t('config.tcpListeners')}</h3>
+        <button className="btn btn-secondary btn-sm" type="button" onClick={() => onChange([...listeners, newTcpListener(listeners.length)])}>
+          <Icon name="add" size={16} />{t('config.addTcpListener')}
+        </button>
+      </div>
+      {listeners.length === 0 ? <p className="card-desc">{t('form.noneConfigured')}</p> : (
+        <div className="policy-list">
+          {listeners.map((listener, index) => {
+            const routes = Object.entries(listener.sni_routes ?? {});
+            return (
+              <div className="policy-row" key={`${listener.name}-${index}`} style={{ alignItems: 'stretch', gridTemplateColumns: '1fr' }}>
+                <div className="form-grid">
+                  <Field label={t('table.name')}><input value={listener.name} onChange={(e) => replace(index, { ...listener, name: e.target.value })} /></Field>
+                  <Field label={t('table.listen')}><input value={listener.listen} placeholder="0.0.0.0:8443" onChange={(e) => replace(index, { ...listener, listen: e.target.value })} /></Field>
+                  <Field label={t('config.tcpMode')}><Dropdown value={listener.mode} options={enumOptions(TCP_LISTENER_MODES)} onChange={(mode) => replace(index, { ...listener, mode: mode as TcpListenerMode })} /></Field>
+                  <Field label={t('config.defaultUpstream')}>
+                    <Dropdown value={listener.upstream ?? ''} options={[{ value: '', label: '—' }, ...upstreamOptions]} onChange={(upstream) => replace(index, { ...listener, upstream: upstream || null })} />
+                  </Field>
+                  <Field label="maxconn"><input type="number" min="0" value={listener.maxconn ?? ''} placeholder={t('form.optionalZero')} onChange={(e) => replace(index, { ...listener, maxconn: parseOptionalPositive(e.target.value) })} /></Field>
+                </div>
+                {listener.mode === 'tls_passthrough' && (
+                  <div className="policy-subsection">
+                    <div className="policy-subsection-head">
+                      <span className="field-label">{t('config.sniRoutes')}</span>
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => updateSniRoute(index, 'app.example.com', upstreamOptions[0]?.value ?? '')}>
+                        <Icon name="add" size={16} />{t('config.sniRoutes')}
+                      </button>
+                    </div>
+                    {routes.map(([host, upstream]) => (
+                      <div className="policy-row header-policy-row" key={host}>
+                        <Field label={t('config.sniHost')}><input value={host} onChange={(e) => updateSniRoute(index, e.target.value, upstream, host)} /></Field>
+                        <Field label={t('table.upstream')}><Dropdown value={upstream} options={upstreamOptions.length ? upstreamOptions : [{ value: '', label: '—' }]} onChange={(next) => updateSniRoute(index, host, next, host)} /></Field>
+                        <button type="button" className="btn btn-ghost btn-sm policy-remove" onClick={() => {
+                          const next = { ...(listener.sni_routes ?? {}) };
+                          delete next[host];
+                          replace(index, { ...listener, sni_routes: next });
+                        }}>
+                          <Icon name="close" size={16} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => onChange(listeners.filter((_, i) => i !== index))}>{t('action.del')}</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ===== Config File View ===== */
 
 function CertificatesView({ config, token, setConfig, setNotice }: DataProps) {
@@ -2524,6 +2863,21 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
     setText(dumpConfigYaml(next));
   }
 
+  function updateTimeouts(patch: Partial<TimeoutPolicy>) {
+    const current = parsedConfig ?? config;
+    setText(dumpConfigYaml({ ...current, timeouts: { ...defaultTimeoutPolicy, ...(current.timeouts ?? {}), ...patch } }));
+  }
+
+  function updateLimits(patch: Partial<ConnectionLimitPolicy>) {
+    const current = parsedConfig ?? config;
+    setText(dumpConfigYaml({ ...current, limits: { ...defaultConnectionLimits, ...(current.limits ?? {}), ...patch } }));
+  }
+
+  function updateTcpListeners(tcp_listeners: TcpListener[]) {
+    const current = parsedConfig ?? config;
+    setText(dumpConfigYaml({ ...current, tcp_listeners: tcp_listeners.map(normalizeTcpListener) }));
+  }
+
   function updateFallbackUrl(url: string) {
     const current = parsedConfig ?? config;
     setText(dumpConfigYaml({ ...current, fallback: { ...(current.fallback ?? { url: '' }), url } }));
@@ -2575,15 +2929,29 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
             <Field label={t('config.proxyListen')}><input value={globalConfig.proxy_listen ?? '0.0.0.0:80'} onChange={(e) => updateGlobal({ proxy_listen: e.target.value })} /></Field>
             <Field label={t('config.certificateDir')}><input value={globalConfig.certificate_dir ?? '/etc/rustproxy/cert.d'} onChange={(e) => updateGlobal({ certificate_dir: e.target.value })} /></Field>
             <Field label={t('config.fallbackUrl')}><input value={globalConfig.fallback?.url ?? ''} onChange={(e) => updateFallbackUrl(e.target.value)} /></Field>
-            <Field label={t('config.requestTimeout')}><input type="number" min="0" value={globalConfig.request_timeout ?? 60} onChange={(e) => updateGlobal({ request_timeout: Number(e.target.value) })} /></Field>
+          </div>
+          <div className="card global-config-card">
+            <h3 className="card-title-sm">{t('config.timeouts')}</h3>
+            <Field label={t('config.connectTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.connect_timeout_seconds ?? defaultTimeoutPolicy.connect_timeout_seconds} onChange={(e) => updateTimeouts({ connect_timeout_seconds: Number(e.target.value) })} /></Field>
+            <Field label={t('config.clientTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.client_timeout_seconds ?? defaultTimeoutPolicy.client_timeout_seconds} onChange={(e) => updateTimeouts({ client_timeout_seconds: Number(e.target.value) })} /></Field>
+            <Field label={t('config.serverTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.server_timeout_seconds ?? defaultTimeoutPolicy.server_timeout_seconds} onChange={(e) => updateTimeouts({ server_timeout_seconds: Number(e.target.value) })} /></Field>
+            <Field label={t('config.httpRequestTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.http_request_timeout_seconds ?? defaultTimeoutPolicy.http_request_timeout_seconds} onChange={(e) => updateTimeouts({ http_request_timeout_seconds: Number(e.target.value) })} /></Field>
+            <Field label={t('config.httpKeepaliveTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.http_keepalive_timeout_seconds ?? defaultTimeoutPolicy.http_keepalive_timeout_seconds} onChange={(e) => updateTimeouts({ http_keepalive_timeout_seconds: Number(e.target.value) })} /></Field>
+            <Field label={t('config.tunnelTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.tunnel_timeout_seconds ?? defaultTimeoutPolicy.tunnel_timeout_seconds} onChange={(e) => updateTimeouts({ tunnel_timeout_seconds: Number(e.target.value) })} /></Field>
+            <Field label={t('config.queueTimeout')}><input type="number" min="0" value={globalConfig.timeouts?.queue_timeout_ms ?? defaultTimeoutPolicy.queue_timeout_ms} onChange={(e) => updateTimeouts({ queue_timeout_ms: Number(e.target.value) })} /></Field>
+          </div>
+          <div className="card global-config-card">
+            <h3 className="card-title-sm">{t('config.limits')}</h3>
+            <Field label={t('config.globalMaxconn')}><input type="number" min="0" value={globalConfig.limits?.global_maxconn ?? ''} placeholder={t('form.optionalZero')} onChange={(e) => updateLimits({ global_maxconn: parseOptionalPositive(e.target.value) })} /></Field>
+            <Field label={t('config.listenerMaxconn')}><input type="number" min="0" value={globalConfig.limits?.listener_maxconn ?? ''} placeholder={t('form.optionalZero')} onChange={(e) => updateLimits({ listener_maxconn: parseOptionalPositive(e.target.value) })} /></Field>
           </div>
           <div className="card global-config-card">
             <h3 className="card-title-sm">{t('config.loadAdvanced')}</h3>
-            <Field label={t('config.connectTimeout')}><input type="number" min="0" value={globalConfig.connect_timeout ?? 10} onChange={(e) => updateGlobal({ connect_timeout: Number(e.target.value) })} /></Field>
             <Field label={t('config.poolMaxIdle')}><input type="number" min="0" value={globalConfig.pool_max_idle_per_host ?? 32} onChange={(e) => updateGlobal({ pool_max_idle_per_host: Number(e.target.value) })} /></Field>
             <Field label={t('config.poolIdleTimeout')}><input type="number" min="0" value={globalConfig.pool_idle_timeout ?? 90} onChange={(e) => updateGlobal({ pool_idle_timeout: Number(e.target.value) })} /></Field>
             <Field label={t('config.tcpKeepalive')}><input type="number" min="0" value={globalConfig.tcp_keepalive ?? 60} onChange={(e) => updateGlobal({ tcp_keepalive: Number(e.target.value) })} /></Field>
           </div>
+          <TcpListenersEditor config={globalConfig} onChange={updateTcpListeners} />
           <div className="card global-config-card">
             <h3 className="card-title-sm">{t('config.accessLog')}</h3>
             <label className="checkbox-row">
@@ -2624,12 +2992,13 @@ function ConfigView({ config, token, setConfig, setNotice }: DataProps) {
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.schema')}</h3>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log.level, monitoring.prometheus, certificates[].cert/key path, fallback, connect_timeout, request_timeout, pool_max_idle_per_host, pool_idle_timeout, tcp_keepalive</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>global</span><span className="schema-val">listen, proxy_listen, certificate_dir, access_log.level, monitoring.prometheus, fallback, timeouts, limits, pool_idle_timeout, tcp_keepalive</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">balance, retry, skip_ssl, websocket, targets[].url, targets[].weight, health_check</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#82AAFF' }}>upstreams.&lt;name&gt;</span><span className="schema-val">balance, retry, skip_ssl, websocket, sticky, timeouts, targets[].timeouts, health_check</span></div>
             <div style={{ height: 1, background: 'var(--border)' }} />
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#89DDFF' }}>tcp_listeners[]</span><span className="schema-val">name, listen, mode, upstream, sni_routes, maxconn</span></div>
             <div className="schema-entry"><span className="schema-key" style={{ color: '#C792EA' }}>match_sets[]</span><span className="schema-val">name, conditions(header/cookie/jwt)</span></div>
-            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, request_timeout, header_policy, path_actions, limit_policy, host, location, priority, tls, match_set, conditions, upstream</span></div>
+            <div className="schema-entry"><span className="schema-key" style={{ color: '#FFCB6B' }}>routes[]</span><span className="schema-val">id, listen, timeouts, header_policy, path_actions, limit_policy, host, location, priority, tls, match_set, conditions, upstream</span></div>
           </div>
           <div className="card">
             <h3 className="card-title-sm">{t('config.validation')}</h3>
@@ -2903,6 +3272,7 @@ function newRule(upstream = '', listen = '0.0.0.0:80'): Rule {
     is_fallback: false,
     listen,
     request_timeout: 0,
+    timeouts: {},
     conditions: createLeafCondition(),
     header_policy: { ...defaultHeaderPolicy, request: [], response: [] },
     path_actions: [],
@@ -2970,7 +3340,9 @@ function newUpstream(): Upstream {
     websocket: false,
     balance: 'weighted_round_robin',
     retry: { ...defaultRetryPolicy, retry_on_status: [] },
-    targets: [{ url: 'http://127.0.0.1:8080', weight: 100 }],
+    timeouts: {},
+    sticky: { ...defaultStickyPolicy },
+    targets: [{ url: 'http://127.0.0.1:8080', weight: 100, timeouts: {} }],
     health_check: { ...defaultHealthCheck },
   };
 }
@@ -2978,6 +3350,9 @@ function newUpstream(): Upstream {
 function normalizeConfig(config: AppConfig): AppConfig {
   return {
     ...config,
+    timeouts: normalizeGlobalTimeoutPolicy(config.timeouts),
+    limits: normalizeConnectionLimits(config.limits),
+    tcp_listeners: (config.tcp_listeners ?? []).map(normalizeTcpListener),
     rules: (config.rules ?? []).map(normalizeRule),
     upstreams: Object.fromEntries(
       Object.entries(config.upstreams ?? {}).map(([name, upstream]) => [name, normalizeUpstream(upstream)])
@@ -2992,6 +3367,7 @@ function normalizeRule(rule: Rule): Rule {
     location: normalizeLocationMatcher(rule.location),
     conditions: rule.match_set ? null : normalizeCondition(rule.conditions),
     request_timeout: Number(rule.request_timeout ?? 0),
+    timeouts: normalizeTimeoutOverride(rule.timeouts),
     header_policy: normalizeHeaderPolicy(rule.header_policy),
     path_actions: normalizePathActions(rule.path_actions),
     limit_policy: normalizeLimitPolicy(rule.limit_policy),
@@ -3003,8 +3379,80 @@ function normalizeUpstream(upstream: Upstream): Upstream {
     ...upstream,
     balance: BALANCE_ALGORITHMS.includes(upstream.balance as BalanceAlgorithm) ? upstream.balance : 'weighted_round_robin',
     retry: normalizeRetryPolicy(upstream.retry),
+    timeouts: normalizeTimeoutOverride(upstream.timeouts),
+    sticky: normalizeStickyPolicy(upstream.sticky),
     health_check: normalizeHealthCheck(upstream.health_check),
-    targets: (upstream.targets ?? []).map((target) => ({ url: target.url, weight: Number(target.weight ?? 0) })),
+    targets: (upstream.targets ?? []).map((target) => ({ url: target.url, weight: Number(target.weight ?? 0), timeouts: normalizeTimeoutOverride(target.timeouts) })),
+  };
+}
+
+function normalizeGlobalTimeoutPolicy(policy?: Partial<TimeoutPolicy>): TimeoutPolicy {
+  return {
+    connect_timeout_seconds: Number(policy?.connect_timeout_seconds ?? defaultTimeoutPolicy.connect_timeout_seconds),
+    client_timeout_seconds: Number(policy?.client_timeout_seconds ?? defaultTimeoutPolicy.client_timeout_seconds),
+    server_timeout_seconds: Number(policy?.server_timeout_seconds ?? defaultTimeoutPolicy.server_timeout_seconds),
+    http_request_timeout_seconds: Number(policy?.http_request_timeout_seconds ?? defaultTimeoutPolicy.http_request_timeout_seconds),
+    http_keepalive_timeout_seconds: Number(policy?.http_keepalive_timeout_seconds ?? defaultTimeoutPolicy.http_keepalive_timeout_seconds),
+    tunnel_timeout_seconds: Number(policy?.tunnel_timeout_seconds ?? defaultTimeoutPolicy.tunnel_timeout_seconds),
+    queue_timeout_ms: Number(policy?.queue_timeout_ms ?? defaultTimeoutPolicy.queue_timeout_ms),
+  };
+}
+
+function normalizeTimeoutOverride(policy?: TimeoutOverridePolicy): TimeoutOverridePolicy {
+  return {
+    connect_timeout_seconds: nullablePositiveNumber(policy?.connect_timeout_seconds),
+    client_timeout_seconds: nullablePositiveNumber(policy?.client_timeout_seconds),
+    server_timeout_seconds: nullablePositiveNumber(policy?.server_timeout_seconds),
+    http_request_timeout_seconds: nullablePositiveNumber(policy?.http_request_timeout_seconds),
+    http_keepalive_timeout_seconds: nullablePositiveNumber(policy?.http_keepalive_timeout_seconds),
+    tunnel_timeout_seconds: nullablePositiveNumber(policy?.tunnel_timeout_seconds),
+    queue_timeout_ms: nullablePositiveNumber(policy?.queue_timeout_ms),
+  };
+}
+
+function normalizeConnectionLimits(policy?: ConnectionLimitPolicy): ConnectionLimitPolicy {
+  return {
+    global_maxconn: nullablePositiveNumber(policy?.global_maxconn),
+    listener_maxconn: nullablePositiveNumber(policy?.listener_maxconn),
+  };
+}
+
+function normalizeStickyPolicy(policy?: StickyPolicy): StickyPolicy {
+  const source = normalizeStickySource(policy?.source);
+  return {
+    enabled: Boolean(policy?.enabled),
+    source,
+    ttl_seconds: Math.max(1, Number(policy?.ttl_seconds ?? defaultStickyPolicy.ttl_seconds)),
+    cookie: policy?.cookie ? { ...defaultStickyCookie, ...policy.cookie } : null,
+  };
+}
+
+function normalizeStickySource(source?: StickyKeySource): StickyKeySource {
+  if (source?.type === 'header') return { type: 'header', name: source.name || 'x-user-id' };
+  if (source?.type === 'cookie') return { type: 'cookie', name: source.name || 'session' };
+  if (source?.type === 'jwt_claim') return { type: 'jwt_claim', claim_path: source.claim_path || 'sub' };
+  return { type: 'ip' };
+}
+
+function newTcpListener(index = 0): TcpListener {
+  return {
+    name: `tcp-${index + 1}`,
+    listen: '0.0.0.0:8443',
+    mode: 'tcp',
+    upstream: null,
+    sni_routes: {},
+    maxconn: null,
+  };
+}
+
+function normalizeTcpListener(listener: TcpListener): TcpListener {
+  return {
+    name: listener.name ?? '',
+    listen: listener.listen ?? '',
+    mode: listener.mode === 'tls_passthrough' ? 'tls_passthrough' : 'tcp',
+    upstream: listener.upstream || null,
+    sni_routes: Object.fromEntries(Object.entries(listener.sni_routes ?? {}).filter(([host, upstream]) => host.trim() && upstream.trim()).map(([host, upstream]) => [host.trim().toLowerCase(), upstream.trim()])),
+    maxconn: nullablePositiveNumber(listener.maxconn),
   };
 }
 
