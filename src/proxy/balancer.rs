@@ -427,6 +427,7 @@ mod tests {
         Target {
             url: url.to_string(),
             weight,
+            timeouts: Default::default(),
         }
     }
 
@@ -439,6 +440,7 @@ mod tests {
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
+            timeouts: Default::default(),
         }
     }
 
@@ -875,6 +877,7 @@ mod tests {
             health_check: check.clone(),
             balance: Default::default(),
             retry: Default::default(),
+            timeouts: Default::default(),
         };
         health.record_probe_result(
             &HealthRegistry::target_key("backend", "http://a"),

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use serde::de::DeserializeOwned;
 
 use crate::config::yaml::{
     AccessLogConfig, AppConfig, Certificate, Fallback, MonitoringConfig, TlsListener,
@@ -293,6 +294,17 @@ fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(result)
 }
 
+fn load_json_setting<T>(conn: &Connection, key: &str) -> Result<T>
+where
+    T: DeserializeOwned + Default,
+{
+    match get_setting(conn, key)? {
+        Some(value) => serde_json::from_str(&value)
+            .with_context(|| format!("failed to parse settings.{key} as JSON")),
+        None => Ok(T::default()),
+    }
+}
+
 fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
@@ -337,14 +349,8 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
         .unwrap_or(None)
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
-    let timeouts = get_setting(conn, "timeouts")
-        .unwrap_or(None)
-        .and_then(|v| serde_json::from_str::<TimeoutPolicy>(&v).ok())
-        .unwrap_or_default();
-    let limits = get_setting(conn, "limits")
-        .unwrap_or(None)
-        .and_then(|v| serde_json::from_str::<ConnectionLimitPolicy>(&v).ok())
-        .unwrap_or_default();
+    let timeouts = load_json_setting::<TimeoutPolicy>(conn, "timeouts")?;
+    let limits = load_json_setting::<ConnectionLimitPolicy>(conn, "limits")?;
     let certificate_dir = get_setting(conn, "certificate_dir")
         .unwrap_or(None)
         .unwrap_or_else(|| "/etc/rustproxy/cert.d".to_string());
@@ -404,7 +410,7 @@ fn load_config(conn: &Connection) -> Result<AppConfig> {
 
 fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy FROM rules ORDER BY priority DESC, rowid ASC"
+        "SELECT id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy, timeout_policy FROM rules ORDER BY priority DESC, rowid ASC"
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -426,8 +432,15 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
         let header_policy_json: Option<String> = row.get(16)?;
         let path_actions_json: Option<String> = row.get(17)?;
         let limit_policy_json: Option<String> = row.get(18)?;
+        let timeout_policy_json: Option<String> = row.get(19)?;
         let conditions =
             expr_json.and_then(|json| serde_json::from_str::<ConditionExpr>(&json).ok());
+        let mut timeouts =
+            json_or_default::<crate::models::RuleTimeoutPolicy>(timeout_policy_json.as_deref());
+        if timeouts.server_timeout_seconds.is_none() && request_timeout > 0 {
+            timeouts.server_timeout_seconds = Some(request_timeout);
+        }
+
         Ok(Rule {
             id,
             name,
@@ -454,6 +467,7 @@ fn load_rules(conn: &Connection) -> Result<Vec<Rule>> {
             header_policy: json_or_default(header_policy_json.as_deref()),
             path_actions: json_or_default(path_actions_json.as_deref()),
             limit_policy: json_or_default(limit_policy_json.as_deref()),
+            timeouts,
         })
     })?;
 
@@ -475,9 +489,10 @@ fn insert_rule(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
     let header_policy = serde_json::to_string(&rule.header_policy)?;
     let path_actions = serde_json::to_string(&rule.path_actions)?;
     let limit_policy = serde_json::to_string(&rule.limit_policy)?;
+    let timeout_policy = serde_json::to_string(&rule.timeouts)?;
     tx.execute(
-        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, header_policy, path_actions, limit_policy],
+        "INSERT INTO rules (id, name, priority, upstream, weight, condition_expr, listen, tls_enabled, tls_certificate, is_fallback, match_set, host_type, host_value, location_type, location_value, request_timeout, header_policy, path_actions, limit_policy, timeout_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        params![rule.id, rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, header_policy, path_actions, limit_policy, timeout_policy],
     )?;
     Ok(())
 }
@@ -491,7 +506,7 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
         let targets = load_targets(conn, &name)?;
         let (skip_ssl, websocket) = load_upstream_options(conn, &name)?;
         let health_check = load_health_check(conn, &name)?;
-        let (balance, retry) = load_upstream_policy(conn, &name)?;
+        let (balance, retry, timeouts) = load_upstream_policy(conn, &name)?;
         upstreams.push(Upstream {
             name,
             skip_ssl,
@@ -500,6 +515,7 @@ fn load_upstreams(conn: &Connection) -> Result<Vec<Upstream>> {
             health_check,
             balance,
             retry,
+            timeouts,
         });
     }
     Ok(upstreams)
@@ -550,16 +566,22 @@ fn load_health_check(conn: &Connection, upstream_name: &str) -> Result<HealthChe
 fn load_upstream_policy(
     conn: &Connection,
     upstream_name: &str,
-) -> Result<(BalanceAlgorithm, RetryPolicy)> {
+) -> Result<(
+    BalanceAlgorithm,
+    RetryPolicy,
+    crate::models::UpstreamTimeoutPolicy,
+)> {
     conn.query_row(
-        "SELECT balance, retry_policy FROM upstreams WHERE name = ?1",
+        "SELECT balance, retry_policy, timeout_policy FROM upstreams WHERE name = ?1",
         params![upstream_name],
         |row| {
             let balance: String = row.get(0)?;
             let retry_json: Option<String> = row.get(1)?;
+            let timeout_json: Option<String> = row.get(2)?;
             Ok((
                 parse_balance_algorithm(&balance),
                 json_or_default(retry_json.as_deref()),
+                json_or_default(timeout_json.as_deref()),
             ))
         },
     )
@@ -568,11 +590,14 @@ fn load_upstream_policy(
 
 fn load_targets(conn: &Connection, upstream_name: &str) -> Result<Vec<Target>> {
     let mut stmt = conn
-        .prepare("SELECT url, weight FROM targets WHERE upstream_name = ?1 ORDER BY sort_order")?;
+        .prepare(
+            "SELECT url, weight, timeout_policy FROM targets WHERE upstream_name = ?1 ORDER BY sort_order",
+        )?;
     let rows = stmt.query_map(params![upstream_name], |row| {
         Ok(Target {
             url: row.get(0)?,
             weight: row.get::<_, i64>(1)? as u32,
+            timeouts: json_or_default(row.get::<_, Option<String>>(2)?.as_deref()),
         })
     })?;
     let mut targets = Vec::new();
@@ -663,7 +688,7 @@ fn set_setting_tx(tx: &rusqlite::Transaction, key: &str, value: &str) -> Result<
 fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
     let retry_policy = serde_json::to_string(&upstream.retry)?;
     tx.execute(
-        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO upstreams (name, skip_ssl, websocket, health_check_enabled, health_check_mode, health_check_path, health_check_expected_status, health_check_interval_seconds, health_check_timeout_seconds, health_check_healthy_threshold, health_check_unhealthy_threshold, balance, retry_policy, timeout_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             upstream.name,
             upstream.skip_ssl,
@@ -678,6 +703,7 @@ fn insert_upstream(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()
             upstream.health_check.unhealthy_threshold,
             balance_algorithm_str(upstream.balance),
             retry_policy,
+            serde_json::to_string(&upstream.timeouts)?,
         ],
     )?;
     insert_targets(tx, &upstream.name, &upstream.targets)?;
@@ -718,8 +744,14 @@ fn insert_targets(
 ) -> Result<()> {
     for (i, target) in targets.iter().enumerate() {
         tx.execute(
-            "INSERT INTO targets (upstream_name, url, weight, sort_order) VALUES (?1, ?2, ?3, ?4)",
-            params![upstream_name, target.url, target.weight, i as i64],
+            "INSERT INTO targets (upstream_name, url, weight, sort_order, timeout_policy) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                upstream_name,
+                target.url,
+                target.weight,
+                i as i64,
+                serde_json::to_string(&target.timeouts)?,
+            ],
         )?;
     }
     Ok(())
@@ -736,9 +768,10 @@ fn update_rule_row(tx: &rusqlite::Transaction, rule: &Rule) -> Result<()> {
     let header_policy = serde_json::to_string(&rule.header_policy)?;
     let path_actions = serde_json::to_string(&rule.path_actions)?;
     let limit_policy = serde_json::to_string(&rule.limit_policy)?;
+    let timeout_policy = serde_json::to_string(&rule.timeouts)?;
     let changes = tx.execute(
-        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14, request_timeout = ?15, header_policy = ?16, path_actions = ?17, limit_policy = ?18 WHERE id = ?19",
-        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, header_policy, path_actions, limit_policy, rule.id],
+        "UPDATE rules SET name = ?1, priority = ?2, upstream = ?3, weight = ?4, condition_expr = ?5, listen = ?6, tls_enabled = ?7, tls_certificate = ?8, is_fallback = ?9, match_set = ?10, host_type = ?11, host_value = ?12, location_type = ?13, location_value = ?14, request_timeout = ?15, header_policy = ?16, path_actions = ?17, limit_policy = ?18, timeout_policy = ?19 WHERE id = ?20",
+        params![rule.name, rule.priority, rule.upstream, rule.weight, expr_json, rule.listen, tls_enabled, tls_certificate, rule.is_fallback, rule.match_set, host_match_type_str(&rule.host.match_type), rule.host.value, location_match_type_str(&rule.location.match_type), rule.location.value, rule.request_timeout, header_policy, path_actions, limit_policy, timeout_policy, rule.id],
     )?;
     if changes == 0 {
         anyhow::bail!("rule '{}' not found", rule.id);
@@ -788,8 +821,9 @@ fn delete_upstream_targets(tx: &rusqlite::Transaction, upstream_name: &str) -> R
 
 fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Result<()> {
     let retry_policy = serde_json::to_string(&upstream.retry)?;
+    let timeout_policy = serde_json::to_string(&upstream.timeouts)?;
     let changes = tx.execute(
-        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, updated_at = datetime('now') WHERE name = ?13",
+        "UPDATE upstreams SET skip_ssl = ?1, websocket = ?2, health_check_enabled = ?3, health_check_mode = ?4, health_check_path = ?5, health_check_expected_status = ?6, health_check_interval_seconds = ?7, health_check_timeout_seconds = ?8, health_check_healthy_threshold = ?9, health_check_unhealthy_threshold = ?10, balance = ?11, retry_policy = ?12, timeout_policy = ?13, updated_at = datetime('now') WHERE name = ?14",
         params![
             upstream.skip_ssl,
             upstream.websocket,
@@ -803,6 +837,7 @@ fn update_upstream_row(tx: &rusqlite::Transaction, upstream: &Upstream) -> Resul
             upstream.health_check.unhealthy_threshold,
             balance_algorithm_str(upstream.balance),
             retry_policy,
+            timeout_policy,
             upstream.name,
         ],
     )?;
@@ -832,6 +867,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
     health_check_unhealthy_threshold INTEGER NOT NULL DEFAULT 2,
     balance                          TEXT NOT NULL DEFAULT 'weighted_round_robin',
     retry_policy                     TEXT,
+    timeout_policy                   TEXT,
     created_at                       TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at                       TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -841,7 +877,8 @@ CREATE TABLE IF NOT EXISTS targets (
     upstream_name TEXT NOT NULL REFERENCES upstreams(name) ON DELETE CASCADE,
     url           TEXT NOT NULL,
     weight        INTEGER NOT NULL DEFAULT 100,
-    sort_order    INTEGER NOT NULL DEFAULT 0
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    timeout_policy TEXT
 );
 
 CREATE TABLE IF NOT EXISTS rules (
@@ -864,6 +901,7 @@ CREATE TABLE IF NOT EXISTS rules (
     header_policy   TEXT,
     path_actions    TEXT,
     limit_policy    TEXT,
+    timeout_policy  TEXT,
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -936,6 +974,7 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "rules", "header_policy", "TEXT")?;
     add_column_if_missing(conn, "rules", "path_actions", "TEXT")?;
     add_column_if_missing(conn, "rules", "limit_policy", "TEXT")?;
+    add_column_if_missing(conn, "rules", "timeout_policy", "TEXT")?;
 
     add_column_if_missing(conn, "upstreams", "skip_ssl", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "upstreams", "websocket", "INTEGER NOT NULL DEFAULT 0")?;
@@ -994,6 +1033,8 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'weighted_round_robin'",
     )?;
     add_column_if_missing(conn, "upstreams", "retry_policy", "TEXT")?;
+    add_column_if_missing(conn, "upstreams", "timeout_policy", "TEXT")?;
+    add_column_if_missing(conn, "targets", "timeout_policy", "TEXT")?;
 
     Ok(())
 }
@@ -1125,6 +1166,7 @@ mod tests {
                 is_fallback: false,
                 listen: None,
                 request_timeout: 0,
+                timeouts: Default::default(),
                 tls: None,
                 header_policy: Default::default(),
                 path_actions: Vec::new(),
@@ -1142,15 +1184,18 @@ mod tests {
                             Target {
                                 url: "http://a:8080".to_string(),
                                 weight: 70,
+                                timeouts: Default::default(),
                             },
                             Target {
                                 url: "http://b:8080".to_string(),
                                 weight: 30,
+                                timeouts: Default::default(),
                             },
                         ],
                         health_check: Default::default(),
                         balance: Default::default(),
                         retry: Default::default(),
+                        timeouts: Default::default(),
                     },
                 );
                 m
@@ -1266,6 +1311,10 @@ mod tests {
             global_maxconn: Some(1024),
             listener_maxconn: Some(128),
         };
+        config.rules[0].timeouts.server_timeout_seconds = Some(8);
+        let upstream = config.upstreams.get_mut("backend-1").unwrap();
+        upstream.timeouts.connect_timeout_seconds = Some(4);
+        upstream.targets[0].timeouts.server_timeout_seconds = Some(5);
 
         db.save_full_config(&config).unwrap();
         let loaded = db.load_config().unwrap();
@@ -1275,6 +1324,23 @@ mod tests {
         assert_eq!(loaded.connect_timeout, 3);
         assert_eq!(loaded.request_timeout, 12);
         assert_eq!(loaded.pool_idle_timeout, 14);
+        assert_eq!(loaded.rules[0].timeouts.server_timeout_seconds, Some(8));
+        let loaded_upstream = loaded.upstreams.get("backend-1").unwrap();
+        assert_eq!(loaded_upstream.timeouts.connect_timeout_seconds, Some(4));
+        assert_eq!(
+            loaded_upstream.targets[0].timeouts.server_timeout_seconds,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn malformed_timeout_setting_fails_load_config() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_setting("timeouts", "{malformed").unwrap();
+
+        let err = db.load_config().unwrap_err();
+
+        assert!(err.to_string().contains("timeouts"));
     }
 
     #[test]
@@ -1315,6 +1381,7 @@ mod tests {
             is_fallback: false,
             listen: None,
             request_timeout: 7,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),
@@ -1347,10 +1414,12 @@ mod tests {
             targets: vec![Target {
                 url: "http://c:9090".to_string(),
                 weight: 100,
+                timeouts: Default::default(),
             }],
             health_check: Default::default(),
             balance: Default::default(),
             retry: Default::default(),
+            timeouts: Default::default(),
         };
         db.create_upstream(&new_upstream).unwrap();
         assert_eq!(db.list_upstreams().unwrap().len(), 2);

@@ -79,10 +79,15 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
                     name: name.clone(),
                     skip_ssl: false,
                     websocket: false,
-                    targets: vec![Target { url, weight }],
+                    targets: vec![Target {
+                        url,
+                        weight,
+                        timeouts: Default::default(),
+                    }],
                     health_check: Default::default(),
                     balance: Default::default(),
                     retry: Default::default(),
+                    timeouts: Default::default(),
                 },
             );
             db.save_full_config(&config)?;
@@ -93,7 +98,11 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
             let Some(upstream) = config.upstreams.get_mut(&name) else {
                 anyhow::bail!("upstream '{name}' not found");
             };
-            upstream.targets.push(Target { url, weight });
+            upstream.targets.push(Target {
+                url,
+                weight,
+                timeouts: Default::default(),
+            });
             db.save_full_config(&config)?;
             println!("target added to upstream {name}");
         }
@@ -172,6 +181,7 @@ pub fn run_rule(db_path: &str, command: RuleCommands) -> Result<()> {
                 is_fallback: false,
                 listen,
                 request_timeout: 0,
+                timeouts: Default::default(),
                 tls: None,
                 header_policy: Default::default(),
                 path_actions: Vec::new(),

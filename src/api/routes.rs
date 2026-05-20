@@ -1398,6 +1398,7 @@ mod tests {
         Target {
             url: url.to_string(),
             weight,
+            timeouts: Default::default(),
         }
     }
 
@@ -1437,6 +1438,7 @@ mod tests {
             health_check: Default::default(),
             balance: BalanceAlgorithm::LeastConnections,
             retry: Default::default(),
+            timeouts: Default::default(),
         }
     }
 

@@ -18,10 +18,12 @@ fn build_config() -> AppConfig {
         targets: vec![Target {
             url: "http://canary.internal:8080".to_string(),
             weight: 100,
+            timeouts: Default::default(),
         }],
         health_check: Default::default(),
         balance: Default::default(),
         retry: Default::default(),
+        timeouts: Default::default(),
     };
 
     let mut upstreams = HashMap::new();
@@ -51,6 +53,7 @@ fn build_config() -> AppConfig {
             is_fallback: false,
             listen: None,
             request_timeout: 0,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),

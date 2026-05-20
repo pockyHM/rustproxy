@@ -116,6 +116,7 @@ mod tests {
             is_fallback: false,
             listen: None,
             request_timeout: 0,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),
@@ -199,6 +200,7 @@ mod tests {
             is_fallback: false,
             listen: None,
             request_timeout: 0,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),
@@ -227,6 +229,7 @@ mod tests {
             is_fallback: false,
             listen: None,
             request_timeout: 0,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),
@@ -246,6 +249,26 @@ mod tests {
         assert!(rule.header_policy.response.is_empty());
         assert!(rule.path_actions.is_empty());
         assert_eq!(rule.limit_policy.rate_per_second, None);
+        assert_eq!(rule.timeouts, RuleTimeoutPolicy::default());
+    }
+
+    #[test]
+    fn test_rule_timeout_policy_serde() {
+        let json = r#"{
+            "id":"r1",
+            "name":"R1",
+            "priority":10,
+            "upstream":"api",
+            "weight":100,
+            "timeouts":{"server_timeout_seconds":7}
+        }"#;
+
+        let rule: Rule = serde_json::from_str(json).unwrap();
+
+        assert_eq!(rule.timeouts.server_timeout_seconds, Some(7));
+        let serialized = serde_json::to_string(&rule).unwrap();
+        assert!(serialized.contains("\"timeouts\""));
+        assert!(serialized.contains("\"server_timeout_seconds\":7"));
     }
 
     #[test]
@@ -263,6 +286,7 @@ mod tests {
             is_fallback: false,
             listen: None,
             request_timeout: 0,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),
@@ -359,6 +383,7 @@ pub struct Rule {
     pub listen: Option<String>,
     /// Request timeout override in seconds. 0 inherits the global request_timeout.
     pub request_timeout: u64,
+    pub timeouts: RuleTimeoutPolicy,
     pub tls: Option<RuleTls>,
     pub header_policy: HeaderPolicy,
     pub path_actions: Vec<PathAction>,
@@ -548,7 +573,7 @@ impl Serialize for Rule {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Rule", 16)?;
+        let mut state = serializer.serialize_struct("Rule", 17)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("priority", &self.priority)?;
@@ -561,6 +586,7 @@ impl Serialize for Rule {
         state.serialize_field("is_fallback", &self.is_fallback)?;
         state.serialize_field("listen", &self.listen)?;
         state.serialize_field("request_timeout", &self.request_timeout)?;
+        state.serialize_field("timeouts", &self.timeouts)?;
         state.serialize_field("tls", &self.tls)?;
         state.serialize_field("header_policy", &self.header_policy)?;
         state.serialize_field("path_actions", &self.path_actions)?;
@@ -597,6 +623,8 @@ impl<'de> Deserialize<'de> for Rule {
             #[serde(default)]
             request_timeout: u64,
             #[serde(default)]
+            timeouts: RuleTimeoutPolicy,
+            #[serde(default)]
             tls: Option<RuleTls>,
             #[serde(default)]
             header_policy: HeaderPolicy,
@@ -606,6 +634,11 @@ impl<'de> Deserialize<'de> for Rule {
             limit_policy: LimitPolicy,
         }
         let helper = RuleHelper::deserialize(deserializer)?;
+        let mut timeouts = helper.timeouts;
+        if timeouts.server_timeout_seconds.is_none() && helper.request_timeout > 0 {
+            timeouts.server_timeout_seconds = Some(helper.request_timeout);
+        }
+
         Ok(Rule {
             id: helper.id,
             name: helper.name,
@@ -619,6 +652,7 @@ impl<'de> Deserialize<'de> for Rule {
             is_fallback: helper.is_fallback,
             listen: helper.listen,
             request_timeout: helper.request_timeout,
+            timeouts,
             tls: helper.tls,
             header_policy: helper.header_policy,
             path_actions: helper.path_actions,

@@ -425,6 +425,29 @@ fallback: { url: "404" }
     }
 
     #[test]
+    fn timeout_policy_wins_over_legacy_aliases_when_both_present() {
+        let yaml = r#"
+connect_timeout: 2
+request_timeout: 30
+pool_idle_timeout: 45
+timeouts:
+  connect_timeout_seconds: 3
+  server_timeout_seconds: 7
+  http_keepalive_timeout_seconds: 11
+fallback: { url: "404" }
+"#;
+        let file = create_test_config_file(yaml);
+        let config = AppConfig::load(file.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(config.timeouts.connect_timeout_seconds, 3);
+        assert_eq!(config.timeouts.server_timeout_seconds, 7);
+        assert_eq!(config.timeouts.http_keepalive_timeout_seconds, 11);
+        assert_eq!(config.connect_timeout, 3);
+        assert_eq!(config.request_timeout, 7);
+        assert_eq!(config.pool_idle_timeout, 11);
+    }
+
+    #[test]
     fn test_app_config_load() {
         let yaml_content = r#"
 listen: "0.0.0.0:8080"
@@ -540,10 +563,12 @@ fallback:
                 targets: vec![Target {
                     url: "http://localhost:8080".to_string(),
                     weight: 100,
+                    timeouts: Default::default(),
                 }],
                 health_check: Default::default(),
                 balance: Default::default(),
                 retry: Default::default(),
+                timeouts: Default::default(),
             },
         );
         let config = AppConfig {
@@ -593,6 +618,7 @@ fallback:
                 is_fallback: false,
                 listen: None,
                 request_timeout: 0,
+                timeouts: Default::default(),
                 tls: None,
                 header_policy: Default::default(),
                 path_actions: Vec::new(),
@@ -618,6 +644,8 @@ fallback:
         assert!(!yaml.contains("limit_policy:"));
         assert!(!yaml.contains("balance: weighted_round_robin"));
         assert!(!yaml.contains("retry:"));
+        assert!(!yaml.contains("timeouts:"));
+        assert!(!yaml.contains("limits:"));
         assert!(!yaml.contains("certificates: []"));
         assert!(!yaml.contains("path: /tmp/access.log"));
     }

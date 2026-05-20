@@ -98,15 +98,18 @@ mod tests {
                 Target {
                     url: "http://first".to_string(),
                     weight: 1,
+                    timeouts: Default::default(),
                 },
                 Target {
                     url: "http://second".to_string(),
                     weight: 1,
+                    timeouts: Default::default(),
                 },
             ],
             health_check: Default::default(),
             balance: Default::default(),
             retry: policy.clone(),
+            timeouts: Default::default(),
         };
         let mut upstreams = HashMap::new();
         upstreams.insert("backend".to_string(), upstream);

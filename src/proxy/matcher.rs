@@ -696,6 +696,7 @@ mod tests {
             is_fallback: false,
             listen: None,
             request_timeout: 0,
+            timeouts: Default::default(),
             tls: None,
             header_policy: Default::default(),
             path_actions: Vec::new(),
