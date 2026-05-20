@@ -347,6 +347,7 @@ const T: Record<string, [string, string]> = {
   'action.drain': ['Drain', '排空'],
   'action.apply': ['Apply', '应用'],
   'action.addTarget': ['Add Target', '添加目标'],
+  'action.addTcpTarget': ['Add TCP Target', '添加 TCP 目标'],
   'metric.requests': ['PROXY REQUESTS', '代理请求数'],
   'metric.latency': ['AVG LATENCY', '平均延迟'],
   'metric.conns': ['ACTIVE CONNECTIONS', '活跃连接'],
@@ -477,6 +478,9 @@ const T: Record<string, [string, string]> = {
   'form.operator': ['Operator', '操作符'],
   'form.value': ['Value', '值'],
   'form.targets': ['Targets', '目标'],
+  'form.targetProtocol': ['Protocol', '协议'],
+  'form.targetUrl': ['Target URL', '目标地址'],
+  'form.targetUrlHint': ['Use http:// or https:// for HTTP routes; use tcp://host:port for TCP listeners.', 'HTTP 路由使用 http:// 或 https://；TCP 监听使用 tcp://host:port。'],
   'form.balance': ['Load balancing', '负载均衡'],
   'form.algorithm': ['Algorithm', '算法'],
   'form.retry': ['Retry policy', '重试策略'],
@@ -508,6 +512,8 @@ const T: Record<string, [string, string]> = {
   'form.replacement': ['Replacement', '替换值'],
   'form.status': ['Status', '状态码'],
   'form.locationTarget': ['Location', '跳转地址'],
+  'form.advanced': ['Advanced config', '高级配置'],
+  'form.advancedDesc': ['Route timeouts, header mutations, path actions, and throttling.', '规则级超时、Header 策略、路径动作和限流。'],
   'health.title': ['Health Check', '健康检查'],
   'health.desc': ['Probe targets in the background and skip endpoints after repeated failures.', '后台探测目标并在反复失败后跳过端点。'],
   'health.enabled': ['Enabled', '已启用'],
@@ -632,6 +638,8 @@ const SAME_SITE_OPTIONS = ['lax', 'strict', 'none'] as const;
 const HEADER_MUTATION_OPS: HeaderMutationOp[] = ['set', 'add', 'remove'];
 const PATH_ACTION_TYPES = ['strip_prefix', 'rewrite', 'redirect'] as const;
 type PathActionType = typeof PATH_ACTION_TYPES[number];
+const TARGET_SCHEMES = ['http', 'https', 'tcp'] as const;
+type TargetScheme = typeof TARGET_SCHEMES[number];
 
 const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
   { id: 'operations', labelKey: 'nav.operations', icon: 'monitoring' },
@@ -1719,7 +1727,6 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
             {!draft.is_fallback && <section className="form-section">
               <h3 className="form-section-title">{t('form.routing')}</h3>
               <Field label={t('table.priority')}><input type="number" value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: Number(e.target.value) })} /></Field>
-              <Field label={t('rule.requestTimeout')}><input type="number" min="0" placeholder={t('rule.requestTimeoutInherit')} value={draft.request_timeout ?? 0} onChange={(e) => setDraft({ ...draft, request_timeout: Number(e.target.value) })} /></Field>
               <Field label={t('table.pool')}>
                 <Dropdown
                   value={draft.upstream}
@@ -1728,13 +1735,6 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 />
               </Field>
             </section>}
-            {!draft.is_fallback && (
-              <TimeoutOverrideEditor
-                title={t('config.timeouts')}
-                value={draft.timeouts}
-                onChange={(timeouts) => setDraft({ ...draft, timeouts })}
-              />
-            )}
             <section className="form-section">
               {draft.is_fallback && <h3 className="form-section-title">{t('form.routing')}</h3>}
               {draft.is_fallback && (
@@ -1802,9 +1802,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               </Field>
               {!draft.match_set && <ConditionEditor draft={draft} setDraft={setDraft} />}
             </section>}
-            <HeaderPolicyEditor draft={draft} setDraft={setDraft} />
-            <PathActionsEditor draft={draft} setDraft={setDraft} />
-            <LimitPolicyEditor draft={draft} setDraft={setDraft} />
+            {!draft.is_fallback && <AdvancedRuleConfig draft={draft} setDraft={setDraft} />}
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
               <button type="submit" className="btn btn-primary" disabled={protocolConflict}>{editing ? t('action.save') : t('action.create')}</button>
@@ -2035,14 +2033,48 @@ function ConditionLeafEditor({ expr, onChange }: {
 
 /* ===== Rule Policy Editors ===== */
 
-function HeaderPolicyEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+function AdvancedRuleConfig({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+  const { t } = useI18n();
+  return (
+    <details className="advanced-section">
+      <summary className="advanced-section-summary">
+        <span className="advanced-section-title"><Icon name="tune" size={18} />{t('form.advanced')}</span>
+        <span className="advanced-section-desc">{t('form.advancedDesc')}</span>
+        <Icon name="expand_more" size={20} />
+      </summary>
+      <div className="advanced-section-body">
+        <TimeoutOverrideEditor
+          embedded
+          title={t('config.timeouts')}
+          value={draft.timeouts}
+          onChange={(timeouts) => setDraft({ ...draft, timeouts })}
+        >
+          <Field label={t('rule.requestTimeout')}>
+            <input
+              type="number"
+              min="0"
+              placeholder={t('rule.requestTimeoutInherit')}
+              value={draft.request_timeout ?? 0}
+              onChange={(e) => setDraft({ ...draft, request_timeout: Number(e.target.value) })}
+            />
+          </Field>
+        </TimeoutOverrideEditor>
+        <HeaderPolicyEditor embedded draft={draft} setDraft={setDraft} />
+        <PathActionsEditor embedded draft={draft} setDraft={setDraft} />
+        <LimitPolicyEditor embedded draft={draft} setDraft={setDraft} />
+      </div>
+    </details>
+  );
+}
+
+function HeaderPolicyEditor({ draft, setDraft, embedded = false }: { draft: Rule; setDraft: (rule: Rule) => void; embedded?: boolean }) {
   const { t } = useI18n();
   const policy = normalizeHeaderPolicy(draft.header_policy);
   function update(kind: keyof HeaderPolicy, items: HeaderMutation[]) {
     setDraft({ ...draft, header_policy: { ...policy, [kind]: items.map(normalizeHeaderMutation) } });
   }
   return (
-    <section className="form-section">
+    <section className={embedded ? 'advanced-group' : 'form-section'}>
       <h3 className="form-section-title">{t('form.headers')}</h3>
       <HeaderMutationList
         title={t('form.requestHeaders')}
@@ -2108,14 +2140,14 @@ function HeaderMutationList({ title, items, onChange }: {
   );
 }
 
-function PathActionsEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+function PathActionsEditor({ draft, setDraft, embedded = false }: { draft: Rule; setDraft: (rule: Rule) => void; embedded?: boolean }) {
   const { t } = useI18n();
   const actions = normalizePathActions(draft.path_actions);
   function replace(index: number, action: PathAction) {
     setDraft({ ...draft, path_actions: actions.map((current, i) => i === index ? action : current) });
   }
   return (
-    <section className="form-section">
+    <section className={embedded ? 'advanced-group' : 'form-section'}>
       <div className="policy-subsection-head">
         <h3 className="form-section-title">{t('form.pathActions')}</h3>
         <button type="button" className="btn btn-secondary btn-sm" onClick={() => setDraft({ ...draft, path_actions: [...actions, createPathAction()] })}>
@@ -2176,14 +2208,14 @@ function PathActionsEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: 
   );
 }
 
-function LimitPolicyEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: Rule) => void }) {
+function LimitPolicyEditor({ draft, setDraft, embedded = false }: { draft: Rule; setDraft: (rule: Rule) => void; embedded?: boolean }) {
   const { t } = useI18n();
   const policy = normalizeLimitPolicy(draft.limit_policy);
   function update(patch: Partial<LimitPolicy>) {
     setDraft({ ...draft, limit_policy: normalizeLimitPolicy({ ...policy, ...patch }) });
   }
   return (
-    <section className="form-section">
+    <section className={embedded ? 'advanced-group' : 'form-section'}>
       <h3 className="form-section-title">{t('form.limitPolicy')}</h3>
       <div className="form-grid-3">
         <Field label={t('form.ratePerSecond')}>
@@ -2206,16 +2238,23 @@ function LimitPolicyEditor({ draft, setDraft }: { draft: Rule; setDraft: (rule: 
   );
 }
 
-function TimeoutOverrideEditor({ value, onChange, title }: { value?: TimeoutOverridePolicy; onChange: (next: TimeoutOverridePolicy) => void; title: string }) {
+function TimeoutOverrideEditor({ value, onChange, title, embedded = false, children }: {
+  value?: TimeoutOverridePolicy;
+  onChange: (next: TimeoutOverridePolicy) => void;
+  title: string;
+  embedded?: boolean;
+  children?: ReactNode;
+}) {
   const { t } = useI18n();
   const policy = normalizeTimeoutOverride(value);
   function update(key: keyof TimeoutOverridePolicy, input: string) {
     onChange({ ...policy, [key]: parseOptionalPositive(input) });
   }
   return (
-    <section className="form-section">
+    <section className={embedded ? 'advanced-group' : 'form-section'}>
       <h3 className="form-section-title">{title}</h3>
       <div className="form-grid-3">
+        {children}
         <Field label={t('config.connectTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.connect_timeout_seconds ?? ''} onChange={(e) => update('connect_timeout_seconds', e.target.value)} /></Field>
         <Field label={t('config.clientTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.client_timeout_seconds ?? ''} onChange={(e) => update('client_timeout_seconds', e.target.value)} /></Field>
         <Field label={t('config.serverTimeout')}><input type="number" min="0" placeholder={t('config.inheritHint')} value={policy.server_timeout_seconds ?? ''} onChange={(e) => update('server_timeout_seconds', e.target.value)} /></Field>
@@ -2349,6 +2388,9 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
 
   function openCreate() { setEditing(null); setDraft(newUpstream()); setShowModal(true); }
   function openEdit(u: Upstream) { setEditing(u.name); setDraft(normalizeUpstream(structuredClone(u))); setShowModal(true); }
+  function addTarget(scheme: TargetScheme = 'http') {
+    setDraft({ ...draft, targets: [...draft.targets, { url: defaultTargetUrl(scheme), weight: 100 }] });
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -2502,16 +2544,34 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
             </section>
             <section className="form-section">
               <h3 className="form-section-title">{t('form.targets')}</h3>
+              <p className="card-desc">{t('form.targetUrlHint')}</p>
               <div className="target-editor">
                 {draft.targets.map((target, i) => (
                   <div className="target-row" key={i}>
-                    <Field label="URL"><input value={target.url} onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, url: e.target.value }))} required /></Field>
+                    <Field label={t('form.targetProtocol')}>
+                      <Dropdown
+                        value={targetScheme(target.url)}
+                        options={enumOptions(TARGET_SCHEMES)}
+                        onChange={(scheme) => setDraft(replaceTarget(draft, i, { ...target, url: rewriteTargetScheme(target.url, scheme as TargetScheme) }))}
+                      />
+                    </Field>
+                    <Field label={t('form.targetUrl')}>
+                      <input
+                        value={target.url}
+                        placeholder={targetPlaceholder(targetScheme(target.url))}
+                        onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, url: e.target.value }))}
+                        required
+                      />
+                    </Field>
                     <Field label={t('table.weight')}><input type="number" min="0" value={target.weight} onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, weight: Number(e.target.value) }))} /></Field>
                     <button type="button" className="btn btn-ghost btn-sm" style={{ marginTop: 24 }} onClick={() => setDraft({ ...draft, targets: draft.targets.filter((_, j) => j !== i) })}><Icon name="close" size={16} /></button>
                   </div>
                 ))}
               </div>
-              <button type="button" className="btn btn-secondary" style={{ marginTop: 10 }} onClick={() => setDraft({ ...draft, targets: [...draft.targets, { url: 'http://127.0.0.1:8080', weight: 100 }] })}><Icon name="add" size={16} />{t('action.addTarget')}</button>
+              <div className="target-actions">
+                <button type="button" className="btn btn-secondary" onClick={() => addTarget('http')}><Icon name="add" size={16} />{t('action.addTarget')}</button>
+                <button type="button" className="btn btn-secondary" onClick={() => addTarget('tcp')}><Icon name="settings_ethernet" size={16} />{t('action.addTcpTarget')}</button>
+              </div>
             </section>
             <StickyPolicyEditor draft={draft} setDraft={setDraft} />
             <HealthCheckEditor draft={draft} setDraft={setDraft} />
@@ -3546,6 +3606,25 @@ function targetSummary(upstream: Upstream, lang: Lang): string {
 
 function replaceTarget(upstream: Upstream, index: number, target: Target): Upstream {
   return { ...upstream, targets: upstream.targets.map((item, i) => (i === index ? target : item)) };
+}
+
+function targetScheme(url: string): TargetScheme {
+  const scheme = url.trim().match(/^([a-z][a-z0-9+.-]*):\/\//i)?.[1].toLowerCase();
+  return TARGET_SCHEMES.includes(scheme as TargetScheme) ? scheme as TargetScheme : 'http';
+}
+
+function rewriteTargetScheme(url: string, scheme: TargetScheme): string {
+  const trimmed = url.trim();
+  const body = trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') || targetPlaceholder(scheme).replace(/^[a-z]+:\/\//, '');
+  return `${scheme}://${body}`;
+}
+
+function defaultTargetUrl(scheme: TargetScheme): string {
+  return scheme === 'tcp' ? 'tcp://127.0.0.1:6379' : `${scheme}://127.0.0.1:8080`;
+}
+
+function targetPlaceholder(scheme: TargetScheme): string {
+  return defaultTargetUrl(scheme);
 }
 
 function conditionTypeOptions(t: (key: string) => string): DropdownOption[] {
