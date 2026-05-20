@@ -1,20 +1,24 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::models::{BalanceAlgorithm, Upstream};
 use crate::proxy::health::HealthRegistry;
 use crate::runtime::state::{RuntimeState, TargetKey};
+use crate::stick::{StickSnapshotEntry, StickTable, StickyPolicy};
 
 pub struct Balancer {
     upstreams: HashMap<String, WeightedUpstream>,
     health: Option<HealthRegistry>,
     runtime_state: RuntimeState,
+    stick_table: StickTable,
 }
 
 pub struct BalanceContext<'a> {
     pub client_ip: Option<&'a str>,
     pub path: &'a str,
+    pub sticky_key: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -32,6 +36,7 @@ pub struct TargetLease {
 struct WeightedUpstream {
     name: String,
     balance: BalanceAlgorithm,
+    sticky: StickyPolicy,
     targets: Vec<WeightedTarget>,
     total_weight: u32,
     counter: AtomicU32,
@@ -81,6 +86,7 @@ impl Balancer {
             upstreams,
             health,
             runtime_state,
+            stick_table: StickTable::default(),
         }
     }
 
@@ -97,6 +103,21 @@ impl Balancer {
         let upstream = self.upstreams.get(upstream_name)?;
         if upstream.targets.is_empty() || upstream.total_weight == 0 {
             return None;
+        }
+
+        let sticky_key = ctx
+            .sticky_key
+            .filter(|key| !key.is_empty())
+            .filter(|_| excluded_url.is_none() && upstream.sticky.enabled);
+        if let Some(selection) = sticky_key.and_then(|key| self.select_sticky(upstream, key)) {
+            let target = selection.target;
+            return Some(SelectedTarget {
+                url: target.url.clone(),
+                upstream: upstream.name.clone(),
+                active_connection: TargetLease {
+                    _runtime_lease: selection._runtime_lease,
+                },
+            });
         }
 
         let candidates = match upstream.balance {
@@ -119,6 +140,16 @@ impl Balancer {
         };
         let selection = self.acquire_selected_target(candidates.enabled, candidates.fallback)?;
         let target = selection.target;
+        if let Some(key) = sticky_key {
+            let now = Instant::now();
+            self.stick_table.bind(
+                &upstream.name,
+                key,
+                &target.url,
+                now + Duration::from_secs(upstream.sticky.ttl_seconds),
+                now,
+            );
+        }
 
         Some(SelectedTarget {
             url: target.url.clone(),
@@ -127,6 +158,24 @@ impl Balancer {
                 _runtime_lease: selection._runtime_lease,
             },
         })
+    }
+
+    fn select_sticky<'a>(
+        &'a self,
+        upstream: &'a WeightedUpstream,
+        sticky_key: &str,
+    ) -> Option<TargetSelection<'a>> {
+        let now = Instant::now();
+        let target_url = self.stick_table.lookup(&upstream.name, sticky_key, now)?;
+        let target = upstream.targets.iter().find(|target| {
+            target.url == target_url && self.target_is_selectable(target, None, false)
+        })?;
+        self.runtime_state
+            .acquire_available_target(&target.key)
+            .map(|runtime_lease| TargetSelection {
+                target,
+                _runtime_lease: runtime_lease,
+            })
     }
 
     fn weighted_round_robin_candidates<'a>(
@@ -329,6 +378,15 @@ impl Balancer {
         self.runtime_state.clone()
     }
 
+    pub(crate) fn stick_table_snapshot(&self, now: Instant) -> Vec<StickSnapshotEntry> {
+        self.stick_table.snapshot(now)
+    }
+
+    #[cfg(test)]
+    fn stick_table_for_test(&self) -> StickTable {
+        self.stick_table.clone()
+    }
+
     fn target_is_selectable(
         &self,
         target: &WeightedTarget,
@@ -366,6 +424,7 @@ impl WeightedUpstream {
         let mut targets = Vec::new();
         let upstream_name = upstream.name;
         let balance = upstream.balance;
+        let sticky = upstream.sticky;
         let health_enabled = upstream.health_check.enabled;
 
         for target in upstream.targets.into_iter() {
@@ -401,6 +460,7 @@ impl WeightedUpstream {
         Self {
             name: upstream_name,
             balance,
+            sticky,
             targets,
             total_weight,
             counter: AtomicU32::new(0),
@@ -421,7 +481,9 @@ mod tests {
     use crate::models::{BalanceAlgorithm, HealthCheck, Target, Upstream};
     use crate::proxy::health::HealthRegistry;
     use crate::runtime::state::{RuntimeState, TargetKey, TargetMode};
+    use crate::stick::{StickyKeySource, StickyPolicy};
     use std::collections::HashMap;
+    use std::time::Instant;
 
     fn target(url: &str, weight: u32) -> Target {
         Target {
@@ -457,7 +519,19 @@ mod tests {
     }
 
     fn ctx<'a>(client_ip: Option<&'a str>, path: &'a str) -> BalanceContext<'a> {
-        BalanceContext { client_ip, path }
+        BalanceContext {
+            client_ip,
+            path,
+            sticky_key: None,
+        }
+    }
+
+    fn sticky_ctx<'a>(key: &'a str) -> BalanceContext<'a> {
+        BalanceContext {
+            client_ip: None,
+            path: "/",
+            sticky_key: Some(key),
+        }
     }
 
     fn balancer_with(upstream: Upstream) -> Balancer {
@@ -470,6 +544,23 @@ mod tests {
         let mut upstreams = HashMap::new();
         upstreams.insert(upstream.name.clone(), upstream);
         Balancer::new_with_runtime(upstreams, None, runtime_state)
+    }
+
+    fn sticky_upstream() -> Upstream {
+        Upstream {
+            sticky: StickyPolicy {
+                enabled: true,
+                source: StickyKeySource::Header {
+                    name: "x-session".to_string(),
+                },
+                ttl_seconds: 60,
+                cookie: None,
+            },
+            ..upstream(
+                "backend",
+                vec![target("http://a", 1), target("http://b", 1)],
+            )
+        }
     }
 
     #[test]
@@ -514,6 +605,49 @@ mod tests {
                 "http://b".to_string(),
                 "http://c".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn sticky_key_reuses_bound_target_while_available() {
+        let balancer = balancer_with(sticky_upstream());
+
+        let first = balancer.select("backend", sticky_ctx("user-1")).unwrap();
+        let first_url = first.url.clone();
+        drop(first);
+        let second = balancer.select("backend", sticky_ctx("user-1")).unwrap();
+
+        assert_eq!(second.url, first_url);
+        assert_eq!(
+            balancer
+                .stick_table_for_test()
+                .snapshot(Instant::now())
+                .first()
+                .map(|entry| entry.target.as_str()),
+            Some(first_url.as_str())
+        );
+    }
+
+    #[test]
+    fn sticky_key_remaps_when_bound_target_is_disabled() {
+        let runtime = RuntimeState::default();
+        let balancer = balancer_with_runtime(sticky_upstream(), runtime.clone());
+
+        let first = balancer.select("backend", sticky_ctx("user-1")).unwrap();
+        let first_url = first.url.clone();
+        drop(first);
+        runtime.set_target_mode(&TargetKey::new("backend", &first_url), TargetMode::Disabled);
+
+        let second = balancer.select("backend", sticky_ctx("user-1")).unwrap();
+
+        assert_ne!(second.url, first_url);
+        assert_eq!(
+            balancer
+                .stick_table_for_test()
+                .snapshot(Instant::now())
+                .first()
+                .map(|entry| entry.target.as_str()),
+            Some(second.url.as_str())
         );
     }
 

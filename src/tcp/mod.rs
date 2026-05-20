@@ -124,6 +124,7 @@ async fn handle_tcp_connection(
             BalanceContext {
                 client_ip: Some(remote_ip.as_str()),
                 path: "",
+                sticky_key: None,
             },
         )
         .with_context(|| format!("no selectable target for TCP upstream {upstream}"))?;

@@ -47,6 +47,7 @@ use crate::{
     runtime::drain::DrainController,
     runtime::state::RuntimeState,
     runtime::timeouts::ResolvedTimeoutPolicy,
+    stick::StickSnapshotEntry,
     tcp::{run_tcp_listener, TcpRuntime, TcpRuntimeSnapshot},
 };
 
@@ -127,6 +128,10 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn runtime_state(&self) -> RuntimeState {
         self.runtime_state.clone()
+    }
+
+    pub(crate) fn stick_table_snapshot(&self, now: Instant) -> Vec<StickSnapshotEntry> {
+        self.proxy_runtime.load().balancer.stick_table_snapshot(now)
     }
 
     #[cfg(test)]
@@ -1121,6 +1126,7 @@ fn api_router(state: AppState) -> Router {
         )
         .route("/api/upstream-health", get(handlers::upstream_health))
         .route("/api/runtime/upstreams", get(runtime_api::list_upstreams))
+        .route("/api/runtime/stick-table", get(runtime_api::stick_table))
         .route(
             "/api/runtime/upstreams/:upstream/targets/enable",
             post(runtime_api::enable_target),
@@ -1260,6 +1266,13 @@ async fn proxy_handler(
                     } else {
                         rule.name.clone()
                     };
+                    let sticky_key = config.upstreams.get(&rule.upstream).and_then(|upstream| {
+                        crate::stick::extract_sticky_key(
+                            &upstream.sticky,
+                            &match_request,
+                            Some(source.as_str()),
+                        )
+                    });
                     runtime
                         .balancer
                         .select(
@@ -1267,6 +1280,7 @@ async fn proxy_handler(
                             BalanceContext {
                                 client_ip: Some(source.as_str()),
                                 path: &request_path,
+                                sticky_key: sticky_key.as_deref(),
                             },
                         )
                         .map(|target| {
@@ -1806,6 +1820,7 @@ mod tests {
                 BalanceContext {
                     client_ip: None,
                     path: "/",
+                    sticky_key: None,
                 },
             )
             .unwrap();
@@ -1822,6 +1837,7 @@ mod tests {
                 BalanceContext {
                     client_ip: None,
                     path: "/",
+                    sticky_key: None,
                 },
             )
             .unwrap();

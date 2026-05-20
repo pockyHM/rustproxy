@@ -1149,6 +1149,7 @@ fn next_retry_target(
         BalanceContext {
             client_ip: Some(proxy_context.balance_client_ip.as_str()),
             path: proxy_context.balance_path.as_str(),
+            sticky_key: None,
         },
         excluded_url,
     )

@@ -1,3 +1,9 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use http::Request;
 use serde::{Deserialize, Serialize};
@@ -54,6 +60,39 @@ impl Default for StickyPolicy {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct StickTable {
+    entries: Arc<Mutex<HashMap<StickKey, StickEntry>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct StickKey {
+    upstream: String,
+    key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StickEntry {
+    pub target: String,
+    pub expires_at: Instant,
+    pub request_count: u64,
+    pub error_count: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StickSnapshotEntry {
+    pub upstream: String,
+    pub key: String,
+    pub target: String,
+    pub expires_at: Instant,
+    pub request_count: u64,
+    pub error_count: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
 fn default_sticky_ttl_seconds() -> u64 {
     3600
 }
@@ -91,6 +130,68 @@ pub fn extract_sticky_key<B>(
                 navigate_path(&payload, path).and_then(value_to_string)
             }),
     })
+}
+
+impl StickTable {
+    pub fn lookup(&self, upstream: &str, key: &str, now: Instant) -> Option<String> {
+        let mut entries = self.entries.lock().expect("stick table lock poisoned");
+        prune_expired(&mut entries, now);
+        let entry = entries.get_mut(&StickKey::new(upstream, key))?;
+        entry.request_count = entry.request_count.saturating_add(1);
+        Some(entry.target.clone())
+    }
+
+    pub fn bind(&self, upstream: &str, key: &str, target: &str, expires_at: Instant, now: Instant) {
+        let mut entries = self.entries.lock().expect("stick table lock poisoned");
+        prune_expired(&mut entries, now);
+        entries
+            .entry(StickKey::new(upstream, key))
+            .and_modify(|entry| {
+                if entry.target != target {
+                    entry.request_count = 0;
+                    entry.error_count = 0;
+                    entry.bytes_in = 0;
+                    entry.bytes_out = 0;
+                }
+                entry.target = target.to_string();
+                entry.expires_at = expires_at;
+            })
+            .or_insert_with(|| StickEntry {
+                target: target.to_string(),
+                expires_at,
+                request_count: 0,
+                error_count: 0,
+                bytes_in: 0,
+                bytes_out: 0,
+            });
+    }
+
+    pub fn snapshot(&self, now: Instant) -> Vec<StickSnapshotEntry> {
+        let mut entries = self.entries.lock().expect("stick table lock poisoned");
+        prune_expired(&mut entries, now);
+        entries
+            .iter()
+            .map(|(key, entry)| StickSnapshotEntry {
+                upstream: key.upstream.clone(),
+                key: key.key.clone(),
+                target: entry.target.clone(),
+                expires_at: entry.expires_at,
+                request_count: entry.request_count,
+                error_count: entry.error_count,
+                bytes_in: entry.bytes_in,
+                bytes_out: entry.bytes_out,
+            })
+            .collect()
+    }
+}
+
+impl StickKey {
+    fn new(upstream: &str, key: &str) -> Self {
+        Self {
+            upstream: upstream.to_string(),
+            key: key.to_string(),
+        }
+    }
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -137,12 +238,17 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn prune_expired(entries: &mut HashMap<StickKey, StickEntry>, now: Instant) {
+    entries.retain(|_, entry| entry.expires_at > now);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_sticky_key, StickyKeySource, StickyPolicy};
+    use super::{extract_sticky_key, StickTable, StickyKeySource, StickyPolicy};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use http::{HeaderValue, Request};
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     fn test_request() -> Request<()> {
         Request::builder().uri("/").body(()).unwrap()
@@ -278,5 +384,53 @@ mod tests {
             cookie: None,
         };
         assert_eq!(extract_sticky_key(&missing_claim, &request, None), None);
+    }
+
+    #[test]
+    fn same_key_reuses_bound_target() {
+        let table = StickTable::default();
+        let now = Instant::now();
+        table.bind(
+            "backend",
+            "user-1",
+            "http://a",
+            now + Duration::from_secs(60),
+            now,
+        );
+
+        assert_eq!(
+            table.lookup("backend", "user-1", now),
+            Some("http://a".to_string())
+        );
+        assert_eq!(
+            table.lookup("backend", "user-1", now + Duration::from_secs(30)),
+            Some("http://a".to_string())
+        );
+        assert_eq!(
+            table
+                .snapshot(now + Duration::from_secs(30))
+                .first()
+                .map(|entry| entry.request_count),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn expired_bindings_are_pruned() {
+        let table = StickTable::default();
+        let now = Instant::now();
+        table.bind(
+            "backend",
+            "user-1",
+            "http://a",
+            now + Duration::from_secs(1),
+            now,
+        );
+
+        assert_eq!(
+            table.lookup("backend", "user-1", now + Duration::from_secs(2)),
+            None
+        );
+        assert!(table.snapshot(now + Duration::from_secs(2)).is_empty());
     }
 }

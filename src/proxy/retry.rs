@@ -122,6 +122,7 @@ mod tests {
                 BalanceContext {
                     client_ip: None,
                     path: "/",
+                    sticky_key: None,
                 },
             )
             .unwrap();
@@ -138,6 +139,7 @@ mod tests {
                 BalanceContext {
                     client_ip: None,
                     path: "/",
+                    sticky_key: None,
                 },
                 Some(first.url.as_str()),
             )

@@ -5,6 +5,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::{
     api::{handlers::ApiResponse, routes::AppState},
@@ -35,6 +36,18 @@ pub struct RuntimeTarget {
     active_connections: u32,
     healthy: bool,
     last_error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct RuntimeStickEntry {
+    upstream: String,
+    key: String,
+    target: String,
+    expires_in_seconds: u64,
+    request_count: u64,
+    error_count: u64,
+    bytes_in: u64,
+    bytes_out: u64,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +82,33 @@ pub async fn list_upstreams(
             })
             .collect(),
     ))
+}
+
+pub async fn stick_table(
+    State(state): State<AppState>,
+) -> Json<ApiResponse<Vec<RuntimeStickEntry>>> {
+    let now = Instant::now();
+    let mut entries = state
+        .stick_table_snapshot(now)
+        .into_iter()
+        .map(|entry| RuntimeStickEntry {
+            upstream: entry.upstream,
+            key: entry.key,
+            target: entry.target,
+            expires_in_seconds: entry.expires_at.saturating_duration_since(now).as_secs(),
+            request_count: entry.request_count,
+            error_count: entry.error_count,
+            bytes_in: entry.bytes_in,
+            bytes_out: entry.bytes_out,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        a.upstream
+            .cmp(&b.upstream)
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.target.cmp(&b.target))
+    });
+    Json(ApiResponse::success(entries))
 }
 
 pub async fn enable_target(
@@ -388,6 +428,16 @@ mod tests {
         assert_eq!(listed["data"][0]["targets"][0]["effective_weight"], 50);
 
         drop(lease);
+    }
+
+    #[tokio::test]
+    async fn runtime_api_lists_stick_table_snapshot() {
+        let state = AppState::for_test(app_config());
+
+        let listed = request(state, Method::GET, "/api/runtime/stick-table", None).await;
+
+        assert_eq!(listed["success"], true);
+        assert!(listed["data"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

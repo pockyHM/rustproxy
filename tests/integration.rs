@@ -12,7 +12,11 @@ use rustproxy::{
         balancer::{BalanceContext, Balancer},
         matcher::Matcher,
     },
-    runtime::drain::DrainController,
+    runtime::{
+        drain::DrainController,
+        state::{RuntimeState, TargetKey, TargetMode},
+    },
+    stick::{extract_sticky_key, StickyKeySource, StickyPolicy},
     tcp::{run_tcp_listener, TcpRuntime, TcpRuntimeSnapshot},
 };
 use tokio::{
@@ -250,6 +254,7 @@ async fn test_header_routing() {
             BalanceContext {
                 client_ip: None,
                 path: request.uri().path(),
+                sticky_key: None,
             },
         )
         .expect("matched upstream should have a selectable target");
@@ -274,6 +279,7 @@ async fn test_fallback_when_header_does_not_match() {
                 BalanceContext {
                     client_ip: None,
                     path: request.uri().path(),
+                    sticky_key: None,
                 },
             )
         })
@@ -282,6 +288,96 @@ async fn test_fallback_when_header_does_not_match() {
 
     assert!(matcher.match_request(&request, None).is_none());
     assert_eq!(selected_target, "http://fallback.internal:8080");
+}
+
+#[tokio::test]
+async fn sticky_header_reuses_target_and_remaps_when_disabled() {
+    let mut config = build_config();
+    config.upstreams.insert(
+        "sticky".to_string(),
+        Upstream {
+            name: "sticky".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![
+                Target {
+                    url: "http://sticky-a.internal:8080".to_string(),
+                    weight: 1,
+                    timeouts: Default::default(),
+                },
+                Target {
+                    url: "http://sticky-b.internal:8080".to_string(),
+                    weight: 1,
+                    timeouts: Default::default(),
+                },
+            ],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+            sticky: StickyPolicy {
+                enabled: true,
+                source: StickyKeySource::Header {
+                    name: "x-session".to_string(),
+                },
+                ttl_seconds: 60,
+                cookie: None,
+            },
+        },
+    );
+    let runtime = RuntimeState::default();
+    let balancer = Balancer::new_with_runtime(config.upstreams.clone(), None, runtime.clone());
+    let request = Request::builder()
+        .uri("/users")
+        .header("x-session", "user-1")
+        .body(())
+        .unwrap();
+    let sticky_key = extract_sticky_key(
+        &config.upstreams["sticky"].sticky,
+        &request,
+        Some("203.0.113.7"),
+    )
+    .expect("sticky key should be extracted");
+
+    let first = balancer
+        .select(
+            "sticky",
+            BalanceContext {
+                client_ip: Some("203.0.113.7"),
+                path: request.uri().path(),
+                sticky_key: Some(sticky_key.as_str()),
+            },
+        )
+        .unwrap();
+    let first_url = first.url.clone();
+    drop(first);
+
+    let second = balancer
+        .select(
+            "sticky",
+            BalanceContext {
+                client_ip: Some("203.0.113.7"),
+                path: request.uri().path(),
+                sticky_key: Some(sticky_key.as_str()),
+            },
+        )
+        .unwrap();
+    assert_eq!(second.url, first_url);
+    drop(second);
+
+    runtime.set_target_mode(&TargetKey::new("sticky", &first_url), TargetMode::Disabled);
+    let remapped = balancer
+        .select(
+            "sticky",
+            BalanceContext {
+                client_ip: Some("203.0.113.7"),
+                path: request.uri().path(),
+                sticky_key: Some(sticky_key.as_str()),
+            },
+        )
+        .unwrap();
+
+    assert_ne!(remapped.url, first_url);
 }
 
 #[test]
