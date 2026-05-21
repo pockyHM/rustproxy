@@ -19,6 +19,31 @@
 
 ---
 
+## 建议实现顺序
+
+该顺序基于生产可用性、线上变更风险、问题定位能力和实现投入产出综合排序。P1/P2 原始分组仍保留；实际开发时优先按本节选择下一项。
+
+1. **P1 Reload / Drain 语义增强**：最高优先级。优先补齐 SIGTERM/SIGINT graceful shutdown、reload/drain E2E 测试、连接池/健康状态/stick table/runtime target override 在 reload 期间的保留语义。原因是代理系统上线后的发布、重载、长连接处理都依赖这部分稳定性。
+2. **P1 Runtime API / 运维控制面增强**：很高优先级。优先做 stick table 清理、配置预览 diff、失败原因展示、手动回滚入口、Runtime 操作审计日志。原因是线上故障需要快速干预，而不是只能改配置后 reload。
+3. **P1 观测与日志增强**：很高优先级。优先做 JSON access log、分阶段耗时、per-upstream / per-target 指标、Runtime stats endpoint。原因是没有足够观测能力时，生产问题很难定位。
+4. **P1 高级健康检查与服务发现**：高优先级。优先做 HTTP check method/headers/body、期望响应 body/header、rise/fall、slow start、backup server。DNS resolver 和服务状态持久化可以后置。
+5. **P1 管理后台权限与审计**：高优先级。优先做 RBAC、API token / service account、配置变更审计、高风险操作确认。多人或生产环境使用时这是安全边界。
+6. **P1 TLS 增强**：中高优先级。优先做 mTLS、TLS 版本/ALPN 策略、证书过期告警。OCSP Stapling 和完整证书使用状态展示可以后置。
+7. **P1 ACL 与规则动作系统增强**：中高优先级。优先做 IP/CIDR allow-deny、Method/Query/Scheme/Port 匹配、条件动作。变量系统和 map 文件会扩大配置复杂度，建议后置。
+8. **P1 Stick Table 增强**：中优先级。优先做 Prometheus 指标、与限流/后端选择联动。多实例 peers 同步复杂度高，建议最后实现。
+9. **P2 PROXY protocol v1/v2 收发**：P2 中最高优先级。部署在 LB、Nginx 或云负载均衡后面时，该能力会影响真实源 IP、审计和限流。
+10. **P2 自定义错误页**：中优先级。实现成本可控，优先支持 404 / 429 / 502 / 503 / 504，并允许按监听、规则、上游配置。
+11. **P2 gRPC 友好支持与指标**：中优先级。适合现代服务代理场景，但需要先明确 HTTP/2 前后端语义和指标口径。
+12. **P2 压缩**：中低优先级。gzip / brotli 有价值，但要处理 content-encoding、streaming、重复压缩和 CPU 成本。
+13. **P2 缓存**：中低优先级且复杂度高。缓存 key、TTL、bypass、purge 和 header 策略会形成较大子系统，除非目标场景明确，否则不建议太早做。
+14. **P2 UDP 代理评估**：低到中优先级。与当前 HTTP/TCP 模型差异较大，按真实需求再评估。
+15. **P2 HTTP/3 / QUIC 评估**：低优先级且复杂度高。涉及连接模型、TLS 和运行时链路的较大改动。
+16. **P2 WASM / Lua / 插件式扩展评估**：低优先级且复杂度最高。会显著影响安全模型、配置模型和运行时边界，建议最后评估。
+
+推荐近期主线：**Reload/Drain E2E 与 graceful shutdown → Runtime diff/rollback/audit/stick 清理 → 观测增强 → PROXY protocol**。
+
+---
+
 ## P0 — 发布前验收与稳定化
 
 ### 1. Admin UI 验收
