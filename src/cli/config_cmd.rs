@@ -69,7 +69,7 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
         }
         UpstreamCommands::Add { name, url, weight } => {
             validate_name("upstream", &name)?;
-            validate_upstream_url(&url)?;
+            validate_target_url(&url)?;
             if config.upstreams.contains_key(&name) {
                 anyhow::bail!("upstream '{name}' already exists");
             }
@@ -90,7 +90,7 @@ pub fn run_upstream(db_path: &str, command: UpstreamCommands) -> Result<()> {
             println!("upstream {name} added");
         }
         UpstreamCommands::AddTarget { name, url, weight } => {
-            validate_upstream_url(&url)?;
+            validate_target_url(&url)?;
             let Some(upstream) = config.upstreams.get_mut(&name) else {
                 anyhow::bail!("upstream '{name}' not found");
             };
@@ -309,7 +309,7 @@ fn set_config_value(config: &mut AppConfig, key: &str, value: &str) -> Result<()
             config.proxy_listen = value.to_string();
         }
         "fallback_url" => {
-            validate_upstream_url(value)?;
+            validate_fallback_url(value)?;
             config.fallback.url = value.to_string();
         }
         "connect_timeout" => {
@@ -382,7 +382,7 @@ fn validate_listen_addr(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_upstream_url(value: &str) -> Result<()> {
+fn validate_fallback_url(value: &str) -> Result<()> {
     if value == "404" {
         return Ok(());
     }
@@ -392,6 +392,30 @@ fn validate_upstream_url(value: &str) -> Result<()> {
     match uri.scheme_str() {
         Some("http") | Some("https") => Ok(()),
         _ => anyhow::bail!("fallback_url must use http://, https://, or 404"),
+    }
+}
+
+fn validate_target_url(value: &str) -> Result<()> {
+    if value.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let uri = value
+        .parse::<http::Uri>()
+        .with_context(|| format!("invalid target URL: {value}"))?;
+    match uri.scheme_str() {
+        Some("http") | Some("https") => {
+            if uri.authority().is_none() {
+                anyhow::bail!("HTTP target must include a host");
+            }
+            Ok(())
+        }
+        Some("tcp") => {
+            if uri.host().is_none() || uri.port_u16().is_none() {
+                anyhow::bail!("TCP target must include host and port");
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("target URL must use http://, https://, tcp://, or host:port"),
     }
 }
 
@@ -619,9 +643,18 @@ mod tests {
         let mut config = config();
 
         assert!(set_config_value(&mut config, "listen", "127.0.0.1").is_err());
+        assert!(set_config_value(&mut config, "fallback_url", "tcp://127.0.0.1:6379").is_err());
         assert!(set_config_value(&mut config, "fallback_url", "ftp://fallback.local").is_err());
         assert!(set_config_value(&mut config, "connect_timeout", "-1").is_err());
         assert!(set_config_value(&mut config, "access_log_level", "verbose").is_err());
         assert!(set_config_value(&mut config, "missing", "value").is_err());
+    }
+
+    #[test]
+    fn validates_tcp_target_urls_for_upstreams() {
+        validate_target_url("tcp://127.0.0.1:6379").unwrap();
+        validate_target_url("127.0.0.1:6379").unwrap();
+        assert!(validate_target_url("tcp://127.0.0.1").is_err());
+        assert!(validate_target_url("redis://127.0.0.1:6379").is_err());
     }
 }

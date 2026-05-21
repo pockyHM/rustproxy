@@ -478,9 +478,11 @@ const T: Record<string, [string, string]> = {
   'form.operator': ['Operator', '操作符'],
   'form.value': ['Value', '值'],
   'form.targets': ['Targets', '目标'],
-  'form.targetProtocol': ['Protocol', '协议'],
+  'form.targetProtocol': ['Target protocol', '目标协议'],
   'form.targetUrl': ['Target URL', '目标地址'],
   'form.targetUrlHint': ['Use http:// or https:// for HTTP routes; use tcp://host:port for TCP listeners.', 'HTTP 路由使用 http:// 或 https://；TCP 监听使用 tcp://host:port。'],
+  'form.targetProtocolHint': ['All targets in one upstream must use the same transport class.', '同一个上游中的所有目标必须使用同一种传输类型。'],
+  'form.targetProtocolMixed': ['This upstream already contains both HTTP and TCP targets. Pick one protocol to normalize them.', '该上游当前同时存在 HTTP 和 TCP 目标，请先选择一种协议进行统一。'],
   'form.balance': ['Load balancing', '负载均衡'],
   'form.algorithm': ['Algorithm', '算法'],
   'form.retry': ['Retry policy', '重试策略'],
@@ -638,7 +640,7 @@ const SAME_SITE_OPTIONS = ['lax', 'strict', 'none'] as const;
 const HEADER_MUTATION_OPS: HeaderMutationOp[] = ['set', 'add', 'remove'];
 const PATH_ACTION_TYPES = ['strip_prefix', 'rewrite', 'redirect'] as const;
 type PathActionType = typeof PATH_ACTION_TYPES[number];
-const TARGET_SCHEMES = ['http', 'https', 'tcp'] as const;
+const TARGET_SCHEMES = ['http', 'tcp'] as const;
 type TargetScheme = typeof TARGET_SCHEMES[number];
 
 const NAV_ITEMS: { id: View; labelKey: string; icon: string }[] = [
@@ -2331,6 +2333,7 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
   const [runtimeError, setRuntimeError] = useState('');
   const [runtimeAction, setRuntimeAction] = useState<string | null>(null);
   const [weightDrafts, setWeightDrafts] = useState<Record<string, string>>({});
+  const [targetSchemeDraft, setTargetSchemeDraft] = useState<TargetScheme | null>('http');
   const upstreams = Object.values(config.upstreams ?? {});
   const upstreamHealthByName = useMemo(() => Object.fromEntries(upstreamHealth.map((item) => [item.upstream, item])), [upstreamHealth]);
   const loadRuntime = useCallback(async () => {
@@ -2386,21 +2389,36 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
     });
   }, [runtimeUpstreams]);
 
-  function openCreate() { setEditing(null); setDraft(newUpstream()); setShowModal(true); }
-  function openEdit(u: Upstream) { setEditing(u.name); setDraft(normalizeUpstream(structuredClone(u))); setShowModal(true); }
+  function openCreate() { setEditing(null); setDraft(newUpstream()); setTargetSchemeDraft('http'); setShowModal(true); }
+  function openEdit(u: Upstream) {
+    const next = normalizeUpstream(structuredClone(u));
+    setEditing(u.name);
+    setDraft(next);
+    setTargetSchemeDraft(uniformTargetScheme(next.targets));
+    setShowModal(true);
+  }
   function addTarget(scheme: TargetScheme = 'http') {
     setDraft({ ...draft, targets: [...draft.targets, { url: defaultTargetUrl(scheme), weight: 100 }] });
+  }
+  function setTargetScheme(scheme: TargetScheme) {
+    setTargetSchemeDraft(scheme);
+    setDraft({ ...draft, targets: normalizeTargetsForScheme(draft.targets, scheme) });
   }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (!targetSchemeDraft) {
+      setNotice({ type: 'error', message: t('form.targetProtocolMixed') });
+      return;
+    }
+    const targets = normalizeTargetsForScheme(draft.targets, targetSchemeDraft);
     const body = {
       ...draft,
       balance: draft.balance ?? 'weighted_round_robin',
       retry: normalizeRetryPolicy(draft.retry),
       health_check: normalizeHealthCheck(draft.health_check),
       sticky: normalizeStickyPolicy(draft.sticky),
-      targets: draft.targets.map((target) => ({ url: target.url, weight: target.weight })),
+      targets: targets.map((target) => ({ url: target.url, weight: target.weight })),
     };
     await api<Upstream>(editing ? `/api/upstreams/${encodeURIComponent(editing)}` : '/api/upstreams', { method: editing ? 'PUT' : 'POST', token, body });
     await refreshConfig(token, setConfig, setNotice);
@@ -2544,21 +2562,35 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
             </section>
             <section className="form-section">
               <h3 className="form-section-title">{t('form.targets')}</h3>
-              <p className="card-desc">{t('form.targetUrlHint')}</p>
+              <div className="target-hint">
+                <Icon name="info" size={16} />
+                <span>{t('form.targetProtocolHint')}</span>
+                <span>{t('form.targetUrlHint')}</span>
+              </div>
+              <div className="form-grid">
+                <Field label={t('form.targetProtocol')}>
+                  {targetSchemeDraft ? (
+                    <Dropdown
+                      value={targetSchemeDraft}
+                      options={enumOptions(TARGET_SCHEMES)}
+                      onChange={(scheme) => setTargetScheme(scheme as TargetScheme)}
+                    />
+                  ) : (
+                    <div className="target-protocol-actions">
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => setTargetScheme('http')}>HTTP</button>
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => setTargetScheme('tcp')}>TCP</button>
+                    </div>
+                  )}
+                </Field>
+              </div>
+              {!targetSchemeDraft && <div className="form-warning"><Icon name="warning" size={16} />{t('form.targetProtocolMixed')}</div>}
               <div className="target-editor">
                 {draft.targets.map((target, i) => (
                   <div className="target-row" key={i}>
-                    <Field label={t('form.targetProtocol')}>
-                      <Dropdown
-                        value={targetScheme(target.url)}
-                        options={enumOptions(TARGET_SCHEMES)}
-                        onChange={(scheme) => setDraft(replaceTarget(draft, i, { ...target, url: rewriteTargetScheme(target.url, scheme as TargetScheme) }))}
-                      />
-                    </Field>
                     <Field label={t('form.targetUrl')}>
                       <input
                         value={target.url}
-                        placeholder={targetPlaceholder(targetScheme(target.url))}
+                        placeholder={targetPlaceholder(targetSchemeDraft ?? 'http')}
                         onChange={(e) => setDraft(replaceTarget(draft, i, { ...target, url: e.target.value }))}
                         required
                       />
@@ -2569,15 +2601,15 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
                 ))}
               </div>
               <div className="target-actions">
-                <button type="button" className="btn btn-secondary" onClick={() => addTarget('http')}><Icon name="add" size={16} />{t('action.addTarget')}</button>
-                <button type="button" className="btn btn-secondary" onClick={() => addTarget('tcp')}><Icon name="settings_ethernet" size={16} />{t('action.addTcpTarget')}</button>
+                <button type="button" className="btn btn-secondary" disabled={!targetSchemeDraft} onClick={() => addTarget(targetSchemeDraft ?? 'http')}><Icon name="add" size={16} />{t('action.addTarget')}</button>
+                <button type="button" className="btn btn-secondary" disabled={targetSchemeDraft !== 'tcp'} onClick={() => addTarget('tcp')}><Icon name="settings_ethernet" size={16} />{t('action.addTcpTarget')}</button>
               </div>
             </section>
             <StickyPolicyEditor draft={draft} setDraft={setDraft} />
             <HealthCheckEditor draft={draft} setDraft={setDraft} />
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
-              <button type="submit" className="btn btn-primary">{editing ? t('action.save') : t('action.create')}</button>
+              <button type="submit" className="btn btn-primary" disabled={!targetSchemeDraft}>{editing ? t('action.save') : t('action.create')}</button>
             </div>
           </form>
         </Modal>
@@ -3609,14 +3641,15 @@ function replaceTarget(upstream: Upstream, index: number, target: Target): Upstr
 }
 
 function targetScheme(url: string): TargetScheme {
-  const scheme = url.trim().match(/^([a-z][a-z0-9+.-]*):\/\//i)?.[1].toLowerCase();
-  return TARGET_SCHEMES.includes(scheme as TargetScheme) ? scheme as TargetScheme : 'http';
+  const trimmed = url.trim();
+  const scheme = trimmed.match(/^([a-z][a-z0-9+.-]*):\/\//i)?.[1].toLowerCase();
+  if (scheme === 'tcp') return 'tcp';
+  if (/^(?:\d{1,3}\.){3}\d{1,3}:\d+$/.test(trimmed) || /^\[[0-9a-f:]+\]:\d+$/i.test(trimmed)) return 'tcp';
+  return 'http';
 }
 
 function rewriteTargetScheme(url: string, scheme: TargetScheme): string {
-  const trimmed = url.trim();
-  const body = trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') || targetPlaceholder(scheme).replace(/^[a-z]+:\/\//, '');
-  return `${scheme}://${body}`;
+  return `${scheme}://${targetAuthority(url, scheme)}`;
 }
 
 function defaultTargetUrl(scheme: TargetScheme): string {
@@ -3625,6 +3658,39 @@ function defaultTargetUrl(scheme: TargetScheme): string {
 
 function targetPlaceholder(scheme: TargetScheme): string {
   return defaultTargetUrl(scheme);
+}
+
+function uniformTargetScheme(targets: Target[]): TargetScheme | null {
+  if (targets.length === 0) return 'http';
+  const kinds = new Set(targets.map((target) => targetScheme(target.url)));
+  return kinds.size === 1 ? [...kinds][0] : null;
+}
+
+function normalizeTargetsForScheme(targets: Target[], scheme: TargetScheme): Target[] {
+  return targets.map((target) => {
+    const current = targetScheme(target.url);
+    if (current === scheme) return target;
+    return { ...target, url: rewriteTargetScheme(target.url, scheme) };
+  });
+}
+
+function targetAuthority(url: string, nextScheme: TargetScheme): string {
+  const trimmed = url.trim();
+  const fallback = targetPlaceholder(nextScheme).replace(/^[a-z]+:\/\//, '');
+  if (!trimmed) return fallback;
+
+  const schemeMatch = trimmed.match(/^([a-z][a-z0-9+.-]*):\/\/([^/?#]+)/i);
+  const currentScheme = schemeMatch?.[1]?.toLowerCase();
+  const authority = schemeMatch?.[2] ?? trimmed.split(/[/?#]/, 1)[0] ?? '';
+  if (!authority) return fallback;
+  if (nextScheme !== 'tcp' || authorityHasPort(authority)) return authority;
+  if (currentScheme === 'https') return `${authority}:443`;
+  if (currentScheme === 'http') return `${authority}:80`;
+  return fallback;
+}
+
+function authorityHasPort(authority: string): boolean {
+  return /^\[[^\]]+\]:\d+$/.test(authority) || /^[^:]+:\d+$/.test(authority);
 }
 
 function conditionTypeOptions(t: (key: string) => string): DropdownOption[] {

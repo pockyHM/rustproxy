@@ -499,7 +499,8 @@ fn tls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-pub(crate) fn validate_tls_config(config: &AppConfig) -> anyhow::Result<()> {
+pub(crate) fn validate_runtime_config(config: &AppConfig) -> anyhow::Result<()> {
+    config.validate_upstreams()?;
     validate_match_sets(config)?;
     for rule in config.rules.iter().filter(|rule| rule_tls_enabled(rule)) {
         if rule.listen.as_deref().unwrap_or("").trim().is_empty() {
@@ -1620,7 +1621,7 @@ fn spawn_config_reloader(state: AppState) {
                     if old_config == new_config {
                         continue;
                     }
-                    if let Err(error) = validate_tls_config(&new_config) {
+                    if let Err(error) = validate_runtime_config(&new_config) {
                         tracing::warn!(%error, "reloaded config rejected by validation");
                         continue;
                     }

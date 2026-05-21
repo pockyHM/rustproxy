@@ -31,6 +31,7 @@ pub async fn run(db_path: &str, yaml_path: &str) -> Result<()> {
     }
 
     let config = db.load_config()?;
+    server::validate_runtime_config(&config)?;
     let shutdown = async {
         match tokio::signal::ctrl_c().await {
             Ok(()) => tracing::info!("shutdown signal received"),

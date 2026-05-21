@@ -2092,7 +2092,7 @@ textarea {
 
 .target-row {
   display: grid;
-  grid-template-columns: 120px 1fr 100px 28px;
+  grid-template-columns: minmax(0, 1fr) 100px 28px;
   align-items: end;
   gap: 10px;
   padding: 12px;
@@ -2100,11 +2100,47 @@ textarea {
   background: var(--background);
 }
 
+.target-row .field {
+  min-width: 0;
+}
+
+.target-row .field input {
+  width: 100%;
+}
+
 .target-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
   margin-top: 10px;
+}
+
+.target-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border));
+  background: color-mix(in srgb, var(--primary) 7%, var(--card));
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.target-hint .material-symbols-sharp {
+  color: var(--primary);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.target-hint span {
+  min-width: 0;
+}
+
+.target-protocol-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .policy-subsection {

@@ -204,7 +204,7 @@ pub async fn put_config(
     let old_config = state.config.read().await.clone();
     new_config.reconcile_timeout_aliases_for_update(&old_config);
     new_config.normalize_rules();
-    super::routes::validate_tls_config(&new_config)
+    super::routes::validate_runtime_config(&new_config)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     state
@@ -273,7 +273,7 @@ pub async fn upload_certificate(
         new_config.certificates.push(certificate.clone());
     }
 
-    super::routes::validate_tls_config(&new_config)
+    super::routes::validate_runtime_config(&new_config)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
     state
         .sync_proxy_listeners(&new_config)
@@ -368,7 +368,7 @@ pub async fn create_match_set(
 
     let mut new_config = old_config.clone();
     new_config.match_sets.push(match_set.clone());
-    super::routes::validate_tls_config(&new_config)
+    super::routes::validate_runtime_config(&new_config)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     state
@@ -403,7 +403,7 @@ pub async fn update_match_set(
         ));
     };
     *existing = match_set.clone();
-    super::routes::validate_tls_config(&new_config)
+    super::routes::validate_runtime_config(&new_config)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     state
@@ -486,7 +486,7 @@ pub async fn create_rule(
     {
         let mut next = old_config.clone();
         next.rules.push(rule.clone());
-        super::routes::validate_tls_config(&next)
+        super::routes::validate_runtime_config(&next)
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
         state
@@ -540,7 +540,7 @@ pub async fn update_rule(
             .find(|existing| existing.id == id)
             .unwrap();
         *existing_rule = rule.clone();
-        super::routes::validate_tls_config(&next)
+        super::routes::validate_runtime_config(&next)
             .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
         state
@@ -587,7 +587,7 @@ pub async fn delete_rule(
 
     let mut next_config = old_config.clone();
     next_config.rules.retain(|rule| rule.id != id);
-    super::routes::validate_tls_config(&next_config)
+    super::routes::validate_runtime_config(&next_config)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
     state
         .sync_proxy_listeners(&next_config)
@@ -648,6 +648,10 @@ pub async fn create_upstream(
     State(state): State<AppState>,
     Json(upstream): Json<Upstream>,
 ) -> Result<(StatusCode, Json<ApiResponse<Upstream>>), Response> {
+    upstream
+        .validate_target_protocols()
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+
     {
         let config = state.config.read().await;
         if config.upstreams.contains_key(&upstream.name) {
@@ -683,6 +687,9 @@ pub async fn update_upstream(
     Json(mut upstream): Json<Upstream>,
 ) -> Result<Json<ApiResponse<Upstream>>, Response> {
     upstream.name = id.clone();
+    upstream
+        .validate_target_protocols()
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
     state
         .db

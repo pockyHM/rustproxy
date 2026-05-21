@@ -231,6 +231,131 @@ targets:
         assert!(!serialized.contains("\"timeouts\""));
         assert_eq!(upstream.targets[0].url, "http://127.0.0.1:8080");
     }
+
+    #[test]
+    fn validate_target_protocols_allows_http_and_https_targets() {
+        let upstream = Upstream {
+            name: "web".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![
+                Target {
+                    url: "http://127.0.0.1:8080".to_string(),
+                    weight: 100,
+                },
+                Target {
+                    url: "https://127.0.0.1:8443".to_string(),
+                    weight: 100,
+                },
+            ],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            sticky: Default::default(),
+        };
+
+        upstream.validate_target_protocols().unwrap();
+    }
+
+    #[test]
+    fn validate_target_protocols_allows_tcp_and_socket_targets() {
+        let upstream = Upstream {
+            name: "redis".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![
+                Target {
+                    url: "tcp://127.0.0.1:6379".to_string(),
+                    weight: 100,
+                },
+                Target {
+                    url: "127.0.0.1:6380".to_string(),
+                    weight: 100,
+                },
+            ],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            sticky: Default::default(),
+        };
+
+        upstream.validate_target_protocols().unwrap();
+    }
+
+    #[test]
+    fn validate_target_protocols_rejects_http_and_tcp_mix() {
+        let upstream = Upstream {
+            name: "mixed".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![
+                Target {
+                    url: "http://127.0.0.1:8080".to_string(),
+                    weight: 100,
+                },
+                Target {
+                    url: "tcp://127.0.0.1:6379".to_string(),
+                    weight: 100,
+                },
+            ],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            sticky: Default::default(),
+        };
+
+        let error = upstream
+            .validate_target_protocols()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot mix HTTP and TCP targets"));
+    }
+
+    #[test]
+    fn validate_target_protocols_rejects_unsupported_scheme() {
+        let upstream = Upstream {
+            name: "bad".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![Target {
+                url: "redis://127.0.0.1:6379".to_string(),
+                weight: 100,
+            }],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            sticky: Default::default(),
+        };
+
+        let error = upstream
+            .validate_target_protocols()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported target scheme"));
+    }
+
+    #[test]
+    fn validate_target_protocols_rejects_tcp_target_without_port() {
+        let upstream = Upstream {
+            name: "bad".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![Target {
+                url: "tcp://redis.internal".to_string(),
+                weight: 100,
+            }],
+            health_check: Default::default(),
+            balance: Default::default(),
+            retry: Default::default(),
+            sticky: Default::default(),
+        };
+
+        let error = upstream
+            .validate_target_protocols()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires host and port"));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -344,4 +469,80 @@ pub struct Upstream {
     pub retry: RetryPolicy,
     #[serde(default)]
     pub sticky: StickyPolicy,
+}
+
+impl Upstream {
+    pub fn validate_target_protocols(&self) -> anyhow::Result<()> {
+        let mut protocol: Option<TargetProtocol> = None;
+        for target in &self.targets {
+            let current = TargetProtocol::from_url(&target.url).map_err(|error| {
+                anyhow::anyhow!(
+                    "upstream '{}' has invalid target '{}': {error}",
+                    self.name,
+                    target.url
+                )
+            })?;
+            if let Some(previous) = protocol {
+                if previous != current {
+                    anyhow::bail!(
+                        "upstream '{}' cannot mix HTTP and TCP targets; target '{}' is {} but previous targets are {}",
+                        self.name,
+                        target.url,
+                        current.label(),
+                        previous.label()
+                    );
+                }
+            } else {
+                protocol = Some(current);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetProtocol {
+    Http,
+    Tcp,
+}
+
+impl TargetProtocol {
+    fn from_url(url: &str) -> anyhow::Result<Self> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("target URL cannot be empty");
+        }
+        if trimmed.parse::<std::net::SocketAddr>().is_ok() {
+            return Ok(TargetProtocol::Tcp);
+        }
+
+        let uri: http::Uri = trimmed
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid target URL: {error}"))?;
+        match uri.scheme_str() {
+            Some("http") | Some("https") => {
+                if uri.authority().is_none() {
+                    anyhow::bail!("HTTP target requires host");
+                }
+                Ok(TargetProtocol::Http)
+            }
+            Some("tcp") => {
+                if uri.host().is_none() || uri.port_u16().is_none() {
+                    anyhow::bail!("TCP target requires host and port");
+                }
+                Ok(TargetProtocol::Tcp)
+            }
+            Some(scheme) => anyhow::bail!(
+                "unsupported target scheme '{scheme}'; use http://, https://, tcp://, or host:port"
+            ),
+            None => anyhow::bail!("target URL must use http://, https://, tcp://, or host:port"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TargetProtocol::Http => "HTTP",
+            TargetProtocol::Tcp => "TCP",
+        }
+    }
 }

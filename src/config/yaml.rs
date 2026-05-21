@@ -387,6 +387,13 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    pub fn validate_upstreams(&self) -> anyhow::Result<()> {
+        for upstream in self.upstreams.values() {
+            upstream.validate_target_protocols()?;
+        }
+        Ok(())
+    }
 }
 
 fn compact_yaml_value(value: &mut serde_yaml::Value) -> bool {
