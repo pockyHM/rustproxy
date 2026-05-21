@@ -172,6 +172,7 @@ type View = 'operations' | 'monitoring' | 'rules' | 'match-sets' | 'upstreams' |
 type Notice = { type: 'success' | 'error'; message: string } | null;
 type DataProps = { config: AppConfig; token: string; setConfig: (config: AppConfig) => void; setNotice: (notice: Notice) => void };
 type DropdownOption = { value: string; label: string; description?: string };
+type UpstreamProtocol = 'http' | 'tcp' | 'mixed' | 'empty';
 type VersionInfo = {
   version: string;
   package_version: string;
@@ -275,6 +276,7 @@ const T: Record<string, [string, string]> = {
   'rule.tlsHelp': ['Rules sharing one HTTPS port can use different certificates when SNI and exact Host conditions are configured.', '多个规则可以共用同一个 HTTPS 端口；配置精确 Host 条件并且客户端发送 SNI 时，可选择不同证书。'],
   'rule.noCertificates': ['Upload a certificate first from the Certificates menu.', '请先在证书菜单上传证书。'],
   'rule.protocolConflict': ['This port is already used by the other protocol. HTTP and HTTPS cannot share one port yet.', '该端口已经被另一种协议占用，当前暂不支持 HTTP 和 HTTPS 共用同一端口。'],
+  'rule.tcpUpstreamInvalid': ['HTTP routing rules cannot use TCP upstreams. Use TCP listeners for tcp:// pools.', 'HTTP 路由规则不能使用 TCP 上游池，请在 TCP 监听中使用 tcp:// 上游。'],
   'rule.fallback': ['Fallback rule', '兜底规则'],
   'rule.enableFallback': ['Use when no other rule matches', '所有规则都未命中时使用'],
   'rule.fallbackHelp': ['Fallback rules run after normal rules and only need an upstream.', '兜底规则会在普通规则全部未命中后执行，只需要选择上游。'],
@@ -283,6 +285,7 @@ const T: Record<string, [string, string]> = {
   'config.fallbackUrl': ['Fallback target', '兜底目标'],
   'config.skipSsl': ['Skip SSL verification', '跳过 SSL 验证'],
   'config.websocket': ['Enable WebSocket proxy', '启用 WebSocket 代理'],
+  'config.httpOnlyUpstreamOptions': ['SSL verification and WebSocket proxying apply only to HTTP/HTTPS upstreams.', 'SSL 校验和 WebSocket 代理仅适用于 HTTP/HTTPS 上游。'],
   'config.connectTimeout': ['Connect timeout (s)', '连接超时 (秒)'],
   'config.requestTimeout': ['Request timeout (s)', '请求超时 (秒)'],
   'config.clientTimeout': ['Client timeout (s)', '客户端超时 (秒)'],
@@ -296,6 +299,16 @@ const T: Record<string, [string, string]> = {
   'config.timeouts': ['Timeout Policy', '超时策略'],
   'config.limits': ['Connection Limits', '连接上限'],
   'config.tcpListeners': ['TCP Listeners', 'TCP 监听'],
+  'tcp.title': ['TCP Proxy Listeners', 'TCP 代理监听'],
+  'tcp.sub': ['Bind raw TCP or TLS passthrough listeners to tcp:// upstream pools.', '将原始 TCP 或 TLS 透传监听绑定到 tcp:// 上游池。'],
+  'tcp.empty': ['No TCP proxy listeners configured', '暂无 TCP 代理监听'],
+  'tcp.defaultRoute': ['Default route', '默认路由'],
+  'tcp.sniRouteCount': ['SNI routes', 'SNI 路由数'],
+  'tcp.edit': ['Edit TCP listener', '编辑 TCP 监听'],
+  'tcp.new': ['New TCP listener', '新建 TCP 监听'],
+  'tcp.saved': ['TCP listener saved', 'TCP 监听已保存'],
+  'tcp.deleted': ['TCP listener deleted', 'TCP 监听已删除'],
+  'tcp.tcpOnlyHint': ['Create a tcp:// upstream first, then select it here.', '请先创建 tcp:// 上游池，然后在这里选择。'],
   'config.addTcpListener': ['Add TCP listener', '添加 TCP 监听'],
   'config.tcpMode': ['Mode', '模式'],
   'config.sniRoutes': ['SNI routes', 'SNI 路由'],
@@ -335,6 +348,7 @@ const T: Record<string, [string, string]> = {
   'config.headerValue': ['Header value', 'Header 值'],
   'action.reload': ['Reload config', '重新加载'],
   'action.newRule': ['New rule', '新建规则'],
+  'action.newTcpListener': ['New TCP listener', '新建 TCP 监听'],
   'action.newMatchSet': ['New match set', '新建匹配集'],
   'action.newUpstream': ['New upstream', '新建上游'],
   'action.save': ['Save', '保存'],
@@ -483,6 +497,8 @@ const T: Record<string, [string, string]> = {
   'form.targetUrlHint': ['Use http:// or https:// for HTTP routes; use tcp://host:port for TCP listeners.', 'HTTP 路由使用 http:// 或 https://；TCP 监听使用 tcp://host:port。'],
   'form.targetProtocolHint': ['All targets in one upstream must use the same transport class.', '同一个上游中的所有目标必须使用同一种传输类型。'],
   'form.targetProtocolMixed': ['This upstream already contains both HTTP and TCP targets. Pick one protocol to normalize them.', '该上游当前同时存在 HTTP 和 TCP 目标，请先选择一种协议进行统一。'],
+  'form.httpUpstreamsOnly': ['Only HTTP/HTTPS upstreams are available for route rules.', '路由规则只能选择 HTTP/HTTPS 上游。'],
+  'form.tcpUpstreamsOnly': ['Only tcp:// upstreams are available for TCP listeners.', 'TCP 监听只能选择 tcp:// 上游。'],
   'form.balance': ['Load balancing', '负载均衡'],
   'form.algorithm': ['Algorithm', '算法'],
   'form.retry': ['Retry policy', '重试策略'],
@@ -1598,17 +1614,36 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
   const [draft, setDraft] = useState<Rule>(() => newRule(Object.keys(config.upstreams)[0], defaultListen));
   const [editing, setEditing] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
+  const [tcpDraft, setTcpDraft] = useState<TcpListener>(() => newTcpListener(config.tcp_listeners?.length ?? 0));
+  const [editingTcpIndex, setEditingTcpIndex] = useState<number | null>(null);
+  const [showTcpModal, setShowTcpModal] = useState(false);
   const upstreamNames = Object.keys(config.upstreams);
+  const httpUpstreamNames = upstreamNames.filter((name) => upstreamProtocol(config.upstreams[name]) === 'http');
+  const tcpListeners = (config.tcp_listeners ?? []).map(normalizeTcpListener);
   const certificates = config.certificates ?? [];
   const matchSets = config.match_sets ?? [];
   const protocolConflict = listenerProtocolConflict(config, draft, editing);
+  const selectedUpstreamProtocol = draft.upstream ? upstreamProtocol(config.upstreams[draft.upstream]) : 'empty';
+  const upstreamProtocolInvalid = Boolean(draft.upstream) && selectedUpstreamProtocol !== 'http';
+  const ruleUpstreamOptions = upstreamOptionsForProtocol(config, 'http', draft.upstream);
 
-  function openCreate() { setEditing(null); setDraft(newRule(upstreamNames[0], defaultListen)); setShowModal(true); }
+  function openCreate() { setEditing(null); setDraft(newRule(httpUpstreamNames[0] ?? '', defaultListen)); setShowModal(true); }
   function openEdit(rule: Rule) {
     const normalized = normalizeRule(rule);
     setEditing(rule.id);
     setDraft({ ...normalized, listen: normalized.listen || defaultListen });
     setShowModal(true);
+  }
+  function openCreateTcp() {
+    const tcpUpstreams = upstreamOptionsForProtocol(config, 'tcp');
+    setEditingTcpIndex(null);
+    setTcpDraft({ ...newTcpListener(tcpListeners.length), upstream: tcpUpstreams[0]?.value ?? null });
+    setShowTcpModal(true);
+  }
+  function openEditTcp(listener: TcpListener, index: number) {
+    setEditingTcpIndex(index);
+    setTcpDraft(normalizeTcpListener(listener));
+    setShowTcpModal(true);
   }
 
   async function submit(event: FormEvent) {
@@ -1641,6 +1676,27 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
     setNotice({ type: 'success', message: t('notice.ruleDeleted') });
   }
 
+  async function saveTcpListeners(nextListeners: TcpListener[], message: string) {
+    const nextConfig = normalizeConfig({ ...config, tcp_listeners: nextListeners.map(normalizeTcpListener) });
+    await api<AppConfig>('/api/config', { method: 'PUT', token, body: nextConfig });
+    await refreshConfig(token, setConfig, setNotice);
+    setNotice({ type: 'success', message });
+  }
+
+  async function submitTcp(event: FormEvent) {
+    event.preventDefault();
+    const normalized = normalizeTcpListener(tcpDraft);
+    const nextListeners = editingTcpIndex == null
+      ? [...tcpListeners, normalized]
+      : tcpListeners.map((listener, index) => index === editingTcpIndex ? normalized : listener);
+    await saveTcpListeners(nextListeners, t('tcp.saved'));
+    setShowTcpModal(false);
+  }
+
+  async function removeTcp(index: number) {
+    await saveTcpListeners(tcpListeners.filter((_, i) => i !== index), t('tcp.deleted'));
+  }
+
   async function handleReload() { await refreshConfig(token, setConfig, setNotice); setNotice({ type: 'success', message: t('notice.configReloaded') }); }
 
   const sorted = [...config.rules].map(normalizeRule).sort((a, b) => Number(a.is_fallback) - Number(b.is_fallback) || b.priority - a.priority);
@@ -1652,25 +1708,35 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
         <button className="btn btn-primary btn-rect" onClick={openCreate}><Icon name="add" size={18} />{t('action.newRule')}</button></>
       } />
       <div className="table-card"><div className="table-wrap">
-        <table><thead><tr>
-          <th style={{ width: 70 }}>{t('table.id')}</th><th style={{ width: 130 }}>{t('table.name')}</th>
-          <th style={{ width: 80 }}>{t('table.priority')}</th><th style={{ width: 90 }}>{t('table.listen')}</th>
-          <th style={{ width: 130 }}>{t('table.host')}</th><th style={{ width: 130 }}>{t('table.location')}</th>
-          <th style={{ width: 180 }}>{t('table.pool')}</th>
-          <th>{t('table.match')}</th><th style={{ width: 120 }}>{t('table.actions')}</th>
+        <table className="rules-table">
+          <colgroup>
+            <col className="rules-col-name" />
+            <col className="rules-col-priority" />
+            <col className="rules-col-listen" />
+            <col className="rules-col-host" />
+            <col className="rules-col-location" />
+            <col className="rules-col-pool" />
+            <col className="rules-col-match" />
+            <col className="rules-col-actions" />
+          </colgroup>
+          <thead><tr>
+            <th>{t('table.name')}</th>
+            <th>{t('table.priority')}</th><th>{t('table.listen')}</th>
+            <th>{t('table.host')}</th><th>{t('table.location')}</th>
+            <th>{t('table.pool')}</th>
+          <th>{t('table.match')}</th><th>{t('table.actions')}</th>
         </tr></thead><tbody>
           {sorted.length === 0 ? (
-            <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 40 }}>{t('table.noRules')}</td></tr>
+            <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 40 }}>{t('table.noRules')}</td></tr>
           ) : sorted.map((rule) => (
             <tr key={rule.id}>
-              <td className="td-mono">{rule.id}</td>
-              <td style={{ fontWeight: 500 }}>{rule.name || rule.id}</td>
+              <td style={{ fontWeight: 500 }} title={rule.name || rule.id}>{rule.name || rule.id}</td>
               <td className="td-mono">{rule.priority}</td>
-              <td className="td-mono">{rule.is_fallback ? `${t('rule.fallback')} · ${rule.listen || defaultListen}` : `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen || defaultListen}`}</td>
-              <td className="td-mono">{summarizeHost(rule.host, t)}</td>
-              <td className="td-mono">{summarizeLocation(rule.location)}</td>
+              <td className="td-mono" title={rule.is_fallback ? `${t('rule.fallback')} · ${rule.listen || defaultListen}` : `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen || defaultListen}`}>{rule.is_fallback ? `${t('rule.fallback')} · ${rule.listen || defaultListen}` : `${rule.tls?.enabled ? 'HTTPS ' : ''}${rule.listen || defaultListen}`}</td>
+              <td className="td-mono" title={summarizeHost(rule.host, t)}>{summarizeHost(rule.host, t)}</td>
+              <td className="td-mono" title={summarizeLocation(rule.location)}>{summarizeLocation(rule.location)}</td>
               <td className="td-upstream"><span className="td-badge" title={rule.upstream}>{rule.upstream}</span></td>
-              <td className="td-mono">{rule.is_fallback ? t('rule.enableFallback') : summarizeRuleMatch(rule)}</td>
+              <td className="td-mono" title={rule.is_fallback ? t('rule.enableFallback') : summarizeRuleMatch(rule)}>{rule.is_fallback ? t('rule.enableFallback') : summarizeRuleMatch(rule)}</td>
               <td className="td-actions">
                 <div className="td-action-row">
                   <button className="btn btn-ghost btn-sm" onClick={() => openEdit(rule)}>{t('action.edit')}</button>
@@ -1681,6 +1747,13 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
           ))}
         </tbody></table>
       </div></div>
+      <TcpListenersPanel
+        config={config}
+        listeners={tcpListeners}
+        onCreate={openCreateTcp}
+        onEdit={openEditTcp}
+        onRemove={removeTcp}
+      />
       {showModal && (
         <Modal title={editing ? t('modal.editRule') : t('modal.newRule')} onClose={() => setShowModal(false)}>
           <form onSubmit={submit} className="config-form">
@@ -1717,7 +1790,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 {draft.host.type !== 'any' && <Field label={t('form.hostValue')}><input placeholder={draft.host.type === 'wildcard' ? '*.example.com' : 'api.example.com'} value={draft.host.value ?? ''} onChange={(e) => setDraft({ ...draft, host: { ...draft.host, value: e.target.value } })} required /></Field>}
               </div>
             </section>
-            <section className="form-section">
+            {!upstreamProtocolInvalid && <section className="form-section">
               <h3 className="form-section-title">{t('form.location')}</h3>
               <div className="form-grid">
                 <Field label={t('form.locationType')}>
@@ -1725,17 +1798,19 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 </Field>
                 <Field label={t('form.locationValue')}><input placeholder={draft.location.type === 'regex' ? '^/api/v[0-9]+/' : '/api'} value={draft.location.value} onChange={(e) => setDraft({ ...draft, location: { ...draft.location, value: e.target.value } })} required /></Field>
               </div>
-            </section>
+            </section>}
             {!draft.is_fallback && <section className="form-section">
               <h3 className="form-section-title">{t('form.routing')}</h3>
               <Field label={t('table.priority')}><input type="number" value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: Number(e.target.value) })} /></Field>
               <Field label={t('table.pool')}>
                 <Dropdown
                   value={draft.upstream}
-                  options={upstreamNames.length > 0 ? upstreamNames.map((name) => ({ value: name, label: name })) : [{ value: '', label: '—' }]}
+                  options={ruleUpstreamOptions.length > 0 ? ruleUpstreamOptions : [{ value: '', label: '—' }]}
                   onChange={(upstream) => setDraft({ ...draft, upstream })}
                 />
               </Field>
+              <p className="card-desc">{t('form.httpUpstreamsOnly')}</p>
+              {upstreamProtocolInvalid && <div className="form-warning"><Icon name="warning" size={16} />{t('rule.tcpUpstreamInvalid')}</div>}
             </section>}
             <section className="form-section">
               {draft.is_fallback && <h3 className="form-section-title">{t('form.routing')}</h3>}
@@ -1743,11 +1818,13 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
                 <Field label={t('table.pool')}>
                   <Dropdown
                     value={draft.upstream}
-                    options={upstreamNames.length > 0 ? upstreamNames.map((name) => ({ value: name, label: name })) : [{ value: '', label: '—' }]}
+                    options={ruleUpstreamOptions.length > 0 ? ruleUpstreamOptions : [{ value: '', label: '—' }]}
                     onChange={(upstream) => setDraft({ ...draft, upstream })}
                   />
                 </Field>
               )}
+              {draft.is_fallback && <p className="card-desc">{t('form.httpUpstreamsOnly')}</p>}
+              {draft.is_fallback && upstreamProtocolInvalid && <div className="form-warning"><Icon name="warning" size={16} />{t('rule.tcpUpstreamInvalid')}</div>}
               {!draft.is_fallback && (
               <div className="tls-rule-card">
                 <div className="tls-rule-head">
@@ -1788,7 +1865,7 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               </div>
               )}
             </section>
-            {!draft.is_fallback && <section className="form-section">
+            {!draft.is_fallback && !upstreamProtocolInvalid && <section className="form-section">
               <h3 className="form-section-title">{t('form.matching')}</h3>
               <Field label={t('form.matchSource')}>
                 <Dropdown
@@ -1804,15 +1881,168 @@ function RulesView({ config, token, setConfig, setNotice }: DataProps) {
               </Field>
               {!draft.match_set && <ConditionEditor draft={draft} setDraft={setDraft} />}
             </section>}
-            {!draft.is_fallback && <AdvancedRuleConfig draft={draft} setDraft={setDraft} />}
+            {!draft.is_fallback && !upstreamProtocolInvalid && <AdvancedRuleConfig draft={draft} setDraft={setDraft} />}
             <div className="modal-footer">
               <button type="button" className="btn btn-secondary" onClick={() => setShowModal(false)}>{t('action.cancel')}</button>
-              <button type="submit" className="btn btn-primary" disabled={protocolConflict}>{editing ? t('action.save') : t('action.create')}</button>
+              <button type="submit" className="btn btn-primary" disabled={protocolConflict || upstreamProtocolInvalid}>{editing ? t('action.save') : t('action.create')}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {showTcpModal && (
+        <Modal title={editingTcpIndex == null ? t('tcp.new') : t('tcp.edit')} onClose={() => setShowTcpModal(false)}>
+          <form onSubmit={submitTcp} className="config-form">
+            <TcpListenerForm config={config} draft={tcpDraft} setDraft={setTcpDraft} />
+            <div className="modal-footer">
+              <button type="button" className="btn btn-secondary" onClick={() => setShowTcpModal(false)}>{t('action.cancel')}</button>
+              <button type="submit" className="btn btn-primary" disabled={!tcpListenerReady(tcpDraft, config)}>{editingTcpIndex == null ? t('action.create') : t('action.save')}</button>
             </div>
           </form>
         </Modal>
       )}
     </div>
+  );
+}
+
+function TcpListenersPanel({ config, listeners, onCreate, onEdit, onRemove }: {
+  config: AppConfig;
+  listeners: TcpListener[];
+  onCreate: () => void;
+  onEdit: (listener: TcpListener, index: number) => void;
+  onRemove: (index: number) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <section className="table-card tcp-listener-card">
+      <div className="tcp-listener-head">
+        <div>
+          <h3 className="card-title-sm">{t('tcp.title')}</h3>
+          <p className="card-desc">{t('tcp.sub')}</p>
+        </div>
+        <button className="btn btn-primary btn-sm" type="button" onClick={onCreate}>
+          <Icon name="settings_ethernet" size={16} />{t('action.newTcpListener')}
+        </button>
+      </div>
+      <div className="table-wrap">
+        <table className="tcp-listeners-table">
+          <thead><tr>
+            <th>{t('table.name')}</th>
+            <th>{t('table.listen')}</th>
+            <th>{t('table.mode')}</th>
+            <th>{t('tcp.defaultRoute')}</th>
+            <th>{t('tcp.sniRouteCount')}</th>
+            <th>{t('table.actions')}</th>
+          </tr></thead>
+          <tbody>
+            {listeners.length === 0 ? (
+              <tr><td colSpan={6} style={{ textAlign: 'center', color: 'var(--muted-foreground)', padding: 32 }}>{t('tcp.empty')}</td></tr>
+            ) : listeners.map((listener, index) => {
+              const upstreamProtocolValue = listener.upstream ? upstreamProtocol(config.upstreams[listener.upstream]) : 'empty';
+              const upstreamLabel = listener.upstream ? `${listener.upstream}${upstreamProtocolValue === 'tcp' ? '' : ` (${upstreamProtocolValue})`}` : '—';
+              return (
+                <tr key={`${listener.name}-${listener.listen}-${index}`}>
+                  <td style={{ fontWeight: 500 }} title={listener.name}>{listener.name}</td>
+                  <td className="td-mono" title={listener.listen}>{listener.listen}</td>
+                  <td><span className="td-badge">{humanizeSnake(listener.mode)}</span></td>
+                  <td className="td-upstream"><span className="td-badge" title={upstreamLabel}>{upstreamLabel}</span></td>
+                  <td className="td-mono">{Object.keys(listener.sni_routes ?? {}).length}</td>
+                  <td className="td-actions">
+                    <div className="td-action-row">
+                      <button className="btn btn-ghost btn-sm" type="button" onClick={() => onEdit(listener, index)}>{t('action.edit')}</button>
+                      <button className="btn btn-danger btn-sm" type="button" onClick={() => onRemove(index)}>{t('action.del')}</button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function TcpListenerForm({ config, draft, setDraft }: {
+  config: AppConfig;
+  draft: TcpListener;
+  setDraft: (listener: TcpListener) => void;
+}) {
+  const { t } = useI18n();
+  const tcpUpstreamOptions = upstreamOptionsForProtocol(config, 'tcp', draft.upstream ?? '');
+  const sniRoutes = Object.entries(draft.sni_routes ?? {});
+  function update(listener: TcpListener) {
+    setDraft(normalizeTcpListener(listener));
+  }
+  function updateSniRoute(host: string, upstream: string, previousHost?: string) {
+    const routes = { ...(draft.sni_routes ?? {}) };
+    if (previousHost && previousHost !== host) delete routes[previousHost];
+    if (host.trim()) routes[host.trim().toLowerCase()] = upstream;
+    update({ ...draft, sni_routes: routes });
+  }
+  return (
+    <>
+      <section className="form-section">
+        <h3 className="form-section-title">{t('form.identity')}</h3>
+        <div className="form-grid">
+          <Field label={t('table.name')}><input value={draft.name} onChange={(e) => update({ ...draft, name: e.target.value })} required /></Field>
+          <Field label={t('table.listen')}><input value={draft.listen} placeholder="0.0.0.0:6379" onChange={(e) => update({ ...draft, listen: e.target.value })} required /></Field>
+        </div>
+      </section>
+      <section className="form-section">
+        <h3 className="form-section-title">{t('form.routing')}</h3>
+        <div className="form-grid-3">
+          <Field label={t('config.tcpMode')}>
+            <Dropdown value={draft.mode} options={enumOptions(TCP_LISTENER_MODES)} onChange={(mode) => update({ ...draft, mode: mode as TcpListenerMode })} />
+          </Field>
+          <Field label={t('config.defaultUpstream')}>
+            <Dropdown
+              value={draft.upstream ?? ''}
+              options={[{ value: '', label: '—' }, ...tcpUpstreamOptions]}
+              onChange={(upstream) => update({ ...draft, upstream: upstream || null })}
+            />
+          </Field>
+          <Field label="maxconn"><input type="number" min="0" value={draft.maxconn ?? ''} placeholder={t('form.optionalZero')} onChange={(e) => update({ ...draft, maxconn: parseOptionalPositive(e.target.value) })} /></Field>
+        </div>
+        <div className="target-hint">
+          <Icon name="info" size={16} />
+          <span>{t('form.tcpUpstreamsOnly')}</span>
+          <span>{t('tcp.tcpOnlyHint')}</span>
+        </div>
+      </section>
+      {draft.mode === 'tls_passthrough' && (
+        <section className="form-section">
+          <div className="policy-subsection-head">
+            <h3 className="form-section-title">{t('config.sniRoutes')}</h3>
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => updateSniRoute('app.example.com', tcpUpstreamOptions[0]?.value ?? '')}>
+              <Icon name="add" size={16} />{t('config.sniRoutes')}
+            </button>
+          </div>
+          {sniRoutes.length === 0 ? <p className="card-desc">{t('form.noneConfigured')}</p> : (
+            <div className="policy-list">
+              {sniRoutes.map(([host, upstream]) => (
+                <div className="policy-row tcp-sni-row" key={host}>
+                  <Field label={t('config.sniHost')}><input value={host} onChange={(e) => updateSniRoute(e.target.value, upstream, host)} /></Field>
+                  <Field label={t('table.upstream')}>
+                    <Dropdown
+                      value={upstream}
+                      options={upstreamOptionsForProtocol(config, 'tcp', upstream).length ? upstreamOptionsForProtocol(config, 'tcp', upstream) : [{ value: '', label: '—' }]}
+                      onChange={(next) => updateSniRoute(host, next, host)}
+                    />
+                  </Field>
+                  <button type="button" className="btn btn-ghost btn-sm policy-remove" onClick={() => {
+                    const next = { ...(draft.sni_routes ?? {}) };
+                    delete next[host];
+                    update({ ...draft, sni_routes: next });
+                  }}>
+                    <Icon name="close" size={16} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+    </>
   );
 }
 
@@ -2334,6 +2564,7 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
   const [runtimeAction, setRuntimeAction] = useState<string | null>(null);
   const [weightDrafts, setWeightDrafts] = useState<Record<string, string>>({});
   const [targetSchemeDraft, setTargetSchemeDraft] = useState<TargetScheme | null>('http');
+  const isTcpDraft = targetSchemeDraft === 'tcp';
   const upstreams = Object.values(config.upstreams ?? {});
   const upstreamHealthByName = useMemo(() => Object.fromEntries(upstreamHealth.map((item) => [item.upstream, item])), [upstreamHealth]);
   const loadRuntime = useCallback(async () => {
@@ -2402,7 +2633,13 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
   }
   function setTargetScheme(scheme: TargetScheme) {
     setTargetSchemeDraft(scheme);
-    setDraft({ ...draft, targets: normalizeTargetsForScheme(draft.targets, scheme) });
+    setDraft({
+      ...draft,
+      skip_ssl: scheme === 'tcp' ? false : draft.skip_ssl,
+      websocket: scheme === 'tcp' ? false : draft.websocket,
+      health_check: scheme === 'tcp' ? { ...normalizeHealthCheck(draft.health_check), mode: 'tcp' } : draft.health_check,
+      targets: normalizeTargetsForScheme(draft.targets, scheme),
+    });
   }
 
   async function submit(event: FormEvent) {
@@ -2414,6 +2651,8 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
     const targets = normalizeTargetsForScheme(draft.targets, targetSchemeDraft);
     const body = {
       ...draft,
+      skip_ssl: targetSchemeDraft === 'tcp' ? false : Boolean(draft.skip_ssl),
+      websocket: targetSchemeDraft === 'tcp' ? false : Boolean(draft.websocket),
       balance: draft.balance ?? 'weighted_round_robin',
       retry: normalizeRetryPolicy(draft.retry),
       health_check: normalizeHealthCheck(draft.health_check),
@@ -2510,14 +2749,23 @@ function UpstreamsView({ config, token, setConfig, setNotice }: DataProps) {
               <Field label={t('table.name')}>
                 <input value={draft.name} disabled={Boolean(editing)} onChange={(e) => setDraft({ ...draft, name: e.target.value })} required />
               </Field>
-              <label className="toggle-row">
-                <input type="checkbox" checked={Boolean(draft.skip_ssl)} onChange={(e) => setDraft({ ...draft, skip_ssl: e.target.checked })} />
-                <span>{t('config.skipSsl')}</span>
-              </label>
-              <label className="toggle-row">
-                <input type="checkbox" checked={Boolean(draft.websocket)} onChange={(e) => setDraft({ ...draft, websocket: e.target.checked })} />
-                <span>{t('config.websocket')}</span>
-              </label>
+              {isTcpDraft ? (
+                <div className="target-hint">
+                  <Icon name="settings_ethernet" size={16} />
+                  <span>{t('config.httpOnlyUpstreamOptions')}</span>
+                </div>
+              ) : (
+                <>
+                  <label className="toggle-row">
+                    <input type="checkbox" checked={Boolean(draft.skip_ssl)} onChange={(e) => setDraft({ ...draft, skip_ssl: e.target.checked })} />
+                    <span>{t('config.skipSsl')}</span>
+                  </label>
+                  <label className="toggle-row">
+                    <input type="checkbox" checked={Boolean(draft.websocket)} onChange={(e) => setDraft({ ...draft, websocket: e.target.checked })} />
+                    <span>{t('config.websocket')}</span>
+                  </label>
+                </>
+              )}
             </section>
             <section className="form-section">
               <h3 className="form-section-title">{t('form.balance')}</h3>
@@ -2779,7 +3027,7 @@ function HealthCheckEditor({ draft, setDraft }: { draft: Upstream; setDraft: (up
 
 function TcpListenersEditor({ config, onChange }: { config: AppConfig; onChange: (listeners: TcpListener[]) => void }) {
   const { t } = useI18n();
-  const upstreamOptions = Object.keys(config.upstreams ?? {}).map((name) => ({ value: name, label: name }));
+  const tcpUpstreamOptions = upstreamOptionsForProtocol(config, 'tcp');
   const listeners = (config.tcp_listeners ?? []).map(normalizeTcpListener);
   function replace(index: number, listener: TcpListener) {
     onChange(listeners.map((item, i) => i === index ? normalizeTcpListener(listener) : item));
@@ -2810,22 +3058,23 @@ function TcpListenersEditor({ config, onChange }: { config: AppConfig; onChange:
                   <Field label={t('table.listen')}><input value={listener.listen} placeholder="0.0.0.0:8443" onChange={(e) => replace(index, { ...listener, listen: e.target.value })} /></Field>
                   <Field label={t('config.tcpMode')}><Dropdown value={listener.mode} options={enumOptions(TCP_LISTENER_MODES)} onChange={(mode) => replace(index, { ...listener, mode: mode as TcpListenerMode })} /></Field>
                   <Field label={t('config.defaultUpstream')}>
-                    <Dropdown value={listener.upstream ?? ''} options={[{ value: '', label: '—' }, ...upstreamOptions]} onChange={(upstream) => replace(index, { ...listener, upstream: upstream || null })} />
+                    <Dropdown value={listener.upstream ?? ''} options={[{ value: '', label: '—' }, ...upstreamOptionsForProtocol(config, 'tcp', listener.upstream ?? '')]} onChange={(upstream) => replace(index, { ...listener, upstream: upstream || null })} />
                   </Field>
                   <Field label="maxconn"><input type="number" min="0" value={listener.maxconn ?? ''} placeholder={t('form.optionalZero')} onChange={(e) => replace(index, { ...listener, maxconn: parseOptionalPositive(e.target.value) })} /></Field>
                 </div>
+                <p className="card-desc">{t('form.tcpUpstreamsOnly')}</p>
                 {listener.mode === 'tls_passthrough' && (
                   <div className="policy-subsection">
                     <div className="policy-subsection-head">
                       <span className="field-label">{t('config.sniRoutes')}</span>
-                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => updateSniRoute(index, 'app.example.com', upstreamOptions[0]?.value ?? '')}>
+                      <button type="button" className="btn btn-secondary btn-sm" onClick={() => updateSniRoute(index, 'app.example.com', tcpUpstreamOptions[0]?.value ?? '')}>
                         <Icon name="add" size={16} />{t('config.sniRoutes')}
                       </button>
                     </div>
                     {routes.map(([host, upstream]) => (
                       <div className="policy-row header-policy-row" key={host}>
                         <Field label={t('config.sniHost')}><input value={host} onChange={(e) => updateSniRoute(index, e.target.value, upstream, host)} /></Field>
-                        <Field label={t('table.upstream')}><Dropdown value={upstream} options={upstreamOptions.length ? upstreamOptions : [{ value: '', label: '—' }]} onChange={(next) => updateSniRoute(index, host, next, host)} /></Field>
+                        <Field label={t('table.upstream')}><Dropdown value={upstream} options={upstreamOptionsForProtocol(config, 'tcp', upstream).length ? upstreamOptionsForProtocol(config, 'tcp', upstream) : [{ value: '', label: '—' }]} onChange={(next) => updateSniRoute(index, host, next, host)} /></Field>
                         <button type="button" className="btn btn-ghost btn-sm policy-remove" onClick={() => {
                           const next = { ...(listener.sni_routes ?? {}) };
                           delete next[host];
@@ -3536,6 +3785,17 @@ function normalizeTcpListener(listener: TcpListener): TcpListener {
   };
 }
 
+function tcpListenerReady(listener: TcpListener, config: AppConfig): boolean {
+  const normalized = normalizeTcpListener(listener);
+  if (!normalized.name.trim() || !normalized.listen.trim()) return false;
+  const isTcpUpstream = (upstream?: string | null) => Boolean(upstream?.trim()) && upstreamProtocol(config.upstreams[upstream!.trim()]) === 'tcp';
+  const hasDefaultUpstream = isTcpUpstream(normalized.upstream);
+  const hasInvalidSniRoute = Object.values(normalized.sni_routes ?? {}).some((upstream) => !isTcpUpstream(upstream));
+  if (hasInvalidSniRoute) return false;
+  if (normalized.mode === 'tcp') return hasDefaultUpstream;
+  return hasDefaultUpstream || Object.keys(normalized.sni_routes ?? {}).length > 0;
+}
+
 function normalizeHeaderPolicy(policy?: HeaderPolicy): HeaderPolicy {
   return {
     request: (policy?.request ?? []).map(normalizeHeaderMutation),
@@ -3664,6 +3924,29 @@ function uniformTargetScheme(targets: Target[]): TargetScheme | null {
   if (targets.length === 0) return 'http';
   const kinds = new Set(targets.map((target) => targetScheme(target.url)));
   return kinds.size === 1 ? [...kinds][0] : null;
+}
+
+function upstreamProtocol(upstream?: Upstream): UpstreamProtocol {
+  if (!upstream || upstream.targets.length === 0) return 'empty';
+  const protocols = new Set(upstream.targets.map((target) => targetScheme(target.url)));
+  if (protocols.size > 1) return 'mixed';
+  return protocols.has('tcp') ? 'tcp' : 'http';
+}
+
+function upstreamOptionsForProtocol(config: AppConfig, protocol: TargetScheme, current = ''): DropdownOption[] {
+  const options: DropdownOption[] = Object.keys(config.upstreams ?? {})
+    .filter((name) => upstreamProtocol(config.upstreams[name]) === protocol)
+    .map((name) => ({ value: name, label: name }));
+
+  if (current && !options.some((option) => option.value === current)) {
+    const currentProtocol = upstreamProtocol(config.upstreams[current]);
+    options.unshift({
+      value: current,
+      label: `${current} (${currentProtocol})`,
+      description: protocol === 'tcp' ? 'requires tcp:// targets' : 'requires http:// or https:// targets',
+    });
+  }
+  return options;
 }
 
 function normalizeTargetsForScheme(targets: Target[], scheme: TargetScheme): Target[] {

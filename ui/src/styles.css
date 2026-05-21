@@ -1549,6 +1549,67 @@ tr:last-child td { border-bottom: none; }
   overflow: auto;
 }
 
+.rules-table {
+  min-width: 1180px;
+  table-layout: fixed;
+}
+
+.rules-col-name { width: 230px; }
+.rules-col-priority { width: 80px; }
+.rules-col-listen { width: 110px; }
+.rules-col-host { width: 150px; }
+.rules-col-location { width: 220px; }
+.rules-col-pool { width: 180px; }
+.rules-col-match { width: 120px; }
+.rules-col-actions { width: 124px; }
+
+.rules-table th,
+.rules-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rules-table .td-actions {
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.rules-table .td-badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tcp-listener-card {
+  flex: 0 0 auto;
+}
+
+.tcp-listener-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tcp-listeners-table {
+  min-width: 860px;
+  table-layout: fixed;
+}
+
+.tcp-listeners-table th,
+.tcp-listeners-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tcp-listeners-table .td-actions {
+  overflow: visible;
+}
+
 .td-actions {
   white-space: nowrap;
 }
@@ -2171,6 +2232,10 @@ textarea {
 
 .header-policy-row {
   grid-template-columns: 150px 1fr 1.2fr 32px;
+}
+
+.tcp-sni-row {
+  grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) 32px;
 }
 
 .path-policy-row {
@@ -3010,7 +3075,7 @@ textarea {
   .flow-branch .flow-upstream,
   .flow-branch .flow-metrics { grid-column: 2 / -1; width: 100%; text-align: left; }
   .flow-metrics { width: 100%; text-align: left; }
-  .form-grid, .form-grid-3, .condition-grid, .target-row, .header-policy-row, .path-policy-row, .health-mode-control, .health-config-grid, .upload-grid, .tls-listener-row, .certificate-grid { grid-template-columns: 1fr; }
+  .form-grid, .form-grid-3, .condition-grid, .target-row, .header-policy-row, .tcp-sni-row, .path-policy-row, .health-mode-control, .health-config-grid, .upload-grid, .tls-listener-row, .certificate-grid { grid-template-columns: 1fr; }
   .tls-rule-head { flex-direction: column; }
   .health-panel-head { align-items: flex-start; flex-direction: column; }
   .runtime-panel-head { flex-direction: column; }

@@ -691,24 +691,30 @@ pub async fn update_upstream(
         .validate_target_protocols()
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    state
-        .db
-        .update_upstream(&upstream)
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let (old_config, new_config) = {
-        let mut config = state.config.write().await;
+    let old_config = {
+        let config = state.config.read().await;
         if !config.upstreams.contains_key(&id) {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("upstream '{id}' not found"),
             ));
         }
-        let old_config = config.clone();
-        config.upstreams.insert(id.clone(), upstream.clone());
-        let new_config = config.clone();
-        (old_config, new_config)
+        config.clone()
     };
+    let mut new_config = old_config.clone();
+    new_config.upstreams.insert(id.clone(), upstream.clone());
+    super::routes::validate_runtime_config(&new_config)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    state
+        .db
+        .update_upstream(&upstream)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    {
+        let mut config = state.config.write().await;
+        *config = new_config.clone();
+    }
     state.rebuild_proxy_runtime(&old_config, &new_config);
 
     Ok(Json(ApiResponse::success(upstream)))
@@ -724,6 +730,15 @@ pub async fn delete_upstream(
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
                 format!("upstream '{id}' is still used by routing rules"),
+            ));
+        }
+        if config.tcp_listeners.iter().any(|listener| {
+            listener.upstream.as_deref() == Some(id.as_str())
+                || listener.sni_routes.values().any(|upstream| upstream == &id)
+        }) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("upstream '{id}' is still used by TCP listeners"),
             ));
         }
     }

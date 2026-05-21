@@ -472,7 +472,7 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn validate_target_protocols(&self) -> anyhow::Result<()> {
+    pub fn target_protocol(&self) -> anyhow::Result<Option<TargetProtocol>> {
         let mut protocol: Option<TargetProtocol> = None;
         for target in &self.targets {
             let current = TargetProtocol::from_url(&target.url).map_err(|error| {
@@ -496,12 +496,16 @@ impl Upstream {
                 protocol = Some(current);
             }
         }
-        Ok(())
+        Ok(protocol)
+    }
+
+    pub fn validate_target_protocols(&self) -> anyhow::Result<()> {
+        self.target_protocol().map(|_| ())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetProtocol {
+pub enum TargetProtocol {
     Http,
     Tcp,
 }

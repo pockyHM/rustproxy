@@ -28,6 +28,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::models::{
     ConditionExpr, ConditionType, HostMatchType, LimitPolicy, LocationMatchType, Rule,
+    TargetProtocol,
 };
 use crate::{
     auth::middleware::{self as auth_mw},
@@ -501,6 +502,7 @@ fn tls_acceptor(
 
 pub(crate) fn validate_runtime_config(config: &AppConfig) -> anyhow::Result<()> {
     config.validate_upstreams()?;
+    validate_upstream_protocol_usage(config)?;
     validate_match_sets(config)?;
     for rule in config.rules.iter().filter(|rule| rule_tls_enabled(rule)) {
         if rule.listen.as_deref().unwrap_or("").trim().is_empty() {
@@ -518,6 +520,66 @@ pub(crate) fn validate_runtime_config(config: &AppConfig) -> anyhow::Result<()> 
     for listener in effective_tls_listeners(config) {
         tls_acceptor(config, &listener)
             .with_context(|| format!("invalid TLS listener {}", listener.listen))?;
+    }
+    Ok(())
+}
+
+fn validate_upstream_protocol_usage(config: &AppConfig) -> anyhow::Result<()> {
+    for rule in &config.rules {
+        let Some(upstream) = config.upstreams.get(&rule.upstream) else {
+            anyhow::bail!(
+                "HTTP rule '{}' references unknown upstream '{}'",
+                rule.id,
+                rule.upstream
+            );
+        };
+        if upstream.target_protocol()? == Some(TargetProtocol::Tcp) {
+            anyhow::bail!(
+                "HTTP rule '{}' cannot use TCP upstream '{}'; configure it through tcp_listeners instead",
+                rule.id,
+                upstream.name
+            );
+        }
+    }
+
+    for listener in &config.tcp_listeners {
+        validate_tcp_listener_upstream_protocol(
+            config,
+            &listener.name,
+            listener.upstream.as_deref(),
+        )?;
+        for (host, upstream) in &listener.sni_routes {
+            validate_tcp_listener_upstream_protocol(
+                config,
+                &format!("{} SNI route {}", listener.name, host),
+                Some(upstream),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_tcp_listener_upstream_protocol(
+    config: &AppConfig,
+    listener_name: &str,
+    upstream_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(upstream_name) = upstream_name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+    let Some(upstream) = config.upstreams.get(upstream_name) else {
+        anyhow::bail!(
+            "TCP listener '{}' references unknown upstream '{}'",
+            listener_name,
+            upstream_name
+        );
+    };
+    if upstream.target_protocol()? == Some(TargetProtocol::Http) {
+        anyhow::bail!(
+            "TCP listener '{}' cannot use HTTP upstream '{}'; select a tcp:// upstream",
+            listener_name,
+            upstream.name
+        );
     }
     Ok(())
 }
@@ -1656,6 +1718,7 @@ mod tests {
         client_ip_string, normalize_host_key, AppState, ConfigSnapshot, LimitState,
         ListenerProtocol, Matcher, ProxyClients, ProxyRuntime,
     };
+    use crate::api::handlers;
     use crate::config::yaml::{AppConfig, Fallback, TcpListenerConfig, TcpListenerMode};
     use crate::db::Database;
     use crate::models::{BalanceAlgorithm, LimitPolicy, Rule, Target, Upstream};
@@ -1665,6 +1728,11 @@ mod tests {
     use crate::runtime::state::{RuntimeState, TargetKey};
     use crate::runtime::timeouts::{ResolvedTimeoutPolicy, TimeoutPolicy};
     use arc_swap::ArcSwap;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        Json,
+    };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1718,6 +1786,47 @@ mod tests {
             retry: Default::default(),
             sticky: Default::default(),
         }
+    }
+
+    fn tcp_upstream(name: &str) -> Upstream {
+        Upstream {
+            name: name.to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![target("tcp://127.0.0.1:6379", 1)],
+            health_check: Default::default(),
+            balance: BalanceAlgorithm::WeightedRoundRobin,
+            retry: Default::default(),
+            sticky: Default::default(),
+        }
+    }
+
+    fn rule_for_upstream(upstream: &str) -> Rule {
+        Rule {
+            id: "rule-1".to_string(),
+            name: "route".to_string(),
+            priority: 10,
+            host: Default::default(),
+            location: Default::default(),
+            match_set: None,
+            conditions: None,
+            upstream: upstream.to_string(),
+            weight: 100,
+            is_fallback: false,
+            listen: None,
+            request_timeout: 0,
+            timeouts: Default::default(),
+            tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
+        }
+    }
+
+    fn state_with_saved_config(config: AppConfig) -> AppState {
+        let state = AppState::for_test(config.clone());
+        state.db.save_full_config(&config).unwrap();
+        state
     }
 
     #[test]
@@ -1791,6 +1900,106 @@ mod tests {
         let resolved = super::resolve_proxy_timeout_policy(&config, &rule, "http://a");
 
         assert_eq!(resolved.server_timeout, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn validate_runtime_config_rejects_http_rule_with_tcp_upstream() {
+        let mut config = app_config_with_upstream(Upstream {
+            name: "redis".to_string(),
+            skip_ssl: false,
+            websocket: false,
+            targets: vec![target("tcp://127.0.0.1:6379", 1)],
+            health_check: Default::default(),
+            balance: BalanceAlgorithm::WeightedRoundRobin,
+            retry: Default::default(),
+            sticky: Default::default(),
+        });
+        config.rules = vec![Rule {
+            id: "rule-1".to_string(),
+            name: "redis".to_string(),
+            priority: 10,
+            host: Default::default(),
+            location: Default::default(),
+            match_set: None,
+            conditions: None,
+            upstream: "redis".to_string(),
+            weight: 100,
+            is_fallback: false,
+            listen: None,
+            request_timeout: 0,
+            timeouts: Default::default(),
+            tls: None,
+            header_policy: Default::default(),
+            path_actions: Vec::new(),
+            limit_policy: Default::default(),
+        }];
+
+        let err = super::validate_runtime_config(&config)
+            .expect_err("HTTP route must not target TCP upstream")
+            .to_string();
+
+        assert!(err.contains("HTTP rule 'rule-1' cannot use TCP upstream 'redis'"));
+    }
+
+    #[test]
+    fn validate_runtime_config_rejects_tcp_listener_with_http_upstream() {
+        let mut config = app_config_with_upstream(least_connections_upstream());
+        config.tcp_listeners = vec![TcpListenerConfig {
+            name: "redis".to_string(),
+            listen: "127.0.0.1:6379".to_string(),
+            mode: TcpListenerMode::Tcp,
+            upstream: Some("backend".to_string()),
+            sni_routes: HashMap::new(),
+            maxconn: None,
+        }];
+
+        let err = super::validate_runtime_config(&config)
+            .expect_err("TCP listener must target TCP upstream")
+            .to_string();
+
+        assert!(err.contains("TCP listener 'redis' cannot use HTTP upstream 'backend'"));
+    }
+
+    #[tokio::test]
+    async fn update_upstream_rejects_protocol_change_used_by_http_rule() {
+        let mut config = app_config_with_upstream(least_connections_upstream());
+        config.rules = vec![rule_for_upstream("backend")];
+        let state = state_with_saved_config(config);
+
+        let result = handlers::update_upstream(
+            State(state),
+            Path("backend".to_string()),
+            Json(tcp_upstream("backend")),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("upstream protocol change should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_upstream_rejects_tcp_listener_reference() {
+        let mut config = app_config_with_upstream(tcp_upstream("redis"));
+        config.tcp_listeners = vec![TcpListenerConfig {
+            name: "redis-listener".to_string(),
+            listen: "127.0.0.1:6379".to_string(),
+            mode: TcpListenerMode::Tcp,
+            upstream: Some("redis".to_string()),
+            sni_routes: HashMap::new(),
+            maxconn: None,
+        }];
+        let state = state_with_saved_config(config);
+
+        let result = handlers::delete_upstream(State(state), Path("redis".to_string())).await;
+        let err = match result {
+            Ok(_) => panic!("deleting a TCP listener upstream should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
