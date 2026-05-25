@@ -1,6 +1,483 @@
-version: "1.0"
+# rustproxy demo configuration — covers most features
+# Admin API & metrics dashboard
 listen: "0.0.0.0:3000"
-rules: []
-upstreams: {}
+# Default proxy listener
+proxy_listen: "0.0.0.0:80"
+
+# ── Global timeouts ──────────────────────────────────────────────────────────
+timeouts:
+  connect_timeout_seconds: 10
+  client_timeout_seconds: 60
+  server_timeout_seconds: 60
+  http_request_timeout_seconds: 120
+  http_keepalive_timeout_seconds: 90
+  tunnel_timeout_seconds: 3600
+  queue_timeout_ms: 500
+
+# ── Connection limits ────────────────────────────────────────────────────────
+limits:
+  global_maxconn: 10000
+  listener_maxconn: 2000
+
+# ── Connection pool ─────────────────────────────────────────────────────────
+pool_max_idle_per_host: 64
+pool_idle_timeout: 90
+tcp_keepalive: 60
+
+certificates: []
+tls_listeners: []
+
+# ── TCP listeners (raw TCP / TLS passthrough) ───────────────────────────────
+tcp_listeners:
+  # Raw TCP: forward Redis traffic
+  - name: "redis"
+    listen: "0.0.0.0:6379"
+    mode: tcp
+    upstream: "redis-cluster"
+    maxconn: 500
+
+  # TLS passthrough: route by SNI hostname
+  - name: "tls-passthrough"
+    listen: "0.0.0.0:8443"
+    mode: tls_passthrough
+    upstream: "tls-default-backend"
+    sni_routes:
+      "grpc.example.com": "grpc-backend"
+      "mqtt.example.com": "mqtt-backend"
+
+# ── Access log ───────────────────────────────────────────────────────────────
+access_log:
+  enabled: true
+  path: "/var/log/rustproxy/access.log"
+  buffer_size: 16384
+  level: info
+
+# ── Monitoring / Prometheus ──────────────────────────────────────────────────
+monitoring:
+  enabled: true
+  prometheus:
+    url: "http://prometheus:9090"
+    auth:
+      auth_type: "basic"
+      username: "metrics"
+      password: "s3cret"
+
+# ── Match sets (reusable condition groups) ───────────────────────────────────
+match_sets:
+  - name: "internal-traffic"
+    conditions:
+      type: "and"
+      children:
+        - type: "leaf"
+          conditionType: "header"
+          key: "X-Internal"
+          operator: "exists"
+        - type: "leaf"
+          conditionType: "header"
+          key: "X-Env"
+          operator: "exact"
+          value: "production"
+
+  - name: "mobile-or-tablet"
+    conditions:
+      type: "or"
+      children:
+        - type: "leaf"
+          conditionType: "header"
+          key: "X-Device-Type"
+          operator: "exact"
+          value: "mobile"
+        - type: "leaf"
+          conditionType: "header"
+          key: "X-Device-Type"
+          operator: "exact"
+          value: "tablet"
+
+# ── Rules (evaluated by priority, highest first) ────────────────────────────
+rules:
+  # 1) Dedicated port listener — all traffic on :9090 goes to admin-api
+  - id: "admin-port"
+    name: "Admin API (dedicated port)"
+    priority: 200
+    listen: "0.0.0.0:9090"
+    upstream: "admin-api"
+    weight: 100
+
+  # 2) WebSocket rule
+  - id: "ws-rule"
+    name: "WebSocket connections"
+    priority: 150
+    conditions:
+      - type: header
+        key: "Upgrade"
+        operator: regex
+        value: "(?i)websocket"
+    upstream: "ws-backend"
+    weight: 100
+    timeouts:
+      tunnel_timeout_seconds: 7200
+      http_request_timeout_seconds: 300
+
+  # 3) JWT claim routing — admin users → admin backend
+  - id: "jwt-admin"
+    name: "JWT admin routing"
+    priority: 100
+    location:
+      type: prefix
+      value: "/admin"
+    conditions:
+      - type: jwt
+        claim_path: "roles"
+        operator: contains
+        value: "admin"
+    upstream: "admin-api"
+    weight: 100
+
+  # 4) Host-based virtual host routing
+  - id: "vhost-api"
+    name: "api.example.com"
+    priority: 90
+    host:
+      type: exact
+      value: "api.example.com"
+    location:
+      type: prefix
+      value: "/"
+    upstream: "api-v2"
+    weight: 100
+
+  # 5) Wildcard host matching
+  - id: "vhost-wildcard"
+    name: "*.app.example.com"
+    priority: 85
+    host:
+      type: wildcard
+      value: "*.app.example.com"
+    location:
+      type: prefix
+      value: "/"
+    upstream: "app-backend"
+    weight: 100
+
+  # 6) Path-based routing with strip_prefix + header mutation
+  - id: "api-strip"
+    name: "Strip /api prefix"
+    priority: 80
+    host:
+      type: any
+    location:
+      type: prefix
+      value: "/api/"
+    upstream: "api-v1"
+    weight: 100
+    header_policy:
+      request:
+        - op: set
+          name: "X-Forwarded-Prefix"
+          value: "/api"
+        - op: remove
+          name: "X-Debug-Flag"
+      response:
+        - op: set
+          name: "X-RateLimit-Policy"
+          value: "api-default"
+    path_actions:
+      - strip_prefix:
+          prefix: "/api"
+
+  # 7) Regex path rewrite (e.g. /v1/users → /users?version=1)
+  - id: "legacy-rewrite"
+    name: "Legacy v1 URL rewrite"
+    priority: 75
+    location:
+      type: regex
+      value: "^/v([0-9]+)/(.*)$"
+    upstream: "api-v1"
+    weight: 100
+    path_actions:
+      - rewrite:
+          pattern: "^/v([0-9]+)/(.*)$"
+          replacement: "/$2?version=$1"
+
+  # 8) Header-based canary routing (weighted split)
+  - id: "canary"
+    name: "Canary (X-Canary header)"
+    priority: 70
+    conditions:
+      - type: header
+        key: "X-Canary"
+        operator: exact
+        value: "true"
+    upstream: "api-canary"
+    weight: 100
+
+  # 9) Cookie-based routing
+  - id: "cookie-ab"
+    name: "Cookie AB test"
+    priority: 65
+    conditions:
+      - type: cookie
+        key: "ab_variant"
+        operator: exact
+        value: "new"
+    upstream: "app-frontend-v2"
+    weight: 100
+
+  # 10) Rate-limited endpoint
+  - id: "rate-limited-api"
+    name: "Rate-limited public API"
+    priority: 60
+    location:
+      type: prefix
+      value: "/public/"
+    upstream: "api-v1"
+    weight: 100
+    limit_policy:
+      rate_per_second: 100
+      rate_key: ip
+      max_connections: 20
+      max_body_bytes: 1048576
+      queue_timeout_ms: 3000
+
+  # 11) Host-based rate limit
+  - id: "host-rate-limit"
+    name: "Host rate limit"
+    priority: 55
+    location:
+      type: prefix
+      value: "/upload/"
+    upstream: "upload-backend"
+    weight: 100
+    limit_policy:
+      rate_per_second: 10
+      rate_key: host
+      max_body_bytes: 10485760
+      max_connections: 5
+
+  # 12) Redirect example (HTTP → HTTPS enforcement)
+  - id: "redirect-http"
+    name: "Redirect old path"
+    priority: 50
+    location:
+      type: prefix
+      value: "/old/path"
+    upstream: "api-v1"
+    weight: 100
+    path_actions:
+      - redirect:
+          status: 301
+          location: "https://example.com/new/path"
+
+  # 13) Exact path match
+  - id: "exact-health"
+    name: "Health check endpoint"
+    priority: 40
+    location:
+      type: exact
+      value: "/healthz"
+    upstream: "api-v1"
+    weight: 100
+
+  # 14) Match set reference — internal traffic
+  - id: "internal-route"
+    name: "Internal services"
+    priority: 35
+    match_set: "internal-traffic"
+    upstream: "internal-backend"
+    weight: 100
+
+  # 15) Per-rule timeout override
+  - id: "slow-upstream"
+    name: "Slow upstream with long timeout"
+    priority: 30
+    location:
+      type: prefix
+      value: "/batch/"
+    upstream: "batch-backend"
+    weight: 100
+    timeouts:
+      server_timeout_seconds: 600
+      http_request_timeout_seconds: 600
+      connect_timeout_seconds: 30
+
+  # 16) Default fallback rule (lowest priority, catches everything else)
+  - id: "default"
+    name: "Default catch-all"
+    priority: 1
+    upstream: "default-backend"
+    weight: 100
+
+# ── Upstreams ────────────────────────────────────────────────────────────────
+upstreams:
+  # --- API v1: weighted round robin + health check + retry ---
+  api-v1:
+    name: "api-v1"
+    targets:
+      - url: "http://10.0.1.1:8080"
+        weight: 70
+      - url: "http://10.0.1.2:8080"
+        weight: 20
+      - url: "http://10.0.1.3:8080"
+        weight: 10
+    health_check:
+      enabled: true
+      mode: http
+      path: "/healthz"
+      expected_status: 200
+      interval_seconds: 10
+      timeout_seconds: 3
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+    retry:
+      attempts: 2
+      retry_on_status: [502, 503]
+      retry_on_timeout: true
+      retry_on_connect_error: true
+
+  # --- API v2: least connections ---
+  api-v2:
+    name: "api-v2"
+    balance: least_connections
+    targets:
+      - url: "http://10.0.2.1:8080"
+        weight: 50
+      - url: "http://10.0.2.2:8080"
+        weight: 50
+    health_check:
+      enabled: true
+      mode: http
+      path: "/ready"
+      expected_status: 204
+
+  # --- Canary: single target, lightweight ---
+  api-canary:
+    name: "api-canary"
+    targets:
+      - url: "http://10.0.9.1:8080"
+        weight: 100
+    health_check:
+      enabled: true
+      mode: http
+      path: "/healthz"
+      expected_status: 200
+
+  # --- Admin API: sticky by cookie ---
+  admin-api:
+    name: "admin-api"
+    targets:
+      - url: "http://10.0.3.1:8080"
+        weight: 100
+    sticky:
+      enabled: true
+      source:
+        type: cookie
+        name: "admin_session"
+      ttl_seconds: 7200
+      cookie:
+        name: "RS_STICKY"
+        path: "/"
+        secure: true
+        http_only: true
+        same_site: "strict"
+
+  # --- WebSocket backend: long timeouts ---
+  ws-backend:
+    name: "ws-backend"
+    websocket: true
+    targets:
+      - url: "http://10.0.4.1:8080"
+        weight: 100
+
+  # --- Frontend v2 (A/B test): sticky by header ---
+  app-frontend-v2:
+    name: "app-frontend-v2"
+    targets:
+      - url: "http://10.0.5.1:3000"
+        weight: 100
+    sticky:
+      enabled: true
+      source:
+        type: header
+        name: "x-variant"
+      ttl_seconds: 86400
+
+  # --- App backend: IP hash for session affinity ---
+  app-backend:
+    name: "app-backend"
+    balance: ip_hash
+    targets:
+      - url: "http://10.0.6.1:8080"
+        weight: 50
+      - url: "http://10.0.6.2:8080"
+        weight: 50
+
+  # --- Upload backend ---
+  upload-backend:
+    name: "upload-backend"
+    targets:
+      - url: "http://10.0.7.1:8080"
+        weight: 100
+
+  # --- Secure backend with TLS ---
+  secure-backend:
+    name: "secure-backend"
+    skip_ssl: true
+    targets:
+      - url: "https://10.0.8.1:8443"
+        weight: 100
+
+  # --- Batch backend: long running jobs ---
+  batch-backend:
+    name: "batch-backend"
+    targets:
+      - url: "http://10.0.10.1:8080"
+        weight: 100
+
+  # --- Internal services ---
+  internal-backend:
+    name: "internal-backend"
+    targets:
+      - url: "http://10.0.11.1:8080"
+        weight: 100
+
+  # --- Default backend ---
+  default-backend:
+    name: "default-backend"
+    targets:
+      - url: "http://10.0.0.1:8080"
+        weight: 100
+
+  # --- Redis cluster (TCP upstream) ---
+  redis-cluster:
+    name: "redis-cluster"
+    targets:
+      - url: "tcp://10.1.0.1:6379"
+        weight: 50
+      - url: "tcp://10.1.0.2:6379"
+        weight: 50
+    balance: least_connections
+
+  # --- TLS passthrough default fallback (TCP upstream) ---
+  tls-default-backend:
+    name: "tls-default-backend"
+    targets:
+      - url: "tcp://10.2.0.2:1443"
+        weight: 100
+
+  # --- gRPC backend (TLS passthrough) ---
+  grpc-backend:
+    name: "grpc-backend"
+    targets:
+      - url: "tcp://10.2.0.1:1443"
+        weight: 100
+
+  # --- MQTT backend (TLS passthrough) ---
+  mqtt-backend:
+    name: "mqtt-backend"
+    targets:
+      - url: "tcp://10.3.0.1:8883"
+        weight: 100
+
+# ── Fallback ─────────────────────────────────────────────────────────────────
 fallback:
-  url: "http://127.0.0.1:8080"
+  url: "http://10.0.0.1:8080"

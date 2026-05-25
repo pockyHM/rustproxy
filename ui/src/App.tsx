@@ -4030,8 +4030,8 @@ function normalizeConditionExpr(condition: ConditionExpr): ConditionExpr {
     const leaf = normalizeLeafForType(condition);
     return leaf.operator === 'exists' ? { ...leaf, value: null } : leaf;
   }
-  const children = condition.children.length > 0
-    ? condition.children.map(normalizeConditionExpr)
+  const children = (condition.children ?? []).length > 0
+    ? (condition.children ?? []).map(normalizeConditionExpr)
     : [createLeafCondition()];
   return { type: condition.type, children };
 }
@@ -4071,7 +4071,7 @@ function summarizeCondition(condition?: ConditionExpr | null): string {
     const value = condition.operator === 'exists' ? '?' : condition.value;
     return [condition.conditionType, key, condition.operator, value].filter(Boolean).join(' ');
   }
-  return `${condition.type.toUpperCase()} (${condition.children.map(summarizeCondition).join(', ')})`;
+  return `${condition.type.toUpperCase()} (${(condition.children ?? []).map(summarizeCondition).join(', ')})`;
 }
 
 function summarizeRuleMatch(rule: Rule): string {
