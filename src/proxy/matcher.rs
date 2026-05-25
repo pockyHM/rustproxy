@@ -223,12 +223,13 @@ impl Matcher {
 
         match leaf.condition_type {
             ConditionType::Host => {
-                let host = headers
+                let raw_host = headers
                     .get("Host")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
+                let host = normalize_host(raw_host);
                 match_text(
-                    host,
+                    &host,
                     &leaf.operator,
                     leaf.value.as_deref(),
                     leaf.regex.as_ref(),
@@ -731,6 +732,16 @@ mod tests {
             claim_path: Some(claim_path.to_string()),
             operator,
             value: value.map(|s| s.to_string()),
+        }
+    }
+
+    fn create_host_leaf(value: &str, operator: Operator) -> ConditionExpr {
+        ConditionExpr::Leaf {
+            condition_type: ConditionType::Host,
+            key: None,
+            claim_path: None,
+            operator,
+            value: Some(value.to_string()),
         }
     }
 
@@ -1271,5 +1282,19 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
         );
         assert!(matcher.match_request(&request_fail, None).is_none());
+    }
+
+    #[test]
+    fn host_condition_strips_port_before_matching() {
+        let rule = create_rule(10, leaf(create_host_leaf("example.com", Operator::Exact)));
+        let matcher = Matcher::new(vec![with_prefix_location(rule, "/")]);
+
+        let mut request = create_request_with_headers(&[("Host", "example.com:8080")]);
+        *request.uri_mut() = "/".parse().unwrap();
+        assert!(matcher.match_request(&request, None).is_some());
+
+        let mut request = create_request_with_headers(&[("Host", "EXAMPLE.COM:443")]);
+        *request.uri_mut() = "/".parse().unwrap();
+        assert!(matcher.match_request(&request, None).is_some());
     }
 }

@@ -646,11 +646,18 @@ fn save_full_config(tx: &rusqlite::Transaction, config: &AppConfig) -> Result<()
     config.normalize_rules();
     config.validate_tcp_listeners()?;
 
+    // Preserve secrets that should survive config updates
+    let jwt_secret = get_setting(tx, "jwt_secret")?;
+
     // Clear existing data
     tx.execute("DELETE FROM rules", [])?;
     tx.execute("DELETE FROM targets", [])?;
     tx.execute("DELETE FROM upstreams", [])?;
     tx.execute("DELETE FROM settings", [])?;
+
+    if let Some(secret) = jwt_secret {
+        set_setting_tx(tx, "jwt_secret", &secret)?;
+    }
 
     // Settings
     set_setting_tx(tx, "listen", &config.listen)?;
@@ -1613,5 +1620,17 @@ mod tests {
         let secret2 = db.ensure_jwt_secret().unwrap();
         assert_eq!(secret1, secret2);
         assert!(secret1.len() > 30);
+    }
+
+    #[test]
+    fn save_full_config_preserves_jwt_secret() {
+        let db = Database::open_in_memory().unwrap();
+        let secret = db.ensure_jwt_secret().unwrap();
+
+        let config = make_test_config();
+        db.save_full_config(&config).unwrap();
+
+        let preserved = db.ensure_jwt_secret().unwrap();
+        assert_eq!(preserved, secret);
     }
 }
