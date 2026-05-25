@@ -80,14 +80,43 @@ Release 二进制文件位于 `target/release/rustproxy`。
 
 ### Docker
 
-```bash
-make docker-build
+预构建镜像已发布到 GitHub Container Registry：
 
-# 使用配置文件运行
-make docker-run CONFIG=config.yaml
+```bash
+docker pull ghcr.io/pockyhm/rustproxy:latest
 ```
 
-镜像暴露端口：**3000**（管理 API / UI）、**80**（代理）、**443**（HTTPS）。
+## 使用 Docker 快速启动
+
+1. 创建 `config.yaml`（参考下方「快速开始」中的最小配置示例）。
+
+2. 运行：
+
+```bash
+docker run -d --name rustproxy \
+  -p 3000:3000 \
+  -p 80:80 \
+  -v ./data:/var/lib/rustproxy \
+  -v ./config.yaml:/etc/rustproxy/config.yaml:ro \
+  ghcr.io/pockyhm/rustproxy:latest
+```
+
+3. 创建管理员用户：
+
+```bash
+docker exec -it rustproxy rustproxy user add admin
+```
+
+4. 打开管理控制台：`http://localhost:3000`。
+
+端口说明：**3000**（管理 API / UI）、**80**（代理）、**443**（HTTPS）。
+
+或本地构建：
+
+```bash
+make docker-build
+make docker-run CONFIG=config.yaml
+```
 
 ## 快速开始
 

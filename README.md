@@ -80,14 +80,43 @@ The release binary is at `target/release/rustproxy`.
 
 ### Docker
 
-```bash
-make docker-build
+Pre-built images are available on GitHub Container Registry:
 
-# Run with a config file
-make docker-run CONFIG=config.yaml
+```bash
+docker pull ghcr.io/pockyhm/rustproxy:latest
 ```
 
-The image exposes ports **3000** (admin API / UI), **80** (proxy), and **443** (HTTPS).
+## Quick Start with Docker
+
+1. Create a `config.yaml` (see [Quick Start](#quick-start) for a minimal example).
+
+2. Run:
+
+```bash
+docker run -d --name rustproxy \
+  -p 3000:3000 \
+  -p 80:80 \
+  -v ./data:/var/lib/rustproxy \
+  -v ./config.yaml:/etc/rustproxy/config.yaml:ro \
+  ghcr.io/pockyhm/rustproxy:latest
+```
+
+3. Create an admin user:
+
+```bash
+docker exec -it rustproxy rustproxy user add admin
+```
+
+4. Open the admin dashboard at `http://localhost:3000`.
+
+Ports: **3000** (admin API / UI), **80** (proxy), **443** (HTTPS).
+
+Or build locally:
+
+```bash
+make docker-build
+make docker-run CONFIG=config.yaml
+```
 
 ## Quick Start
 
