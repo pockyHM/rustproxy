@@ -88,9 +88,11 @@ docker pull ghcr.io/pockyhm/rustproxy:latest
 
 ## 使用 Docker 快速启动
 
+> **说明：** rustproxy 的所有配置都存储在 SQLite 数据库（`/var/lib/rustproxy/rustproxy.db`）中。YAML 文件仅在**首次启动**时用于导入初始配置，之后所有变更均通过 CLI 或管理界面完成。
+
 1. 创建 `config.yaml`（参考下方「快速开始」中的最小配置示例）。
 
-2. 运行：
+2. 挂载配置文件启动，完成首次导入：
 
 ```bash
 docker run -d --name rustproxy \
@@ -100,6 +102,8 @@ docker run -d --name rustproxy \
   -v ./config.yaml:/etc/rustproxy/config.yaml:ro \
   ghcr.io/pockyhm/rustproxy:latest
 ```
+
+YAML 配置会在首次启动时导入到数据库中。数据库初始化完成后，后续重启将从 SQLite 加载，不再需要挂载 YAML 文件。
 
 3. 创建管理员用户：
 

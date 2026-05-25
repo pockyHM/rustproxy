@@ -88,9 +88,11 @@ docker pull ghcr.io/pockyhm/rustproxy:latest
 
 ## Quick Start with Docker
 
+> **Note:** rustproxy stores all configuration in SQLite (`/var/lib/rustproxy/rustproxy.db`). A YAML file is only needed on the **first run** to bootstrap the initial config. After that, all changes are made via the CLI or Admin UI.
+
 1. Create a `config.yaml` (see [Quick Start](#quick-start) for a minimal example).
 
-2. Run:
+2. Run with the config mounted for initial import:
 
 ```bash
 docker run -d --name rustproxy \
@@ -100,6 +102,8 @@ docker run -d --name rustproxy \
   -v ./config.yaml:/etc/rustproxy/config.yaml:ro \
   ghcr.io/pockyhm/rustproxy:latest
 ```
+
+The YAML config is imported into the database on first start. Once the database is initialized, subsequent restarts load from SQLite and the YAML mount can be removed.
 
 3. Create an admin user:
 
